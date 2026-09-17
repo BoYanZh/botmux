@@ -399,6 +399,40 @@ export async function replyMessage(
   });
 }
 
+export type MessageUrgentMode = 'app' | 'sms' | 'phone';
+
+/**
+ * Buzz one or more users about a message sent by this bot.
+ *
+ * `app` is the ordinary in-app Buzz. SMS/phone use separate endpoints, scopes,
+ * and tenant quota. Callers should therefore require an explicit mode for the
+ * latter two and must not retry the primary message when this follow-up fails.
+ */
+export async function urgentMessage(
+  larkAppId: string,
+  messageId: string,
+  userOpenIds: string[],
+  mode: MessageUrgentMode = 'app',
+  requestOptions?: LarkRequestOptions,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'urgentMessage');
+  const recipients = [...new Set(userOpenIds.map(id => id.trim()).filter(Boolean))];
+  if (recipients.length === 0) throw new Error('Urgent message requires at least one user open_id');
+
+  const c = getBotClient(larkAppId);
+  const res: any = await (c as any).request({
+    method: 'PATCH',
+    url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/urgent_${mode}`,
+    params: { user_id_type: 'open_id' },
+    data: { user_id_list: recipients },
+    ...larkRequestDeadline(requestOptions),
+  });
+  if (res?.code !== 0 && res?.code !== undefined) {
+    throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
+  }
+  logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
+}
+
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
   return executeWithLarkGate(larkAppId, 'addReaction', async () => {

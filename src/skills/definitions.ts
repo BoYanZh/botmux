@@ -337,6 +337,22 @@ botmux send --attention=blocked --mention-back "缺 TOS 上传密钥，拿不到
 
 **什么时候不要 \`--attention\`**：常规进度汇报、你自己查得到/能合理假设的事、只是想确认一下——都用普通 \`send\`。这是"我真卡住了、必须人来"的信号，不是闲聊也不是汇报。需要用户在**给定选项里二选一**那种用 \`botmux ask\`（发按钮、阻塞等结果）。
 
+## 加急本轮触发者：\`--urgent\`
+
+只有用户明确要求加急时才用；不要把它当普通通知。加急固定只发给
+\`--mention-back\` 解析出的本轮触发者，不会把其他 \`--mention\` 对象一起加急。
+
+\`\`\`bash
+botmux send --urgent --mention-back "发布窗口将在 10 分钟后关闭，请尽快确认"
+botmux send --urgent=sms --mention-back "线上故障需要立即确认"
+botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
+\`\`\`
+
+- \`--urgent\` 等价于 \`--urgent=app\`（应用内加急）。
+- \`sms\` / \`phone\` 会消耗租户额度，必须由用户明确要求。
+- 只能用于当前会话回复，不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` / \`--slash\` 混用。
+- 主消息先发、加急后调；加急失败时命令会返回 \`urgent.sent=false\`，不要重发主消息。
+
 ## 用法
 
 ### 纯文本（最常见）
@@ -608,6 +624,7 @@ sandbox dispatch 暂不支持
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
 | \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
+| \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
