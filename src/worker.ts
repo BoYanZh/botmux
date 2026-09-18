@@ -239,6 +239,7 @@ import {
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { startCursorCot, stopAllCursorCot, rebaselineCursorCot, cursorCotChatIdFromTranscriptPath, type CursorCotEntry } from './services/cursor-cot.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -7115,7 +7116,42 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
  *  old in-flight output and must not be attributed to the next Lark turn. If
  *  the transcript is created after /adopt, attach fresh so the first
  *  post-adopt Lark/user turn can still be attributed. */
+let cursorCotReaderChatId: string | undefined;
+
+/** Feed the current active botmux turn's thinking channel from Cursor's
+ *  store.db timeline. Entries arriving with no active turn are dropped
+ *  (cosmetic channel, never buffered). The reader is started lazily on the
+ *  first turn whose chatId is known. */
+function ensureCursorCotReader(chatId: string): void {
+  if (!chatId || cursorCotReaderChatId === chatId) return;
+  cursorCotReaderChatId = chatId;
+  startCursorCot(chatId, (entries: readonly CursorCotEntry[]) => {
+    if (!currentBotmuxTurnId) return;
+    observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  });
+}
+
+/** Arm the Cursor thinking bubble for one turn. Called at the same pre-write
+ *  anchor as the structured-bridge mark: the CLI has not produced any model
+ *  output yet, so (re)baselining the store.db rowid here makes every reasoning
+ *  / tool node of THIS turn visible while the previous turn's nodes stay out.
+ *  Resolves the chatId from the observed session id or the live pid. */
+function armCursorCotForTurn(): void {
+  if (lastInitConfig?.cliId !== 'cursor') return;
+  let chatId = lastSpawnEffectiveCliSessionId;
+  if (!chatId) {
+    const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+    if (pid) chatId = findCursorChatIdByPid(findLaunchedCliPid(pid, 'cursor') ?? pid);
+  }
+  if (!chatId) return;
+  ensureCursorCotReader(chatId);
+  rebaselineCursorCot(chatId);
+}
+
 function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
+  // Adopt path: the chat's whole timeline is live from this point, so start
+  // (baselined at the current end) the CoT reader; subsequent turns re-arm.
+  ensureCursorCotReader(cursorCotChatIdFromTranscriptPath(path));
   if (mode === 'baseline-existing' && existsSync(path)) {
     try {
       const full = drainCursorTranscript(path, 0);
@@ -8234,6 +8270,8 @@ function stopCodexBridge(): void {
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
+  stopAllCursorCot();
+  cursorCotReaderChatId = undefined;
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
@@ -8705,6 +8743,9 @@ async function writeAdoptMessage(
         // the pre-existing line can fingerprint-match instead of becoming seen.
         adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
         try { codexBridgeIngest(); } catch { /* best effort */ }
+        // Re-arm the thinking bubble's rowid baseline at this turn's write so
+        // only the new turn's reasoning/tool nodes render.
+        armCursorCotForTurn();
       } else {
         try { codexBridgeIngest(); } catch { /* best effort */ }
         adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
@@ -12137,6 +12178,11 @@ async function flushPending(): Promise<void> {
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
+        } else if (lastInitConfig?.cliId === 'cursor' && !writeRpcEngine) {
+          // Cursor keeps its fallback bridge adopt-only, but its thinking
+          // bubble runs in every session: arm the store.db CoT reader at the
+          // same pre-write anchor the other bridges use.
+          armCursorCotForTurn();
         } else {
           // Same anchoring rule as the transcript bridges above: stamp the send
           // window's lower bound at the literal write, not on IPC arrival, so a
