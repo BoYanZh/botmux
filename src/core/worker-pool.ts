@@ -19,6 +19,7 @@ import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js'
 import { config } from '../config.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
 import { checkWorkerAdmission, formatMemoryBytes } from './worker-budget.js';
+import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import {
@@ -30,11 +31,11 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
@@ -119,6 +120,75 @@ const restartCoordinator = new RestartCoordinator();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+
+type WorkerIpcBootstrapState = {
+  ready: boolean;
+  pending: Array<() => void>;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const workerIpcBootstrapStates = new WeakMap<ChildProcess, WorkerIpcBootstrapState>();
+const STANDALONE_WORKER_IPC_BOOTSTRAP_TIMEOUT_MS = 30_000;
+
+function initializeWorkerIpcBootstrap(worker: ChildProcess): void {
+  if (!isStandaloneBinary()) return;
+  const state: WorkerIpcBootstrapState = {
+    ready: false,
+    pending: [],
+    timer: setTimeout(() => {
+      logger.warn('Standalone worker IPC bootstrap timed out; releasing queued messages');
+      releaseWorkerIpcBootstrap(worker, state);
+    }, STANDALONE_WORKER_IPC_BOOTSTRAP_TIMEOUT_MS),
+  };
+  state.timer.unref?.();
+  workerIpcBootstrapStates.set(worker, state);
+  const onMessage = (message: WorkerToDaemon): void => {
+    if (message.type !== 'worker_ipc_ready') return;
+    worker.off('message', onMessage);
+    releaseWorkerIpcBootstrap(worker, state);
+  };
+  worker.on('message', onMessage);
+  worker.once('exit', () => {
+    worker.off('message', onMessage);
+    clearTimeout(state.timer);
+    state.pending.length = 0;
+    workerIpcBootstrapStates.delete(worker);
+  });
+  worker.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
+}
+
+function releaseWorkerIpcBootstrap(
+  worker: ChildProcess,
+  state: WorkerIpcBootstrapState,
+): void {
+  if (workerIpcBootstrapStates.get(worker) !== state || state.ready) return;
+  state.ready = true;
+  clearTimeout(state.timer);
+  workerIpcBootstrapStates.delete(worker);
+  const pending = state.pending.splice(0);
+  for (const dispatch of pending) {
+    try {
+      dispatch();
+    } catch (error) {
+      logger.error(
+        `Failed to flush standalone worker IPC bootstrap queue: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
+function afterWorkerIpcBootstrap(worker: ChildProcess, dispatch: () => void): boolean {
+  const state = workerIpcBootstrapStates.get(worker);
+  if (!state || state.ready) {
+    dispatch();
+    return true;
+  }
+  if (worker.killed || worker.connected === false) return false;
+  state.pending.push(dispatch);
+  return true;
+}
 
 /** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
 function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefined {
@@ -484,6 +554,23 @@ import {
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
+import {
+  attachReadonlyTaskContinuation,
+  beginReadonlyTaskContinuationDelivery,
+  cancelReadonlyTaskContinuationForUserInput,
+  completeReadonlyTaskContinuationOriginalBusinessFinal,
+  completeReadonlyTaskContinuationWarning,
+  completeReadonlyTaskContinuation,
+  disposeReadonlyTaskContinuation,
+  failReadonlyTaskContinuationWarningDelivery,
+  failReadonlyTaskContinuationVisible,
+  finishReadonlyTaskContinuationAwaitUser,
+  handleReadonlyTaskContinuationTerminal,
+  parseReadonlyContinuationOutput,
+  readonlyTaskContinuationHandlesTerminal,
+  type ReadonlyTaskContinuationDispatch,
+  type ReadonlyTaskContinuationState,
+} from '../services/readonly-task-continuation.js';
 import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
@@ -1616,6 +1703,237 @@ export function ensureOrdinaryTurnRecoveryAttached(
   return true;
 }
 
+function readonlyTaskContinuationEnabled(): boolean {
+  return process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
+}
+
+function readonlyTaskContinuationEligible(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  return readonlyTaskContinuationEnabled()
+    && sessionCliId(ds, botCfg) === 'traex'
+    && ds.session.status === 'active'
+    && !isSharedAdoptSession(ds)
+    && !ds.session.vcMeetingReceiver
+    && !ds.session.deferredScheduleRun
+    && !ds.session.externalTriggerTopicless
+    && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
+}
+
+function readonlyTaskContinuationWarning(
+  state: NonNullable<Session['readonlyTaskContinuation']>,
+): string {
+  const reason = state.status === 'expired'
+    ? '租约已过期'
+    : state.status === 'exhausted'
+      ? `达到最大续跑次数 ${state.maxContinuations}`
+      : state.lastErrorCode ?? '续跑交接失败';
+  return `⚠️ 只读长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
+}
+
+function deliverReadonlyTaskContinuationPending(
+  ds: DaemonSession,
+  state: ReadonlyTaskContinuationState,
+): void {
+  const pending = state.pendingDelivery;
+  const workerGeneration = state.currentWorkerGeneration;
+  if (!pending || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) {
+    failReadonlyTaskContinuationVisible(
+      ds.session, state.currentTurnId, state.currentDispatchAttempt,
+      workerGeneration ?? 0, 'readonly_continuation_delivery_proof_missing',
+    );
+    return;
+  }
+  const stillOwnsDelivery = (): boolean => {
+    const current = ds.session.readonlyTaskContinuation;
+    return current?.status === 'delivering'
+      && current.leaseId === state.leaseId
+      && current.currentTurnId === state.currentTurnId
+      && current.currentDispatchAttempt === state.currentDispatchAttempt
+      && current.currentWorkerGeneration === workerGeneration;
+  };
+  const finalMessage: Extract<WorkerToDaemon, { type: 'final_output' }> = {
+    type: 'final_output',
+    sessionId: ds.session.sessionId,
+    turnId: state.currentTurnId,
+    dispatchAttempt: state.currentDispatchAttempt,
+    content: pending.content,
+    lastUuid: `readonly:${state.leaseId}:${state.currentTurnId}:${state.currentDispatchAttempt ?? ''}`,
+  };
+  deliverFinalOutput(
+    ds, finalMessage, tag(ds), 0,
+    (owned, messageId) => {
+      if (!owned || !messageId) {
+        failReadonlyTaskContinuationVisible(
+          ds.session, state.currentTurnId, state.currentDispatchAttempt, workerGeneration!,
+          owned
+            ? 'readonly_continuation_final_delivery_unproven'
+            : 'readonly_continuation_final_delivery_failed',
+        );
+        return;
+      }
+      if (pending.kind === 'completed') {
+        completeReadonlyTaskContinuation(
+          ds.session, state.currentTurnId, state.currentDispatchAttempt,
+          messageId, workerGeneration!,
+        );
+      } else {
+        finishReadonlyTaskContinuationAwaitUser(
+          ds.session, state.currentTurnId, state.currentDispatchAttempt,
+          messageId, workerGeneration!,
+        );
+      }
+    },
+    stillOwnsDelivery,
+    frozenReplyContextForTurn(ds, state.currentTurnId).target,
+  );
+}
+
+function deliverReadonlyTaskContinuationWarningPending(
+  ds: DaemonSession,
+  state: ReadonlyTaskContinuationState,
+): void {
+  const stillOwnsWarning = (): boolean => {
+    const current = ds.session.readonlyTaskContinuation;
+    return current?.leaseId === state.leaseId
+      && !!current.pendingWarning
+      && current.warningDispatched !== true;
+  };
+  deliverFinalOutput(
+    ds,
+    {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: state.logicalTurnId,
+      content: readonlyTaskContinuationWarning(state),
+      lastUuid: `readonly-warning:${state.leaseId}`,
+    },
+    tag(ds),
+    0,
+    (owned, messageId) => {
+      if (owned && messageId) {
+        completeReadonlyTaskContinuationWarning(ds.session, state.leaseId, messageId);
+      } else {
+        failReadonlyTaskContinuationWarningDelivery(ds.session, state.leaseId);
+      }
+    },
+    stillOwnsWarning,
+    frozenReplyContextForTurn(ds, state.logicalTurnId).target,
+  );
+}
+
+/** Attach the opt-in read-only task continuation owner. The machine switch is
+ * checked both here and before every dispatch; an off switch leaves all normal
+ * sessions on their existing path. */
+export function ensureReadonlyTaskContinuationAttached(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  const current = ds.session.readonlyTaskContinuation;
+  // A kill switch stops every new automatic dispatch, but it must not hide a
+  // warning that was already durably owed to the user. Attach the coordinator
+  // long enough to restore dashboard attention and either settle or expire the
+  // persisted warning outbox; deps.enabled() below still keeps execution off.
+  const needsWarningSettlement = !!current
+    && (current.pendingWarning !== undefined || current.warningDispatched === true);
+  if (!readonlyTaskContinuationEligible(ds, botCfg) && !needsWarningSettlement) {
+    disposeReadonlyTaskContinuation(ds.session);
+    if (current && ['active', 'backoff', 'dispatching', 'delivering'].includes(current.status)) {
+      ds.session.readonlyTaskContinuation = {
+        ...current,
+        status: 'cancelled',
+        nextAttemptAt: undefined,
+        lastErrorCode: readonlyTaskContinuationEnabled()
+          ? 'readonly_continuation_ineligible'
+          : 'readonly_continuation_disabled',
+      };
+      sessionStore.updateSession(ds.session);
+    }
+    return false;
+  }
+  attachReadonlyTaskContinuation(ds.session, {
+    schedule: (delayMs, run) => {
+      const timer = setTimeout(run, delayMs);
+      timer.unref?.();
+      return timer;
+    },
+    cancel: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    persist: () => sessionStore.updateSession(ds.session),
+    enabled: readonlyTaskContinuationEnabled,
+    recoverDelivery: state => deliverReadonlyTaskContinuationPending(ds, state),
+    canEnqueue: () => {
+      const workerGeneration = ds.workerGeneration;
+      const proof = ds.readonlyContinuationRpcProof;
+      return readonlyTaskContinuationEligible(ds)
+        && ordinaryTurnRecoveryStillOwnsSession(ds)
+        && !!ds.worker
+        && !ds.worker.killed
+        && ds.worker.connected !== false
+        && ds.workerReady === true
+        && Number.isSafeInteger(workerGeneration)
+        && (workerGeneration ?? 0) > 0
+        && ds.session.workerGeneration === workerGeneration
+        && proof?.workerGeneration === workerGeneration;
+    },
+    enqueue: (dispatch: ReadonlyTaskContinuationDispatch) => {
+      if (!readonlyTaskContinuationEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) {
+        return false;
+      }
+      const workerGeneration = ds.workerGeneration;
+      const proof = ds.readonlyContinuationRpcProof;
+      if (!ds.worker || ds.worker.killed || ds.worker.connected === false
+        || ds.workerReady !== true
+        || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0
+        || ds.session.workerGeneration !== workerGeneration
+        || proof?.workerGeneration !== workerGeneration) {
+        return false;
+      }
+      const current = ds.session.readonlyTaskContinuation;
+      if (!current || current.currentTurnId !== dispatch.turnId
+        || current.currentDispatchAttempt !== dispatch.dispatchAttempt) return false;
+      try {
+        ds.worker.send({
+          type: 'message',
+          content: dispatch.prompt,
+          turnId: dispatch.turnId,
+          dispatchAttempt: dispatch.dispatchAttempt,
+          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+          readonlyContinuation: {
+            leaseId: current.leaseId,
+            rpcGeneration: proof!.rpcGeneration,
+          },
+        } satisfies Extract<DaemonToWorker, { type: 'message' }>);
+        recordAdmittedOrdinaryUserTurn(ds, dispatch.turnId, {
+          beginRecovery: false,
+          dispatchAttempt: dispatch.dispatchAttempt,
+        });
+        return workerGeneration!;
+      } catch (err) {
+        logger.error(
+          `[${tag(ds)}] Failed to enqueue read-only task continuation `
+          + `${dispatch.continuation}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return false;
+      }
+    },
+    attend: state => {
+      const warning = readonlyTaskContinuationWarning(state);
+      ds.agentAttention = { kind: 'blocked', reason: warning, at: Date.now() };
+      publishAttentionPatch(ds);
+      emitSessionLifecycleHook(ds, 'session.requires_attention', {
+        reason: 'readonly_task_continuation_stopped',
+        errorCode: state.lastErrorCode,
+        logicalTurnId: state.logicalTurnId,
+      });
+    },
+    warn: state => {
+      deliverReadonlyTaskContinuationWarningPending(ds, state);
+    },
+  });
+  return true;
+}
+
 function sessionRuntimeDisplayName(
   ds: DaemonSession,
   botCfg?: { cliRuntime?: CliRuntimeConfig },
@@ -1684,7 +2002,7 @@ function sessionAgentConfig(
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
     const reasoningEffort = selected.reasoningEffort ?? groupEffort;
-    const modelBackendVariant = selected.cliId === 'traex'
+    const modelBackendVariant = isBackendVariantCliId(selected.cliId)
       ? selected.modelBackendVariant ?? undefined
       : undefined;
     const launchShell = selected.launchShell ?? undefined;
@@ -1756,7 +2074,7 @@ function sessionAgentConfig(
     ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
-    ds.session.modelBackendVariant = ds.session.cliId === 'traex'
+    ds.session.modelBackendVariant = isBackendVariantCliId(ds.session.cliId)
       ? ds.session.modelBackendVariant ?? botCfg.modelBackendVariant
       : undefined;
     ds.session.agentFrozen = true;
@@ -1787,7 +2105,7 @@ function sessionAgentConfig(
         repaired = true;
       }
     }
-    if (ds.session.cliId !== 'traex' && ds.session.modelBackendVariant !== undefined) {
+    if (!isBackendVariantCliId(ds.session.cliId) && ds.session.modelBackendVariant !== undefined) {
       ds.session.modelBackendVariant = undefined;
       repaired = true;
     }
@@ -2260,8 +2578,6 @@ function resolveUsageAwareScreenStatus(
   }
   return ds.usageLimit ? 'limited' : workerStatus;
 }
-
-const WORKER_ERROR_MARKER = '[botmux-worker-error]';
 
 function logWorkerStderr(t: string, line: string): void {
   if (!line) return;
@@ -3957,7 +4273,8 @@ function flushCardPatch(ds: DaemonSession): void {
       patchSucceeded = true;
     })
     .catch(err => {
-      if (err instanceof MessageWithdrawnError) {
+      if (err instanceof MessageWithdrawnError || err instanceof MessageUpdateExpiredError) {
+        const reason = err instanceof MessageUpdateExpiredError ? 'expired' : 'withdrawn';
         // Only clear streamCardId when the withdrawn message is still the
         // active one. With auto-recall a new turn may have advanced
         // ds.streamCardId past `cardId` while this PATCH was in flight (the
@@ -3966,11 +4283,11 @@ function flushCardPatch(ds: DaemonSession): void {
         // forget the live new card and trigger a duplicate POST on the next
         // screen_update.
         if (ds.streamCardId === cardId) {
-          logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
+          logger.warn(`[${tag(ds)}] Stream card ${reason}, clearing reference`);
           ds.streamCardId = undefined;
           persistStreamCardState(ds);
         } else {
-          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
+          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} ${reason} (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
         }
         return;
       }
@@ -6960,6 +7277,7 @@ export async function closeSession(
 
   if (ds) {
     disposeOrdinaryTurnRecovery(ds.session);
+    disposeReadonlyTaskContinuation(ds.session);
     killWorker(ds, {
       ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
       // The prepare above already proved this cancel; the durable row cleared the
@@ -7795,6 +8113,11 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
     failOrdinaryImDelivery(record, 'worker_generation_changed');
     return false;
   }
+  if (workerIpcBootstrapStates.has(record.worker)) {
+    return afterWorkerIpcBootstrap(record.worker, () => {
+      sendOrdinaryImDeliveryAttempt(record);
+    });
+  }
 
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
@@ -8097,9 +8420,9 @@ export function sendWorkerSessionInput(
   message: TransferBufferedInput,
 ): boolean {
   if (bufferTransferInput(ds, message)) return true;
-  if (!ds.worker || ds.worker.killed) return false;
-  ds.worker.send(message);
-  return true;
+  const worker = ds.worker;
+  if (!worker || worker.killed) return false;
+  return afterWorkerIpcBootstrap(worker, () => worker.send(message));
 }
 
 function settleTransferInputGate(
@@ -8204,7 +8527,9 @@ function releaseTransferInputGate(
             throw new Error('replacement worker rejected tracked IM delivery');
           }
         } else {
-          worker.send(message);
+          if (!afterWorkerIpcBootstrap(worker, () => worker.send(message))) {
+            throw new Error('replacement worker IPC bootstrap is unavailable');
+          }
         }
         gate.messages.shift();
       } catch (err) {
@@ -8732,13 +9057,13 @@ export async function transferSession(
 
 /** Backends whose conversation state is a local, copyable transcript file and
  *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex terminal:
- *  `codex fork <id>`). App-server backends (codex-app, or a codex CLI running in
+ *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
+ *  terminal: `<cli> fork <id>`). App-server backends (codex-app, or a Codex-family CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex', 'grok',
+  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -8754,7 +9079,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // unrelated/empty local session, so refuse rather than claiming a copy was
   // made. A future server-side thread/fork primitive can add an explicit path.
   if (ds.session.existingAppServerEndpoint) return false;
-  // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
+  // Codex/TraeX terminal mode is forkable; Hybrid RPC input is not (the
   // thread is an app-server live session, no local rollout to `codex fork`).
   //
   // Read BOTH the live config AND the SPAWN-TIME truth (ds.initConfig): a pane
@@ -8766,7 +9091,8 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // and let `/fork` run `codex fork` against a rollout that does not exist.
   // ORing the frozen init flag closes that window (over-refuse, never leak).
   const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
-  if (cliId === 'codex' && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+  if ((cliId === 'codex' || cliId === 'traex')
+    && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
     return false;
   }
   return true;
@@ -9508,31 +9834,48 @@ function rollbackWorkerForkPreInit(
 function recordAdmittedOrdinaryUserTurn(
   ds: DaemonSession,
   turnId: string,
-  opts: { beginRecovery: boolean },
+  opts: { beginRecovery: boolean; dispatchAttempt?: number },
 ): void {
   const priorRecoveryStatus = ds.session.ordinaryTurnRecovery?.status;
+  const priorReadonlyStatus = ds.session.readonlyTaskContinuation?.status;
   let recoveryBookkeepingSucceeded = false;
-  try {
-    if (opts.beginRecovery) {
-      // Freeze the fire's silent attribute onto the logical turn now: the
-      // scheduler arms the runtime registry before dispatch, so it is readable
-      // here, and only the persisted copy survives a restart.
-      const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
-        silent: isSilentScheduledTurn(ds, turnId),
-      });
-      recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
-        && state.currentTurnId === turnId;
-    } else {
-      const state = cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
-      recoveryBookkeepingSucceeded = state?.status === 'cancelled'
-        && state.cancelledByTurnId === turnId;
+  if (isOrdinaryRecoveryTurnId(turnId)) {
+    try {
+      if (opts.beginRecovery) {
+        // Freeze the fire's silent attribute onto the logical turn now: the
+        // scheduler arms the runtime registry before dispatch, so it is readable
+        // here, and only the persisted copy survives a restart.
+        const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
+          silent: isSilentScheduledTurn(ds, turnId),
+        });
+        recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
+          && state.currentTurnId === turnId;
+      } else {
+        const state = cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
+        recoveryBookkeepingSucceeded = state?.status === 'cancelled'
+          && state.cancelledByTurnId === turnId;
+      }
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Failed to persist ordinary-turn recovery bookkeeping `
+        + `after admitting ${turnId.substring(0, 16)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
-  } catch (err) {
-    logger.error(
-      `[${tag(ds)}] Failed to persist ordinary-turn recovery bookkeeping `
-      + `after admitting ${turnId.substring(0, 16)}: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
+  }
+  const readonlyState = ds.session.readonlyTaskContinuation;
+  const isCurrentReadonlyTurn = readonlyState?.currentTurnId === turnId
+    && readonlyState.currentDispatchAttempt === opts.dispatchAttempt;
+  if (!isCurrentReadonlyTurn && priorReadonlyStatus
+    && ['active', 'backoff', 'dispatching', 'delivering', 'awaiting_user'].includes(priorReadonlyStatus)) {
+    try {
+      cancelReadonlyTaskContinuationForUserInput(ds.session, turnId);
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Failed to cancel read-only continuation for new user input `
+        + `${turnId.substring(0, 16)}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   if (recoveryBookkeepingSucceeded
     && (priorRecoveryStatus === 'exhausted' || priorRecoveryStatus === 'attention_required')
@@ -9646,9 +9989,12 @@ export function sendWorkerInput(
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
-      if (isOrdinaryRecoveryTurnId(turnId)) {
-        recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: false });
-      }
+      recordAdmittedOrdinaryUserTurn(ds, queuedTurnId, {
+        beginRecovery: false,
+        ...(opts.dispatchAttempt !== undefined
+          ? { dispatchAttempt: opts.dispatchAttempt }
+          : {}),
+      });
       return true;
     } catch (err) {
       logger.error(
@@ -9745,8 +10091,12 @@ export function sendWorkerInput(
     );
     return false;
   }
-  if (isOrdinaryRecoveryTurnId(turnId)) {
-    recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: true });
+  {
+    const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
+    recordAdmittedOrdinaryUserTurn(ds, admittedTurnId, {
+      beginRecovery: true,
+      ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    });
   }
   return true;
 }
@@ -10103,9 +10453,12 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
-    if (isOrdinaryRecoveryTurnId(head.turnId)) {
-      recordAdmittedOrdinaryUserTurn(ds, head.turnId, { beginRecovery: true });
-    }
+    recordAdmittedOrdinaryUserTurn(ds, head.turnId, {
+      beginRecovery: true,
+      ...(head.dispatchAttempt !== undefined
+        ? { dispatchAttempt: head.dispatchAttempt }
+        : {}),
+    });
   } catch (err) {
     // Durable ownership already moved to the journal (and Codex ledger). Never
     // append another owner on retry; fence this IPC generation and let recovery
@@ -11065,6 +11418,10 @@ export function forkWorker(
   // progress, version banners, deprecation warnings, etc. there. The line
   // is still visible (tagged `:err`) for triage. Real worker faults arrive
   // separately via the IPC `Worker error` branch and stay as logger.error.
+  // Per-worker bounded stderr ring for crash/startup-failure cards. Lives in
+  // this fork closure for the worker process's lifetime and is GC'd after exit
+  // (no global registry).
+  const stderrRing = createWorkerStderrRing();
   worker.stdout?.on('data', (data: Buffer) => {
     for (const line of data.toString().split('\n')) {
       const trimmed = line.trim();
@@ -11073,7 +11430,9 @@ export function forkWorker(
   });
   worker.stderr?.on('data', (data: Buffer) => {
     for (const line of data.toString().split('\n')) {
-      logWorkerStderr(t, line.trim());
+      const trimmed = line.trim();
+      stderrRing.push(trimmed);
+      logWorkerStderr(t, trimmed);
     }
   });
 
@@ -11302,16 +11661,22 @@ export function forkWorker(
 
   // Use shared handler for IPC messages and exit
   replyCardModeFor(ds, initMsg.turnId);
-  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
 
   ds.worker = worker;
+  initializeWorkerIpcBootstrap(worker);
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
     sendOrdinaryImDeliveryTracked(ds, initMsg);
   } else {
-    worker.send(initMsg);
+    afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
   }
-  if (prompt.length > 0 && isOrdinaryRecoveryTurnId(initAttributionTurnId)) {
-    recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId, { beginRecovery: true });
+  if (prompt.length > 0) {
+    recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId ?? `admitted-turn-${randomUUID()}`, {
+      beginRecovery: true,
+      ...(initDispatchAttempt !== undefined
+        ? { dispatchAttempt: initDispatchAttempt }
+        : {}),
+    });
   }
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
@@ -11541,6 +11906,7 @@ function setupWorkerHandlers(
   worker: ChildProcess,
   startupState: WorkerStartupState = { ready: false, failureNotified: false },
   reservedWorkerGeneration?: number,
+  stderrRing: WorkerStderrRing = createWorkerStderrRing(),
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
@@ -11552,6 +11918,8 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
+  ds.readonlyContinuationRpcProof = undefined;
+  ds.readonlyContinuationTurnOrigin = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -11699,6 +12067,7 @@ function setupWorkerHandlers(
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
+  ensureReadonlyTaskContinuationAttached(ds, botCfg);
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -11821,6 +12190,9 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'worker_ipc_ready':
+        // Consumed by the standalone bootstrap listener installed at spawn.
+        break;
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -13641,6 +14013,13 @@ function setupWorkerHandlers(
           }
           if (msg.logTail?.trim()) {
             parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
+          } else {
+            // No worker-provided terminal tail (e.g. worker died before it could
+            // scrape one): fall back to the daemon-side per-worker stderr ring.
+            const stderrTail = stderrRing.render({ maxLines: 10, maxChars: 1500 });
+            if (stderrTail) {
+              parts.push(`${tr('workerDiag.recentStderr', undefined, loc)}\n${stderrTail}`);
+            }
           }
           if (!suppressExitUi) {
             try {
@@ -13677,6 +14056,16 @@ function setupWorkerHandlers(
         // idle sessions got "会话启动失败" cards while their panes were alive).
         if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
         await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
+        break;
+      }
+
+      case 'worker_fatal': {
+        // Structured worker-side fatal (worker.ts reports a death cause that
+        // has no stderr line of its own). Log it like `error` and pin it onto
+        // this fork's stderr ring so the crash / pre-ready-exit card carries
+        // the cause; the process exit itself is handled by the exit handler.
+        logger.error(`[${t}] Worker fatal: ${msg.message}`);
+        stderrRing.pushMarker(msg.message);
         break;
       }
 
@@ -13819,11 +14208,31 @@ function setupWorkerHandlers(
       }
 
       case 'explicit_reply_observed': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored explicit_reply_observed from stale worker generation`);
+          break;
+        }
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
             replyMessageId: msg.messageId,
           });
+        }
+        const continuation = ds.session.readonlyTaskContinuation;
+        if (msg.responseKind === 'final'
+          && continuation?.logicalTurnId === msg.turnId
+          && continuation.currentTurnId === msg.turnId
+          && continuation.currentDispatchAttempt === undefined) {
+          try {
+            completeReadonlyTaskContinuationOriginalBusinessFinal(
+              ds.session, msg.turnId, workerGeneration, msg.messageId,
+            );
+          } catch (err) {
+            logger.error(
+              `[${t}] Failed to persist original-turn business final for read-only continuation `
+              + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         break;
       }
@@ -13916,7 +14325,13 @@ function setupWorkerHandlers(
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
-        const recoveryOwnsTerminal = ordinaryTurnRecoveryHandlesTerminal(ds.session, msg);
+        const readonlyTerminal = { ...msg, workerGeneration };
+        const readonlyContinuationOwnsTerminal = readonlyTaskContinuationHandlesTerminal(
+          ds.session,
+          readonlyTerminal,
+        );
+        const recoveryOwnsTerminal = ordinaryTurnRecoveryHandlesTerminal(ds.session, msg)
+          || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
@@ -13935,6 +14350,16 @@ function setupWorkerHandlers(
           // can be reconciled on the next terminal or daemon restart.
           logger.error(
             `[${t}] Failed to persist ordinary-turn recovery terminal for `
+            + `${msg.turnId.substring(0, 8)}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        try {
+          handleReadonlyTaskContinuationTerminal(ds.session, readonlyTerminal);
+          recoveryHandled ||= readonlyContinuationOwnsTerminal;
+        } catch (err) {
+          logger.error(
+            `[${t}] Failed to persist read-only task continuation terminal for `
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
@@ -14264,6 +14689,11 @@ function setupWorkerHandlers(
             ? { preexistingProcessIdentities }
             : {}),
         };
+        ds.readonlyContinuationTurnOrigin = msg.readonlyContinuation === true
+          && msg.turnId?.startsWith('bmx-readonly-')
+          && msg.dispatchAttempt !== undefined
+          ? { workerGeneration, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }
+          : undefined;
         break;
       }
 
@@ -14312,6 +14742,11 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored stale policy capability in managed turn origin revoke`);
         }
         if (!revokeLive && !revokePolicy) break;
+        if (ds.readonlyContinuationTurnOrigin?.workerGeneration === workerGeneration
+          && ds.readonlyContinuationTurnOrigin.turnId === msg.turnId
+          && ds.readonlyContinuationTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
+          ds.readonlyContinuationTurnOrigin = undefined;
+        }
         if (revokeLive) {
           ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
             ? {
@@ -14413,7 +14848,73 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'readonly_continuation_rpc_status': {
+        if (ds.worker !== worker
+          || msg.sessionId !== ds.session.sessionId
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored read-only RPC proof from stale worker generation`);
+          break;
+        }
+        ds.readonlyContinuationRpcProof = msg.eligible
+          ? { workerGeneration, rpcGeneration: msg.rpcGeneration, checkedAt: Date.now() }
+          : undefined;
+        break;
+      }
+
       case 'final_output': {
+        const continuation = ds.session.readonlyTaskContinuation;
+        const exactReadonlyFinal = continuation
+          && ['active', 'backoff'].includes(continuation.status)
+          && msg.turnId.startsWith('bmx-readonly-')
+          && msg.dispatchAttempt !== undefined
+          && continuation.currentTurnId === msg.turnId
+          && continuation.currentDispatchAttempt === msg.dispatchAttempt
+          && continuation.currentWorkerGeneration === workerGeneration;
+        if (exactReadonlyFinal) {
+          // MR1 deliberately surfaces failed-turn fallback text before the
+          // structured terminal. For a synthetic continuation that text is a
+          // transport diagnostic, not the model's strict JSON business result;
+          // let the following terminal decide whether the allowlisted output
+          // limit should continue or another failure should stop visibly.
+          if (msg.turnFailed) break;
+          const output = parseReadonlyContinuationOutput(msg.content);
+          if (!output) {
+            failReadonlyTaskContinuationVisible(
+              ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
+              'readonly_continuation_invalid_output',
+            );
+            break;
+          }
+          if (output.status === 'continue') break;
+          const deliveryState = beginReadonlyTaskContinuationDelivery(
+            ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
+            { kind: output.status, content: output.content },
+          );
+          if (deliveryState?.status !== 'delivering') break;
+          deliverReadonlyTaskContinuationPending(ds, deliveryState);
+          break;
+        }
+        if (msg.turnId.startsWith('bmx-readonly-')) {
+          logger.warn(`[${t}] Dropped stale/unbound read-only continuation final_output`);
+          break;
+        }
+        const originalContinuation = ds.session.readonlyTaskContinuation;
+        if (originalContinuation?.logicalTurnId === msg.turnId
+          && originalContinuation.currentTurnId === msg.turnId
+          && originalContinuation.currentDispatchAttempt === undefined
+          && msg.turnFailed !== true) {
+          try {
+            completeReadonlyTaskContinuationOriginalBusinessFinal(
+              ds.session, msg.turnId, workerGeneration, msg.lastUuid,
+            );
+          } catch (err) {
+            logger.error(
+              `[${t}] Failed to persist original-turn final output for read-only continuation `
+              + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         if (msg.codexAppSettlement) {
           const settlement = msg.codexAppSettlement;
           const acknowledge = (ok: boolean, error?: string): void => {
@@ -14722,7 +15223,13 @@ function setupWorkerHandlers(
       && !worker.killed
       && ds.session.status !== 'closed'
     ) {
-      const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
+      let reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
+      // Append the per-worker stderr tail so a startup crash shows its cause
+      // instead of a bare exit code (single notice, still via notifyStartupFailure).
+      const stderrTail = stderrRing.render({ maxLines: 8 });
+      if (stderrTail) {
+        reason += `\n\n${tr('workerDiag.recentStderr', undefined, loc)}\n${stderrTail}`;
+      }
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
       // out-of-band (which could post on a silent delivery).
@@ -15047,7 +15554,7 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-  onComplete?: (owned: boolean) => void,
+  onComplete?: (owned: boolean, messageId?: string) => void,
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
@@ -15482,7 +15989,7 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
-        onComplete?.(true);
+        onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
 
@@ -15554,7 +16061,7 @@ function deliverFinalOutput(
           explicit ? explicit.feedback?.requesterSubjectId : feedbackRequesterSubjectId,
           getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined);
       }
-      onComplete?.(true);
+      onComplete?.(true, messageId);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof ReplyCardWithdrawnError) {
@@ -15697,6 +16204,7 @@ export function forkAdoptWorker(
   }
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
+  ds.readonlyContinuationRpcProof = undefined;
   const cb = requireCallbacks();
   const t = tag(ds);
   const adopted = ds.adoptedFrom;
@@ -15807,6 +16315,8 @@ export function forkAdoptWorker(
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,
   // not error.log). See forkWorker for the rationale.
+  // Same per-worker stderr ring as forkWorker, for crash/startup-failure cards.
+  const stderrRing = createWorkerStderrRing();
   worker.stdout?.on('data', (data: Buffer) => {
     for (const line of data.toString().split('\n')) {
       const trimmed = line.trim();
@@ -15815,7 +16325,9 @@ export function forkAdoptWorker(
   });
   worker.stderr?.on('data', (data: Buffer) => {
     for (const line of data.toString().split('\n')) {
-      logWorkerStderr(t, line.trim());
+      const trimmed = line.trim();
+      stderrRing.push(trimmed);
+      logWorkerStderr(t, trimmed);
     }
   });
 
@@ -15954,9 +16466,10 @@ export function forkAdoptWorker(
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
-  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
   ds.worker = worker;
-  worker.send(initMsg);
+  initializeWorkerIpcBootstrap(worker);
+  afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
   } catch (err) {
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }

@@ -187,6 +187,19 @@ export class MessageWithdrawnError extends Error {
 }
 
 /**
+ * Thrown when a message has passed Lark's 14-day edit window and can never be
+ * PATCHed again (Lark code 230031). Unlike 230011 the message still exists —
+ * only updates are rejected permanently, so callers must stop retrying and post
+ * a fresh message rather than treating it as a transient failure.
+ */
+export class MessageUpdateExpiredError extends Error {
+  constructor(messageId: string) {
+    super(`Message ${messageId} can no longer be updated (past Lark's edit window)`);
+    this.name = 'MessageUpdateExpiredError';
+  }
+}
+
+/**
  * Re-exported from bot-registry (defined there to avoid an import cycle with
  * getBotClient). apiOnly bots throw this on any Feishu client request.
  */
@@ -232,6 +245,7 @@ function getLarkErrorCode(err: any): number | undefined {
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
 // Capability cache for the undocumented `/members/bots` endpoint. It prevents
 // repeated hits while the tenant/gateway cannot serve the API, but per-request
 // business errors (bad chat id, permission denial) must not poison other chats.
@@ -1173,13 +1187,18 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
         data: { content: stampBotmuxCallbackMarkers(cardJson) },
       });
     } catch (err: any) {
-      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+      const code = getLarkErrorCode(err);
+      if (code === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw new MessageWithdrawnError(messageId);
+      }
+      if (code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) {
+        throw new MessageUpdateExpiredError(messageId);
       }
       throw err;
     }
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
       throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
     }
   });

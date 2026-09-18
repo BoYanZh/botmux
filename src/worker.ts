@@ -410,6 +410,7 @@ import {
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
+import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -574,6 +575,7 @@ let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let rpcEnginePidMarker: string | null = null;
+let readonlyContinuationRpcGeneration: string | undefined;
 const piInitialPromptCleanupPaths: string[] = [];
 const piInitialPromptCleanupDirs: string[] = [];
 let piInitialPromptReadonlyRoots: string[] = [];
@@ -730,6 +732,7 @@ function stopCodexRpcEngine(): void {
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
   const engine = codexRpcEngine;
+  readonlyContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
     ...rpcLifecycleFailClosedOwners.keys(),
@@ -1242,6 +1245,8 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   let engine: CodexRpcEngine | undefined;
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
+  const readonlyContinuationEnabled = cfg.cliId === 'traex'
+    && process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
   const assertRpcEngagementCurrent = (): void => {
     if (!rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
@@ -1294,6 +1299,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
+      readonlyContinuationHardened: readonlyContinuationEnabled,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1460,6 +1466,19 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     codexRpcEngine = engine;
+    const capability = readonlyContinuationEnabled
+      ? await engine.checkReadonlyContinuationCapabilities()
+      : { ok: false, reason: 'readonly_continuation_disabled' };
+    readonlyContinuationRpcGeneration = capability.ok
+      ? randomBytes(16).toString('hex')
+      : undefined;
+    send({
+      type: 'readonly_continuation_rpc_status',
+      sessionId: cfg.sessionId,
+      rpcGeneration: readonlyContinuationRpcGeneration ?? 'unavailable',
+      eligible: capability.ok,
+      ...(capability.reason ? { reason: capability.reason } : {}),
+    });
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
     persistCliSessionId(threadId);
@@ -2517,6 +2536,10 @@ const FIRST_PROMPT_TIMEOUT_MS = 15_000;
 /** Hard cap for startup screens that outlive the soft fallback. Prevents a
  *  changed/missing readyPattern from trapping the first queued input forever. */
 const FIRST_PROMPT_HARD_TIMEOUT_MS = CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS;
+/** Re-check cadence while an explicit `loading` banner holds the queue. Bounded
+ *  by FIRST_PROMPT_HARD_TIMEOUT_MS, so the hold stays observable but can never
+ *  outlive the first-prompt budget. */
+const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
@@ -3344,6 +3367,10 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(capability.turnId ? { turnId: capability.turnId } : {}),
       ...(capability.dispatchAttempt !== undefined
         ? { dispatchAttempt: capability.dispatchAttempt }
+        : {}),
+      ...(currentBotmuxTurnId?.startsWith('bmx-readonly-')
+        && currentBotmuxDispatchAttempt !== undefined
+        ? { readonlyContinuation: true as const }
         : {}),
     });
   }
@@ -5065,12 +5092,16 @@ function explicitReplyMarkerForTurnWindow(
   return inWindow.at(-1);
 }
 
-function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | undefined): void {
+function notifyExplicitReplyObserved(
+  turnId: string,
+  marker: BridgeSendMarker | undefined,
+): void {
   if (!marker) return;
   send({
     type: 'explicit_reply_observed',
     turnId,
     ...(marker.messageId ? { messageId: marker.messageId } : {}),
+    ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
   });
 }
 
@@ -8432,6 +8463,39 @@ function clearPostHookEvidenceFallback(): void {
   }
 }
 
+/**
+ * 把当前渲染画面交给 IdleDetector 判定启动横幅（loading → 已初始化）。
+ *
+ * 快照型后端（ZMX 用 `zmx history` 取当前屏）不会把「原地重绘」当成 PTY 追加
+ * 输出，已初始化的横幅只会走 screen resync，永远到不了 feed()，启动闸因此无法
+ * 解除。这里主动拉一次权威画面补上这条证据；与 screenShowsReadyPattern() 同样
+ * 只读当前渲染视口，并保留横幅边框与列间距：默认 rawSnapshot() 仍会清理
+ * box drawing，导致适配器的结构正则永远不匹配；scrollback 日志则可能含旧横幅。
+ */
+function observeStartupBannerOnScreen(): boolean {
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen) return false;
+  if (idleDetector?.observeStartupScreen(screen) !== true) return false;
+  log(`${cliName()} initialized banner observed on screen; releasing the startup hold`);
+  // Initialization is not an idle/turn boundary. It only lifts the startup veto
+  // on adapters that already permit input while busy. Re-kick their held queue
+  // through the normal writer (which retains restart, principal, hook-review,
+  // and submission-recovery gates), without publishing a false prompt_ready.
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
+}
+
+/** ZMX's complete cached history can carry a restoration header that no
+ * synthetic renderer viewport retains. Both resync and append-only captures
+ * update this cache before notifying us; neither path may strand startup. */
+function observeRestoredStartupHistory(): void {
+  if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
+  if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
+  log(`${cliName()} restored history observed; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
 function screenShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
@@ -10719,6 +10783,7 @@ function onPtyData(data: string): void {
   lastPtyOutputAtMs = Date.now();
   ptyOutputGeneration.observe();
   idleDetector?.feed(data);
+  observeRestoredStartupHistory();
 }
 
 /**
@@ -10771,12 +10836,19 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
   refreshHookReviewInputHold(visibleSnapshot);
+  if (awaitingFirstPrompt && !idleDetector?.isStartupComplete()) {
+    observeStartupBannerOnScreen();
+    // The async-write/generation fence also protects history startup evidence.
+    observeRestoredStartupHistory();
+  }
 
   // ZMX history does not carry the authoritative current PTY dimensions. A
   // local `zmx attach` can resize the session below our default 120x24 and that
   // size persists after detach, so even the rendered tail may include rows just
-  // above the real viewport. Never synthesize Enter/Down from a full-history
-  // resync. For the same reason, do not feed history into IdleDetector: an old
+  // above the real viewport. Never synthesize dialog-acceptance Enter/Down from
+  // a full-history resync. The startup observation above only releases the
+  // monotonic loading veto for already-permitted type-ahead input, not idle.
+  // Do not feed history into IdleDetector: an old
   // ready/completion marker just above the real viewport could otherwise flush
   // queued input into a CLI that is still busy. Later append-only history deltas
   // still flow through onPtyData; structured transcript completion remains
@@ -11365,6 +11437,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
+/** still_active 只是弱证据（屏幕没有门、但 PTY 刚有活动）：在 20s 弱证据
+ *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
+ *  机制自然终止链，这是保险上限。 */
+const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -11487,6 +11563,7 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   };
   let deferredRecheckAttempts = 0;
+  let activeSilenceExtra = 0;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
@@ -11557,6 +11634,32 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
+    // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
+    // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
+    let submitDiagnosisScreen = '';
+    if (effectiveBackendType !== 'zmx') {
+      try {
+        submitDiagnosisScreen = backend
+          ? captureBackendScreen(backend)
+          : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+      } catch { submitDiagnosisScreen = ''; }
+    }
+    const submitDiagnosis = diagnoseSubmitFailure({
+      screenText: submitDiagnosisScreen,
+      lastActivityAtMs: lastPtyActivityAtMs,
+    });
+    if (
+      submitDiagnosis.reason === 'still_active'
+      && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
+      && chainIsCurrent()
+    ) {
+      activeSilenceExtra += 1;
+      log(`Deferred recheck still sees fresh CLI activity (${submitDiagnosis.evidence}) — silencing submit card once more. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+    log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
+
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -11568,7 +11671,13 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : 'worker.submit_unconfirmed',
+            : submitDiagnosis.reason === 'logged_out'
+              ? 'submitDiag.logged_out'
+              : submitDiagnosis.reason === 'interactive_menu'
+                ? 'submitDiag.interactive_menu'
+                : submitDiagnosis.reason === 'draft_parked'
+                  ? 'submitDiag.draft_parked'
+                  : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -12135,12 +12244,47 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       try {
+        if (item.readonlyContinuation && !writeRpcEngine) {
+          emitTurnTerminal(
+            item.turnId ?? 'readonly-continuation-unknown',
+            'failed',
+            'readonly_continuation_rpc_unavailable',
+            item.dispatchAttempt,
+          );
+          break;
+        }
         if (writeRpcEngine) {
+          if (item.readonlyContinuation) {
+            const exactRestrictedInput = item.turnId?.startsWith('bmx-readonly-')
+              && item.dispatchAttempt !== undefined
+              && item.readonlyContinuation.rpcGeneration === readonlyContinuationRpcGeneration;
+            if (!exactRestrictedInput) {
+              emitTurnTerminal(
+                item.turnId ?? 'readonly-continuation-unknown',
+                'failed',
+                'readonly_continuation_rpc_proof_mismatch',
+                item.dispatchAttempt,
+              );
+              break;
+            }
+            const capability = await writeRpcEngine.checkReadonlyContinuationCapabilities();
+            if (!capability.ok) {
+              readonlyContinuationRpcGeneration = undefined;
+              emitTurnTerminal(
+                item.turnId!,
+                'failed',
+                capability.reason ?? 'readonly_continuation_capability_probe_failed',
+                item.dispatchAttempt,
+              );
+              break;
+            }
+          }
           rpcTurnIdentity = {
             turnId: item.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
             ...(item.dispatchAttempt !== undefined
               ? { dispatchAttempt: item.dispatchAttempt }
               : {}),
+            ...(item.readonlyContinuation ? { readonlyContinuation: true } : {}),
           };
           rpcTurnGeneration = {
             engine: writeRpcEngine,
@@ -12546,6 +12690,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (item.readonlyContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
       // Keep that optimization only within one authenticated principal: a
@@ -12614,6 +12759,7 @@ function sendToPty(
      *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
      *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
     atMostOnce?: true;
+    readonlyContinuation?: import('./types.js').ReadonlyContinuationDispatchMarker;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -12631,6 +12777,7 @@ function sendToPty(
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
+    ...(opts.readonlyContinuation ? { readonlyContinuation: opts.readonlyContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
@@ -12661,6 +12808,7 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
@@ -12692,15 +12840,15 @@ function sendToPty(
   // parks them but steers into the active turn — CodexBridgeQueue's
   // HOL-block-drop attributes the (possibly merged) result correctly.
   // Type-ahead lets the message write while the CLI is BUSY — but only once the
-  // TUI has booted. During startup / tmux re-attach (awaitingFirstPrompt) even a
-  // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
-  // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
-  // brief reaching Codex before its first idle and never landing.
+  // TUI has booted. First-ready or positive initialization evidence proves
+  // this; keep that evidence available to messages arriving after the startup
+  // observer's one-time queue flush, even if resyncs prevent ordinary idle.
   if (!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
@@ -14262,7 +14410,9 @@ async function spawnCli(
         throw new Error(
           `[read-isolation] refusing to start session ${cfg.sessionId}: `
           + `could not verify existing ${effectiveBackendType} pane `
-          + `(liveness probe: ${paneProbe})`,
+          + `(liveness probe: ${paneProbe})\n\n`
+          + `宿主机 tmux server 当前不可达：探测结果不确定时，botmux 会保持现状，不会清理或重建 pane。`
+          + `请不要执行 kill-server；后端恢复后会自动重新探测，也可稍后重发消息重试。`,
         );
       },
     };
@@ -17234,8 +17384,31 @@ async function spawnCli(
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
     // normal idle detection and flushes it without replaying a pasted draft.
+    //
+    // "The loaded frame re-drives it" only holds when that frame reaches
+    // feed(). On a snapshot-based backend it never does (see
+    // observeStartupScreen), so pull the authoritative screen here instead of
+    // waiting for a push that cannot come. If the banner still reports loading,
+    // re-check on a bounded schedule: returning without a timer made this
+    // branch terminal, and a hold that nothing can ever release silently
+    // swallows the queued messages for the lifetime of the session.
+    if (idleDetector?.isStartupPending()) {
+      observeStartupBannerOnScreen();
+    }
     if (idleDetector?.isStartupPending()) {
       log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
+      const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
+        const nextElapsedMs = elapsedMs + waitMs;
+        const startupTimer = setTimeout(
+          () => releaseFirstPromptTimeout(nextElapsedMs, nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS),
+          waitMs,
+        );
+        startupTimer.unref?.();
+      } else {
+        log(`WARN ${cliName()} never reported an initialized banner within the first-prompt budget; queued input stays held`);
+      }
       return;
     }
     if (!shouldReleaseFirstPromptTimeout({
@@ -20490,6 +20663,7 @@ process.on('message', async (raw: unknown) => {
           trustedController: msg.trustedController,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          ...(msg.readonlyContinuation ? { readonlyContinuation: msg.readonlyContinuation } : {}),
           ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
           ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });
@@ -21533,21 +21707,43 @@ process.on('exit', () => {
   teardownSandboxBestEffort();
   stopCodexRpcEngine();
 });
+let workerFatalReported = false;
+/** Best-effort one-shot terminal crash report. The 1s flush timeout means a
+ *  daemon that stopped draining can never delay the fail-closed exit; delivery
+ *  failure is swallowed. Both fatal handlers share this so a rejection that
+ *  immediately causes an exception (or vice versa) reports only once. */
+async function reportWorkerFatal(prefix: string, err: unknown): Promise<void> {
+  if (workerFatalReported) return;
+  workerFatalReported = true;
+  const detail = typeof err === 'object' && err !== null && 'stack' in err && (err as any).stack
+    ? String((err as any).stack)
+    : String(err);
+  const message = `${prefix}: ${detail}`.slice(0, 4096);
+  try {
+    await sendAndFlush({ type: 'worker_fatal', message });
+  } catch { /* best-effort — never delay exit */ }
+}
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.
   if (isIgnorableStreamError(err)) return;
-  try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
+    await reportWorkerFatal('Uncaught exception', err);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 process.on('unhandledRejection', (reason: any) => {
   if (isIgnorableStreamError(reason)) return;
-  try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
+    await reportWorkerFatal('Unhandled rejection', reason);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 
 log('Worker started, waiting for init...');

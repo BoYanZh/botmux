@@ -493,6 +493,22 @@ export interface CliAdapter {
    * It survives per-turn resets and is retired once per IdleDetector/spawn. */
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
+  /** Optional positive initialization evidence from a complete backend history
+   * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
+   * This only releases startup type-ahead; it never proves an idle/turn boundary. */
+  readonly startupReadyFromHistory?: (history: string) => boolean;
+
+  /**
+   * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
+   * (per IdleDetector instance; per-turn reset() does not restore it). Intended
+   * for adapters with readyPattern===undefined whose Bubble Tea style TUI can
+   * still be booting after the default 2s quiet window (OpenCode): the first
+   * queued message then waits this long before being pasted; every later cycle
+   * uses the normal quiescence. Ignored for adapters that define readyPattern
+   * (their prompt anchor gates quiescence already). The worker's first-prompt
+   * soft/hard timeouts remain the outer bound.
+   */
+  readonly firstPromptQuiescenceMs?: number;
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —

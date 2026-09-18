@@ -2,6 +2,8 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { BlockedUsersEditor } from './blocked-users-editor.js';
+import { QuietPresetSection } from './quiet-preset-section.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -62,7 +64,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
@@ -1141,6 +1143,7 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -2362,7 +2365,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (nextKey !== 'traex') {
+    if (!isBackendVariantCliId(nextKey)) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2457,7 +2460,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(cliKey === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(cliKey) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2663,7 +2666,7 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
-  const isTraex = cliKey === 'traex';
+  const isTraex = isBackendVariantCliId(cliKey);
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
@@ -4423,6 +4426,18 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             />
           </div>
           {replyMode === 'legacy' && pinToggle}
+          <QuietPresetSection
+            tr={tr}
+            thinkingCard={thinkingCard}
+            silentReactions={silentReactions}
+            disableStreaming={disableStreaming}
+            putCardPref={putCardPref}
+            onApplied={() => {
+              setThinkingCard(false);
+              setSilentReactions(true);
+              setDisableStreaming(true);
+            }}
+          />
         </section>
 
         <section className="bd-card-setting-group" data-card-buttons-group>

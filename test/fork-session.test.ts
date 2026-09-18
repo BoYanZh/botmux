@@ -154,8 +154,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
+  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -177,6 +177,15 @@ describe('isForkCapableSession', () => {
       botName: 'TestBot',
     } as any);
     const ds = makeSourceDs({ cliId: 'codex' });
+    expect(isForkCapableSession(ds)).toBe(false);
+  });
+
+  it('refuses a traex session running under Hybrid RPC input', () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'traex', larkAppId: 'cli_app_test', codexRpcInput: true },
+      botName: 'TestBot',
+    } as any);
+    const ds = makeSourceDs({ cliId: 'traex' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
@@ -579,6 +588,19 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
     const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
     expect(cfg.modelBackendVariant).toBeUndefined();
+  });
+
+  it('repairs a stale backend variant from a frozen non-TraeX session', () => {
+    const ds = makeSourceDs({
+      cliId: 'codex',
+      agentFrozen: true,
+      modelBackendVariant: 'max',
+    });
+
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+
+    expect(cfg.modelBackendVariant).toBeUndefined();
+    expect(ds.session.modelBackendVariant).toBeUndefined();
   });
 });
 
