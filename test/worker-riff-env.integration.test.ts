@@ -1,11 +1,29 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import {
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+  replaceManagedOriginCapabilityFile,
+} from '../src/core/managed-origin-capability.js';
+
+function rmTree(root: string): void {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== 'ENOTEMPTY' && code !== 'EBUSY') || attempt === 7) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
 
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -30,7 +48,76 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
 }
 
 describe('Riff worker session environment', () => {
-  it('forwards a disabled reply-card usage switch into the remote sandbox', async () => {
+  it('forwards an omitted response kind through the Riff relay as non-final', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-cli-riff-feedback-'));
+    const outbox = join(root, 'outbox');
+    const dataDir = join(root, 'data');
+    const capability = 'ab'.repeat(32);
+    writeFileSync(join(root, 'placeholder'), '');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(outbox, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    replaceManagedOriginCapabilityFile(join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
+      token: capability,
+      turnId: 'turn-riff-feedback',
+      dispatchAttempt: 1,
+    }));
+    const fixture = join(root, 'host-send.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      process.stdout.write(JSON.stringify({
+        content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
+      }));
+    `);
+    const stop = (await import('../src/adapters/backend/sandbox.js')).startOutboxWatcher(
+      outbox,
+      { ...process.env },
+      'sid-riff-feedback',
+      {
+        cliPath: fixture,
+        authorize: claim => claim.capability === capability
+          ? { ok: true as const, origin: { turnId: 'turn-riff-feedback', dispatchAttempt: 1 } }
+          : { ok: false as const, error: 'stale' },
+      },
+    );
+    try {
+      const childResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+        const cli = spawnTsScript(resolve('src/cli.ts'), [
+          'send', 'unclassified Riff progress', '--session-id', 'sid-riff-feedback', '--no-mention',
+        ], {
+          cwd: resolve('.'),
+          env: {
+            ...process.env,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'sid-riff-feedback',
+            BOTMUX_SEND_RELAY: outbox,
+            BOTMUX_FEEDBACK_POLICY: JSON.stringify({ enabled: true }),
+            BOTMUX_WORKFLOW: '',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        cli.stdout?.on('data', chunk => { stdout += String(chunk); });
+        cli.stderr?.on('data', chunk => { stderr += String(chunk); });
+        cli.once('error', rejectPromise);
+        cli.once('close', status => resolvePromise({ status, stdout, stderr }));
+      });
+      expect(childResult.status, childResult.stderr).toBe(0);
+      expect(JSON.parse(childResult.stdout)).toEqual({
+        content: 'unclassified Riff progress',
+        responseKind: null,
+      });
+    } finally {
+      stop();
+      rmTree(root);
+    }
+  });
+
+  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -100,7 +187,7 @@ describe('Riff worker session environment', () => {
       }]));
 
       const logs: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -110,6 +197,7 @@ describe('Riff worker session environment', () => {
           BOTMUX_SESSION_ID: 'sid-riff-env',
           LARK_APP_ID: appId,
           LARK_APP_SECRET: 'secret',
+          BOTMUX_WORKFLOW_ENABLED: 'true',
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
@@ -133,10 +221,46 @@ describe('Riff worker session environment', () => {
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
-        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, injectStatusLines: false },
+        backendConfig: {
+          baseUrl: `http://127.0.0.1:${port}`,
+          injectStatusLines: false,
+          env: {
+            BOTMUX_OWNER_OPEN_ID: 'ou_stale_config_owner',
+            __OWNER_OPEN_ID: 'ou_stale_config_owner',
+            // A stale / attacker-shaped backend env trying to flip the workflow
+            // kill-switch OFF in the remote pane. riffCfg.env merges LAST and is
+            // NOT sanitized (unlike per-bot env), so the host must re-freeze the
+            // resolved value after the merge — otherwise this would desync the
+            // pane's CLI-side gate from the daemon's authoritative decision.
+            BOTMUX_WORKFLOW_ENABLED: 'false',
+            BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+          },
+        },
         prompt: 'verify remote session environment',
         larkAppId: appId,
         larkAppSecret: 'secret',
+        ownerOpenId: 'ou_authenticated_owner',
+        feedback: {
+          enabled: true,
+          audience: 'requester',
+          visibleSemantics: ['positive', 'progress', 'negative'],
+          buttons: [
+            { key: 'yes', label: 'Yes', semantic: 'positive', style: 'primary' },
+            { key: 'progress', label: 'Progress', semantic: 'progress', style: 'default' },
+            { key: 'no', label: 'No', semantic: 'negative', style: 'danger' },
+          ],
+          negativeFollowup: {
+            reasons: [],
+            comment: { enabled: false, required: false, placeholder: 'Explain', maxLength: 100 },
+          },
+          allowReselect: false,
+        },
+        replyStyle: {
+          recipes: false,
+          layout: false,
+          theme: 'minimal',
+          layoutTags: { blocked: '请处理' },
+        },
       };
       child.send(init);
 
@@ -147,11 +271,30 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      // The workflow kill-switch is host-resolved and re-frozen after the merge:
+      // the host is explicitly forced ON (BOTMUX_WORKFLOW_ENABLED=true in the
+      // worker env), so the stale backendConfig.env `false` must NOT survive
+      // into the remote pane.
+      expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
+      // replyStyle is another host-normalized spawn snapshot. The raw Riff env
+      // tries to replace it above, but the worker must re-freeze the init value.
+      expect(JSON.parse(request.config?.env?.BOTMUX_REPLY_STYLE)).toEqual({
+        recipes: false,
+        layout: false,
+        theme: 'minimal',
+        layoutTags: { blocked: '请处理' },
+      });
+      expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
+        enabled: true,
+        buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
+      });
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   }, 25_000);
 });

@@ -22,6 +22,7 @@ export type SessionStatus =
   | 'working'
   | 'idle'
   | 'analyzing'
+  | 'stalled'
   | 'limited'
   | 'starting'
   | 'dormant'
@@ -84,6 +85,8 @@ export function statusToDot(status: string): StatusDot {
       return { tone: 'success', pulse: true, label: 'sessions.status.working' };
     case 'analyzing':
       return { tone: 'info', pulse: true, label: 'sessions.status.analyzing' };
+    case 'stalled':
+      return { tone: 'danger', pulse: false, label: 'sessions.status.stalled' };
     case 'starting':
       return { tone: 'info', pulse: true, label: 'sessions.status.starting' };
     case 'idle':
@@ -122,6 +125,7 @@ function formatRelative(fromMs: number, nowMs: number): string {
 function buildSecondary(row: SessionRow, nowMs?: number): string {
   const parts: string[] = [];
   if (row.cliId) parts.push(String(row.cliId));
+  if (row.cliInstanceSource) parts.push(`instance:${row.cliInstanceId ?? 'legacy'} (${row.cliInstanceSource})`);
   if (row.workingDir) parts.push(row.workingDir);
   if (typeof nowMs === 'number' && Number.isFinite(row.lastMessageAt)) {
     parts.push(formatRelative(row.lastMessageAt, nowMs));
@@ -184,11 +188,12 @@ export function filterByCli(entries: ReadonlyArray<SessionRowDto>, cliId: string
 const STATUS_ORDER: Record<string, number> = {
   working: 0,
   analyzing: 1,
-  starting: 2,
-  idle: 3,
-  dormant: 4,
-  limited: 5,
-  closed: 6,
+  stalled: 2,
+  starting: 3,
+  idle: 4,
+  dormant: 5,
+  limited: 6,
+  closed: 7,
 };
 
 function statusRank(status: string): number {

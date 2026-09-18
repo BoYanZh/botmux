@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, getConfiguredOwnerOpenId, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
+import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
@@ -13,6 +14,29 @@ describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText leaves chatReplyModes undefined when absent/all-invalid', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm2', larkAppSecret: 's' }]))[0].chatReplyModes).toBeUndefined();
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
+  });
+
+  it('parseBotConfigsFromText preserves & filters chatMentionModes (four-state)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'mm1', larkAppSecret: 's',
+      chatMentionModes: {
+        oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient',
+        // Case/padding are normalized; unknown values and blank chat ids are dropped.
+        oc_5: '  NEVER  ', oc_6: 'bogus', oc_7: 42, '': 'never', '   ': 'always',
+      },
+    }]));
+    expect(cfgs[0].chatMentionModes).toEqual({
+      oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient', oc_5: 'never',
+    });
+  });
+
+  it('parseBotConfigsFromText leaves chatMentionModes undefined when absent/all-invalid/not-an-object', () => {
+    const at = (entry: Record<string, unknown>) =>
+      parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mm2', larkAppSecret: 's', ...entry }]))[0].chatMentionModes;
+    expect(at({})).toBeUndefined();
+    expect(at({ chatMentionModes: { oc_1: 'nope' } })).toBeUndefined();
+    // An array is an object in JS — the parser must still reject it.
+    expect(at({ chatMentionModes: ['always'] })).toBeUndefined();
   });
 
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
@@ -89,6 +113,42 @@ describe('bot-registry grant additions', () => {
     expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
   });
 
+  it('parses pinStreamingCard only as strict boolean true', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin1', larkAppSecret: 's', pinStreamingCard: true },
+    ]))[0].pinStreamingCard).toBe(true);
+
+    for (const bad of [undefined, false, 'true', 1, null]) {
+      const [cfg] = parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'pin2', larkAppSecret: 's', pinStreamingCard: bad },
+      ]));
+      expect(cfg.pinStreamingCard).toBeUndefined();
+    }
+  });
+
+  it('parses noPinStreamingCardChats as a trimmed, deduplicated string list', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'pin_chat_1',
+      larkAppSecret: 's',
+      noPinStreamingCardChats: [' oc_chat_a ', 'oc_chat_b', '', '   ', 'oc_chat_a', 1, null],
+    }]));
+    expect(cfg.noPinStreamingCardChats).toEqual(['oc_chat_a', 'oc_chat_b']);
+  });
+
+  it('leaves noPinStreamingCardChats undefined when absent, non-array, or all invalid', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_2', larkAppSecret: 's' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_3', larkAppSecret: 's', noPinStreamingCardChats: 'oc_chat_a' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_4', larkAppSecret: 's', noPinStreamingCardChats: ['', '  ', 1, null] },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+  });
+
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
     registerBot({ larkAppId: 'a2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com', 'ou_owner', 'ou_2'] });
     expect(getOwnerOpenId('a2')).toBe('ou_owner');
@@ -99,6 +159,45 @@ describe('bot-registry grant additions', () => {
     expect(getOwnerOpenId('a3')).toBeUndefined();
   });
 
+  it('getOwnerOpenId prioritizes explicit ownerOpenId while it remains allowed', () => {
+    const bot = registerBot({
+      larkAppId: 'a4',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_first', 'ou_owner_explicit', 'ou_second'];
+    expect(getOwnerOpenId('a4')).toBe('ou_owner_explicit');
+  });
+
+  it('falls back to the resolved allowlist after explicit owner removal', () => {
+    const bot = registerBot({
+      larkAppId: 'a5',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getOwnerOpenId('a5')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a5')).toEqual(['ou_second']);
+  });
+
+  it('keeps raw explicit owner available only for DM fallback', () => {
+    const bot = registerBot({
+      larkAppId: 'a6',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getConfiguredOwnerOpenId('a6')).toBe('ou_owner_explicit');
+    expect(getOwnerOpenId('a6')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a6')).toEqual(['ou_second']);
+  });
+
   it('parses messageQuota.defaultLimit only when a positive integer', () => {
     const ok = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq1', larkAppSecret: 's', messageQuota: { defaultLimit: 20 } }]));
     expect(ok[0].messageQuota).toEqual({ defaultLimit: 20 });
@@ -107,6 +206,25 @@ describe('bot-registry grant additions', () => {
       expect(c[0].messageQuota).toBeUndefined();
     }
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq2', larkAppSecret: 's' }]))[0].messageQuota).toBeUndefined();
+  });
+
+  it('parses grantDefaultDurationMs only from the finite card options', () => {
+    for (const durationMs of GRANT_DURATION_OPTIONS) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: `gd${durationMs}`,
+        larkAppSecret: 's',
+        grantDefaultDurationMs: durationMs,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBe(durationMs);
+    }
+    for (const bad of [undefined, null, '3600000', 0, -1, 2.5, 2 * 60 * 60 * 1000]) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: 'gd_bad',
+        larkAppSecret: 's',
+        grantDefaultDurationMs: bad,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBeUndefined();
+    }
   });
 
   it('parses & sanitizes quotaState (scope-aware keys + positive int limit, used>=0)', () => {
@@ -203,6 +321,25 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].summaryRange).toEqual({ limit: 0, sinceHours: 0 });
     expect(cfgs[1].summaryRange).toEqual({ limit: 20, sinceHours: 8 });
     expect(cfgs[2].summaryRange).toBeUndefined();
+  });
+
+  it('parses summaryMemory as a default-off boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sm1', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 'docs/summary.md' },
+      { larkAppId: 'sm2', larkAppSecret: 's', summaryMemory: false, summaryMemoryPath: '/tmp/botmux-summary.md' },
+      { larkAppId: 'sm3', larkAppSecret: 's', summaryMemory: 'true' },
+      { larkAppId: 'sm4', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: '   ' },
+      { larkAppId: 'sm5', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 123 },
+    ]));
+
+    expect(cfgs[0].summaryMemory).toBe(true);
+    expect(cfgs[0].summaryMemoryPath).toBe('docs/summary.md');
+    expect(cfgs[1].summaryMemory).toBeUndefined();
+    expect(cfgs[1].summaryMemoryPath).toBe('/tmp/botmux-summary.md');
+    expect(cfgs[2].summaryMemory).toBeUndefined();
+    expect(cfgs[2].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[3].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[4].summaryMemoryPath).toBeUndefined();
   });
 
   it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {

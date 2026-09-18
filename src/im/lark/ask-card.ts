@@ -4,10 +4,13 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
+import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
+import { requestGrantForAskClicker } from './ask-grant-request.js';
+import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -21,6 +24,8 @@ export const ASK_TOGGLE_ACTION = 'ask_toggle';
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
 export interface AskCardActionData {
+  context?: { open_message_id?: string };
+  open_message_id?: string;
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, unknown>;
@@ -34,6 +39,12 @@ export interface AskCardDispatcherDeps {
   updateMessage?: typeof updateMessage;
 }
 
+/** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
+export interface AskCardActionDeps {
+  requestGrant?: typeof requestGrantForAskClicker;
+  larkAppId?: string;
+}
+
 export function createLarkAskCardDispatcher(
   deps: AskCardDispatcherDeps = {},
 ): AskCardDispatcher {
@@ -43,6 +54,13 @@ export function createLarkAskCardDispatcher(
 
   return {
     async send(ask) {
+      if (ask.replyCardTarget) {
+        try { return { messageId: await publishReplyCardAsk(ask) }; }
+        catch (err) {
+          const { retryable, detail } = classifyAskDispatchError(err);
+          throw new AskDispatchError(detail, retryable);
+        }
+      }
       const cardJson = buildAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
@@ -50,12 +68,25 @@ export function createLarkAskCardDispatcher(
       // 所以这里要按前缀判断是否真的能 reply.
       const canReplyToRoot =
         typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
-      const messageId = canReplyToRoot
-        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true)
-        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive');
-      return { messageId };
+      // Pass the ask's stable dispatchUuid as the Feishu message uuid so a
+      // re-send after a daemon restart (restart-resume) dedupes server-side and
+      // returns the ORIGINAL message_id instead of posting a second card.
+      const uuid = ask.dispatchUuid;
+      try {
+        const messageId = canReplyToRoot
+          ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+          : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
+        return { messageId };
+      } catch (err) {
+        // Re-throw as a typed AskDispatchError so the broker's bounded retry can
+        // decide transient-vs-deterministic without importing HTTP types
+        // (codex P1-3). The same uuid is reused on retry → server-side dedupe.
+        const { retryable, detail } = classifyAskDispatchError(err);
+        throw new AskDispatchError(detail, retryable);
+      }
     },
     async onSettle(ask, result) {
+      if (ask.replyCardTarget) { await publishReplyCardAsk(ask, result); return; }
       if (!ask.cardMessageId) return;
       try {
         await update(ask.larkAppId, ask.cardMessageId, buildAskCard(ask, result));
@@ -70,12 +101,102 @@ export function createLarkAskCardDispatcher(
   };
 }
 
+/**
+ * Feishu business error codes that mean "the request is transient — retry
+ * later", per the official IM v1 send/reply error table + frequency-control
+ * guide (codex P1-3). These must be retryable EVEN when the HTTP status is a
+ * 4xx (some legacy freq-control surfaces as HTTP 400) or a 2xx-body business
+ * error — otherwise a same-uuid partial-success convergence (the second request
+ * arriving while the first is still "being sent") is wrongly given up on.
+ *
+ *   230049  the message is being sent — official "please retry"
+ *   230020  message API per-chat rate limit
+ *   99991400 generic OpenAPI frequency control (modern = HTTP 429, legacy = 400)
+ *
+ * NOT included: 11232 / 11233 are the old V4 message API; the current im.v1
+ * create/reply path never returns them, so mixing them in would only widen the
+ * whitelist without cause.
+ *
+ * Rate-limit codes (99991400 / HTTP 429) ideally honour `x-ogw-ratelimit-reset`
+ * as the retry delay — the broker's short fixed backoff can't outlast a long
+ * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
+ * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
+ */
+const TRANSIENT_LARK_CODES = new Set([230049, 230020, 99991400]);
+
+/** Extract a Lark business code from either error shape:
+ *  - axios path A: `response.data.code` / top-level `code` (number)
+ *  - 2xx-body path B: a plain Error whose message ends in `(code: NNN)` (the
+ *    `res.code !== 0` throws in client.ts embed the code only in the string). */
+function extractLarkCode(e: {
+  response?: { data?: { code?: number } }; code?: number; message?: string;
+} | null | undefined, rawMessage: string): number | undefined {
+  const structured = e?.response?.data?.code ?? e?.code;
+  if (typeof structured === 'number') return structured;
+  const m = /\(code:\s*(\d+)\)/.exec(rawMessage);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Classify a Feishu card-send failure into "worth retrying" vs "give up now"
+ * (codex P1-3). PURE + exported so the retry decision is unit-tested directly
+ * (executable decision seam) rather than asserted against source text.
+ *
+ * Retryable (transient — a re-send with the same uuid may succeed / dedupe):
+ *   - a well-known transient Lark business code (TRANSIENT_LARK_CODES), checked
+ *     FIRST so it wins even on an HTTP 400 or a 2xx-body business error
+ *   - no HTTP response at all (network reset, DNS, timeout)
+ *   - HTTP 429 (rate limited) or any 5xx (server-side)
+ * Not retryable (deterministic — re-sending repeats the same failure):
+ *   - HTTP 4xx other than 429 (bad request, permission, not found)
+ *   - message withdrawn (target gone)
+ *   - anything we can't positively classify → fail closed (retry is unsafe when
+ *     we can't prove idempotency).
+ *
+ * Extraction mirrors bot-registry.formatLarkError: status at `response.status`
+ * or `.status`; Feishu code at `response.data.code` / `.code` / message tail.
+ */
+export function classifyAskDispatchError(err: unknown): { retryable: boolean; detail: string } {
+  const e = err as {
+    isAxiosError?: boolean; name?: string; message?: string;
+    response?: { status?: number; data?: { code?: number; msg?: string } };
+    status?: number; code?: number; config?: unknown;
+  } | null | undefined;
+
+  const detail =
+    (e && (e.response?.data?.msg || e.message)) ||
+    (typeof err === 'string' ? err : 'unknown dispatch error');
+
+  // A whitelisted transient business code is retryable regardless of HTTP
+  // status / error shape (codex P1-3) — check it before the status branches.
+  const larkCode = extractLarkCode(e, typeof detail === 'string' ? detail : '');
+  if (larkCode !== undefined && TRANSIENT_LARK_CODES.has(larkCode)) {
+    return { retryable: true, detail: `lark code ${larkCode} (transient): ${detail}` };
+  }
+
+  const looksAxios =
+    !!e && (e.isAxiosError === true || e.name === 'AxiosError' || (!!e.config && (!!e.response || e.status != null)));
+
+  if (looksAxios) {
+    const status = e!.response?.status ?? e!.status;
+    if (status === undefined) return { retryable: true, detail: `no-response: ${detail}` }; // network/transport
+    if (status === 429 || (status >= 500 && status <= 599)) return { retryable: true, detail: `http ${status}: ${detail}` };
+    return { retryable: false, detail: `http ${status}: ${detail}` }; // deterministic 4xx
+  }
+
+  // Non-axios (plain Error / string) without a transient code. MessageWithdrawn
+  // and other `res.code !== 0` 2xx-body throws land here — HTTP already
+  // succeeded, so a re-send repeats the same deterministic outcome. Fail closed.
+  return { retryable: false, detail: `non-transport: ${detail}` };
+}
+
 export function isAskCardAction(action?: string): boolean {
   return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION;
 }
 
 export async function handleAskCardAction(
   data: AskCardActionData,
+  deps: AskCardActionDeps = {},
 ): Promise<{ toast: { type: string; content: string } } | Record<string, unknown> | undefined> {
   const value = data.action?.value;
   const action = asString(value?.action);
@@ -90,6 +211,16 @@ export async function handleAskCardAction(
   if (!askId || !nonce || !by) {
     return staleToast(locale);
   }
+  const pending = getAskSnapshot(askId);
+  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) return staleToast(locale);
+  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) return staleToast(locale);
+
+  /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
+   *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
+  const outcomeResponse = (outcome: AskClickOutcome) =>
+    outcome === 'unauthorized'
+      ? escalateUnauthorized(askId, nonce, by, locale, deps)
+      : toastForOutcome(outcome, locale);
 
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
   // accepted 时直接返回终态卡片，让飞书在回调响应里同步替换——不依赖 onSettle 异步 PATCH
@@ -98,7 +229,7 @@ export async function handleAskCardAction(
     const selected = asString(value?.key);
     if (!selected) return staleToast(locale);
     const outcome = tryResolveAsk({ askId, nonce, selected, by });
-    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    if (outcome !== 'accepted') return outcomeResponse(outcome);
     return settledCardResponse(askId, {
       kind: 'answered',
       answers: [[selected]],
@@ -113,22 +244,28 @@ export async function handleAskCardAction(
     const key = asString(value?.key);
     if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
     const outcome = toggleAsk({ askId, nonce, questionIndex, key, by });
-    if (outcome !== 'toggled') return toastForOutcome(outcome, locale);
+    if (outcome !== 'toggled') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     if (!updated) return staleToast(locale);
+    if (updated.replyCardTarget) return inlineAskResponse(updated);
     return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
   }
 
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
   // 同 ASK_SELECT_ACTION：accepted 时同步返回终态卡片。
   if (action === ASK_SUBMIT_ACTION) {
+    // 空提交二次确认标志。飞书按钮 value 回传只可靠保留字符串（对齐 settings-card 的
+    // next_value:'true' 与 toggle 的 String(i)），故按字符串判定；同时容忍真布尔，
+    // 兼容潜在的非飞书调用方。true = 用户已在 arm 卡片上再点了一次，允许空提交落地。
+    const confirmEmpty = value?.confirm_empty === 'true' || value?.confirm_empty === true;
     const formValue = data.action?.form_value ?? {};
     if (Object.keys(formValue).length > 0) {
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      const outcome = submitAsk({ askId, nonce, by, selections });
-      if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
+      if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
+      if (outcome !== 'accepted') return outcomeResponse(outcome);
       return settledCardResponse(askId, {
         kind: 'answered',
         answers: selections,
@@ -137,8 +274,12 @@ export async function handleAskCardAction(
         timedOut: false,
       });
     }
-    const outcome = submitAsk({ askId, nonce, by });
-    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    // 累积按钮路径。submitAsk 在鉴权 + nonce + 单选约束全过后，若「全多选且全空」返回
+    // needs_empty_confirm（防手滑）——空提交二次确认的判定全在 broker 内，卡片不再自行
+    // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
+    const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
+    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
+    if (outcome !== 'accepted') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
     return settledCardResponse(askId, {
@@ -149,8 +290,32 @@ export async function handleAskCardAction(
       timedOut: false,
     });
   }
-
   return staleToast(locale);
+}
+
+/**
+ * 空提交二次确认的卡片响应：重渲染当前 pending ask，arm 一个红色「确认空提交」按钮
+ * + 警示条，并附 warning toast。
+ *
+ * 关键：必须包成 `{ card: { type: 'raw', data } }` —— event-dispatcher 的
+ * shapeCardActionResult 认「已整形响应」的标志是顶层 `toast`/`card`/`deferredCard`
+ * 之一；若把 card 字段摊在顶层再塞个 toast，它只认 toast、raw card 不会被 patch，
+ * 用户只看到 toast、arm 按钮不出现（外层整形契约）。这里同时带 card + toast，二者都生效。
+ */
+function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
+  const ask = getAskSnapshot(askId);
+  if (!ask) return staleToast(locale);
+  if (ask.replyCardTarget) return {
+    ...inlineAskResponse(ask, undefined, true),
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
+  return {
+    card: {
+      type: 'raw',
+      data: JSON.parse(buildAskCard(ask, undefined, { confirmEmptyArmed: true })) as Record<string, unknown>,
+    },
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
 }
 
 /**
@@ -166,7 +331,12 @@ export async function handleAskCardAction(
 function settledCardResponse(askId: string, result: AskResult): Record<string, unknown> | undefined {
   const updated = getAskSnapshot(askId);
   if (!updated) return undefined;
+  if (updated.replyCardTarget) return inlineAskResponse(updated, result);
   return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
+}
+
+function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArmed = false): Record<string, unknown> {
+  return { afterAck: async () => { await publishReplyCardAsk(ask, result, confirmEmptyArmed, true); } };
 }
 
 /**
@@ -181,10 +351,11 @@ function settledCardResponse(askId: string, result: AskResult): Record<string, u
  *
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
-export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
+export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
+  const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
   // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
   const metaDiv = {
@@ -251,17 +422,36 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
 
     if (requiresSubmit) {
       elements.push({ tag: 'hr' });
+      // 空提交二次确认：用户一个选项都没勾就点了提交，且至少有一问是多选（多选允许
+      // 「一个都不选」，但极可能是手滑）。第一次拦下来、渲染警示 + 把 Submit 按钮的
+      // value 打上 confirm_empty；用户再点一次才真正 settle 空答案。arm 态只活在按钮
+      // value 里（随卡片走），broker 不留状态，天然对 daemon 重启幂等。
+      if (confirmEmptyArmed) {
+        elements.push({
+          tag: 'div',
+          text: { tag: 'lark_md', content: t('card.ask.empty_warning', undefined, locale) },
+        });
+      }
       elements.push({
         tag: 'action',
         actions: [
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: t('card.ask.submit', undefined, locale) },
-            type: 'primary',
+            text: {
+              tag: 'plain_text',
+              content: confirmEmptyArmed
+                ? t('card.ask.submit_confirm_empty', undefined, locale)
+                : t('card.ask.submit', undefined, locale),
+            },
+            type: confirmEmptyArmed ? 'danger' : 'primary',
             value: {
               action: ASK_SUBMIT_ACTION,
               ask_id: ask.askId,
               nonce: ask.nonce,
+              // Feishu 按钮 value 只可靠地保留字符串（布尔/数字会被字符串化，见
+              // settings-card 的 `next_value:'true'` 约定 + toggle 的 `String(i)`）。
+              // 故 arm 标志用字符串 'true'，读取端按字符串判定。
+              ...(confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
             },
           },
         ],
@@ -340,6 +530,52 @@ export function parseFormSelections(
   return result;
 }
 
+/**
+ * 点击者没有答复权限时，向 owner 弹一张授权卡（复用对话路径那套 grant 卡 + pending 表），
+ * 并把 toast 从死胡同「你没有权限」换成「已申请授权，通过后再点一次」。
+ *
+ * **授权通过后仍需再点一次**：ask 的答案取决于点的是哪个按钮，daemon 无从代替用户决定，
+ * 所以不像对话路径那样重放触发消息（ask-grant-request 故意不挂 messageData）。这里
+ * 也不动 broker 状态——unauthorized 本来就不改 ask，ask 保持 pending 等着被再点。
+ *
+ * ask 已失效 / 已 settle / nonce 不匹配时不发卡：授权也救不回一个已结束或不存在的 ask。
+ * 这几条正常由 broker 先判（它的门序是 stale → already_settled → unauthorized），这里
+ * 再自查一遍是纵深防御——把「不为已决的 ask 骚扰 owner」从对 broker 内部顺序的隐式依赖
+ * 变成本函数自己的显式前置条件（pi review F2）。
+ */
+function escalateUnauthorized(
+  askId: string,
+  nonce: string,
+  clickerOpenId: string,
+  locale: Locale | undefined,
+  deps: AskCardActionDeps,
+): { toast: { type: string; content: string } } {
+  const ask = getAskSnapshot(askId);
+  if (!ask || ask.settled || ask.nonce !== nonce) return staleToast(locale);
+  const requestGrant = deps.requestGrant ?? requestGrantForAskClicker;
+  const outcome = requestGrant(
+    {
+      larkAppId: ask.larkAppId,
+      chatId: ask.chatId,
+      cardMessageId: ask.cardMessageId,
+      rootMessageId: ask.rootMessageId,
+    },
+    clickerOpenId,
+  );
+  switch (outcome) {
+    case 'sent':
+      return { toast: { type: 'info', content: t('card.ask.toast.grant_requested', undefined, locale) } };
+    case 'pending':
+      return { toast: { type: 'info', content: t('card.ask.toast.grant_pending', undefined, locale) } };
+    case 'denied':
+      // owner 已明确拒绝，还在冷却期 —— 说实话，别谎报「等 owner 处理」。
+      return { toast: { type: 'warning', content: t('card.ask.toast.grant_denied', undefined, locale) } };
+    case 'unavailable':
+      // 发不出授权卡（开放模式无 owner / owner 关了自动发卡）→ 回落原文案。
+      return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
+  }
+}
+
 function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { type: string; content: string } } | undefined {
   switch (outcome) {
     case 'accepted':
@@ -353,6 +589,10 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
+    case 'needs_empty_confirm':
+      // 正常路径由 handleAskCardAction 提前拦成 arm 卡片响应，不会走到这里；
+      // 兜底给个 warning toast，避免静默。
+      return { toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) } };
   }
 }
 
@@ -398,7 +638,8 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(_ask: PendingAsk, locale?: Locale): string {
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

@@ -7,8 +7,8 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
-import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -618,6 +618,37 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('稍后对比');
   });
 
+  it('drops the live split-font signed footer appended after a command', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: "<font color='grey'> </font>" },
+        { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+        { tag: 'at', user_name: 'jihong traex' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it('keeps ordinary links that mention botmux and the marker URL without footer structure', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文提到 ' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: ' 以及 ' },
+        { tag: 'a', text: 'footer spec', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: '，但这不是签名页脚。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(result.content).toContain('footer spec(https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)');
+    expect(result.content).toContain('不是签名页脚');
+  });
+
   it('keeps a usage-shaped final line when it belongs to the same body paragraph', () => {
     const card = {
       elements: [[
@@ -638,6 +669,219 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('帮我看下这个 bug');
     expect(result.content).not.toContain('botmux');
     expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps a grey body line containing one U+2063 separator', () => {
+    const bodyLine = "<font color='grey'>注：U+2063 写作 a\u2063b</font>";
+    const raw = buildMarkdownCard(
+      ['结论如下', '', bodyLine, '', '请据此推进'].join('\n'),
+      'ou_owner',
+    );
+    const textB = extractCardContent(raw);
+    const result = mergeCardText(textB, textB);
+
+    expect(result).toContain('结论如下');
+    expect(result).toContain(bodyLine);
+    expect(result).toContain('请据此推进');
+    expect(result).not.toContain('发送给');
+  });
+
+  it('keeps a non-grey body line containing the full footer marker', () => {
+    const bodyLine = `正文包含不可见序列 a${REPLY_CARD_FOOTER_MARKER}b`;
+    const card = {
+      body: { elements: [{ tag: 'markdown', content: bodyLine }] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toContain(bodyLine);
+  });
+
+  it('round-trips standalone reply headings without losing section text', () => {
+    const raw = buildMarkdownCard(
+      '# 执行结果\n\n核心链路已验证。\n\n## 下一步\n\n请在飞书确认排版。',
+      'ou_owner',
+    );
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+
+    expect(result.content).toContain('执行结果');
+    expect(result.content).toContain('核心链路已验证。');
+    expect(result.content).toContain('下一步');
+    expect(result.content).toContain('请在飞书确认排版。');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('round-trips native reply tables as readable pipe Markdown', () => {
+    const raw = buildMarkdownCard([
+      '## 验证结果',
+      '',
+      '| 项目 | 结果 |',
+      '| --- | --- |',
+      '| build | pass |',
+      '| test | 280 passed |',
+    ].join('\n'), 'ou_owner');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+
+    expect(result.content).toContain('| 项目 | 结果 |');
+    expect(result.content).toContain('| --- | --- |');
+    expect(result.content).toContain('| build | pass |');
+    expect(result.content).toContain('| test | 280 passed |');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('escapes pipes and folds newlines when flattening third-party table cells', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'table',
+        columns: [
+          { name: 'name', display_name: { tag: 'plain_text', content: '名称' } },
+          { name: 'detail', display_name: '详情' },
+        ],
+        rows: [{ name: 'A | B', detail: 'line 1\nline 2' }],
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('| 名称 | 详情 |');
+    expect(result.content).toContain('| A \\| B | line 1<br>line 2 |');
+  });
+
+  it('round-trips CardKit-normalized table cells returned by the live message API', () => {
+    const normalizedCell = (content: string) => ({
+      tag: 'markdown',
+      property: {
+        elements: [{
+          tag: 'plain_text',
+          property: { content, textAlign: 'left' },
+        }],
+        markdownElements: [],
+        originTag: 'lark_md',
+      },
+    });
+    const card = {
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'table',
+        columns: [
+          { name: 'c0', display_name: normalizedCell('检查项') },
+          { name: 'c1', display_name: '预期结果' },
+        ],
+        rows: [{
+          c0: normalizedCell('标题层级'),
+          c1: normalizedCell('H1/H2 明显大于正文'),
+        }],
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('| 检查项 | 预期结果 |');
+    expect(result.content).toContain('| 标题层级 | H1/H2 明显大于正文 |');
+  });
+
+  it('round-trips a live-normalized layout header, tag, body, and native table together', () => {
+    const normalizedMarkdown = (...contents: string[]) => ({
+      tag: 'markdown',
+      property: {
+        elements: contents.map((content, index) => ({
+          tag: index === 0 ? 'plain_text' : 'code_span',
+          property: { content, textAlign: 'left' },
+        })),
+        markdownElements: [],
+        originTag: 'lark_md',
+      },
+    });
+    // Fixture mirrors `botmux quoted --raw` after CardKit normalisation; it is
+    // intentionally not the JSON emitted by the reply-card builder.
+    const card = {
+      schema: '2.0',
+      config: { enable_forward_interaction: false, streaming_mode: false, width_mode: 'fill' },
+      header: {
+        template: 'orange',
+        text_tag_list: [{
+          color: 'red',
+          tag: 'text_tag',
+          text: { content: '需要你', tag: 'plain_text' },
+        }],
+        title: { content: '需要确认 · 回复卡样式是否收口', tag: 'plain_text' },
+      },
+      body: { direction: 'vertical', elements: [
+        { tag: 'markdown', content: '请确认下面三项。' },
+        {
+          tag: 'table',
+          columns: [
+            { name: 'c0', display_name: normalizedMarkdown('检查项') },
+            { name: 'c1', display_name: normalizedMarkdown('实现配置') },
+          ],
+          rows: [{
+            c0: normalizedMarkdown('卡片宽度'),
+            c1: normalizedMarkdown('Card 2.0 ', 'width_mode: fill'),
+          }, {
+            c0: normalizedMarkdown('标题层级'),
+            c1: normalizedMarkdown('H1/H2 ', 'heading-2'),
+          }],
+        },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('[卡片: 需要确认 · 回复卡样式是否收口]');
+    expect(result.content).toContain('[标签: 需要你]');
+    expect(result.content).toContain('请确认下面三项。');
+    expect(result.content).toContain('| 检查项 | 实现配置 |');
+    expect(result.content).toContain('| 卡片宽度 | Card 2.0 width_mode: fill |');
+    expect(result.content).toContain('| 标题层级 | H1/H2 heading-2 |');
+  });
+
+  it('rebuilds ATX headings from element ids after Lark strips text_size', () => {
+    // Fixture mirrors the live read-back shape: text_size is gone entirely and
+    // the content survives only inside the normalized rendered tree, so the
+    // element id is the single carrier of heading hierarchy.
+    const normalizedHeading = (elementId: string, content: string) => ({
+      tag: 'markdown',
+      element_id: elementId,
+      property: {
+        elements: [{ tag: 'plain_text', property: { content, textAlign: 'left' } }],
+        markdownElements: [],
+        originTag: 'lark_md',
+      },
+    });
+    const card = {
+      schema: '2.0',
+      body: { direction: 'vertical', elements: [
+        normalizedHeading('botmux_md_h1_1', '执行结果'),
+        { tag: 'markdown', content: '核心链路已验证。' },
+        normalizedHeading('botmux_md_h2_2', '验证命令'),
+        { tag: 'markdown', content: 'bun run build' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('# 执行结果\n核心链路已验证。');
+    expect(result.content).toContain('## 验证命令\nbun run build');
+    // The bare glued form the pre-fix reader produced must be gone.
+    expect(result.content).not.toContain('执行结果\n核心链路已验证。\n验证命令');
+  });
+
+  it('keeps builder → parser heading round-trip promotable on re-send', () => {
+    const raw = buildMarkdownCard('# 执行结果\n\n核心链路已验证。\n\n## 验证命令\n\n收尾');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+    expect(result.content).toContain('# 执行结果');
+    expect(result.content).toContain('## 验证命令');
+  });
+
+  it('leaves foreign heading-like element ids untouched', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_md_h3_1', content: '不是我们的层级' },
+        { tag: 'markdown', element_id: 'vendor_md_h1_1', content: '第三方组件' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('不是我们的层级');
+    expect(result.content).toContain('第三方组件');
+    expect(result.content).not.toContain('# ');
   });
 
   it('round-trips a footer whose custom brand contains an unmatched bracket', () => {
@@ -695,6 +939,137 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a current footer carrying the non-link text marker', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('drops the current text marker after Lark simplifies the card to Format A', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: `Acme ·${REPLY_CARD_FOOTER_MARKER} 上下文 12.3K · 发送给：` },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('keeps Format A body text containing only one U+2063 separator', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文 a\u2063b' },
+        { tag: 'text', text: ' 后续正文' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe(
+      '正文 a\u2063b 后续正文',
+    );
+  });
+
+  it('drops a brand-disabled recipient-only footer without requiring a visible separator', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('·');
+
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it.each([
+    { name: 'without text_size', textSize: undefined },
+    { name: 'with Card 2.0 notation', textSize: 'notation' },
+    { name: 'with legacy notation_small_v2', textSize: 'notation_small_v2' },
+  ])('drops a schema 2.0 footer $name when it carries the exact split-font marker', ({ textSize }) => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission' },
+        { tag: 'hr' },
+        {
+          element_id: 'botmux_reply_footer',
+          tag: 'markdown',
+          ...(textSize === undefined ? {} : { text_size: textSize }),
+          content: '[botmux](https://github.com/deepcoldy/botmux)'
+            + "<font color='grey'> </font>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
+            + "<font color='grey'> 发送给：</font><at id=ou_owner></at>",
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it.each([
+    {
+      name: 'wrong marker text',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'notation',
+        content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'footer spec',
+    },
+    {
+      name: 'wrong marker URL',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)',
+      },
+      expected: 'reply-card-footer-v1-guide',
+    },
+    {
+      name: 'unexpected text_size',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'normal_v2',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'reply-card-footer-v1',
+    },
+  ])('keeps a schema 2.0 element-id collision with $name', ({ footer, expected }) => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        footer,
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain(expected);
+  });
+
   it('drops a footer carrying the complete Botmux structural signature', () => {
     const footer = buildReplyCardFooter({
       brand: 'Acme',
@@ -824,7 +1199,7 @@ describe('botmux internal callback buttons (🔊 语音总结 …) dropped from 
         { tag: 'hr' },
         { tag: 'column_set', flex_mode: 'none', columns: [
           { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-            elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: ' ' }] },
+            elements: [{ tag: 'markdown', text_size: 'notation', content: ' ' }] },
           { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
             tag: 'button',
             text: { tag: 'plain_text', content: '🔊 语音总结' },
@@ -1047,6 +1422,23 @@ describe('mergeCardText', () => {
     expect(mergeCardText('', '[卡片: x]\n正文')).toBe('[卡片: x]\n正文');
     expect(mergeCardText('[卡片: y]\n正文', '请升级至最新版本客户端，以查看内容')).toContain('正文');
   });
+
+  it('preserves header metadata present only in A without duplicating B metadata', () => {
+    const textA = '[卡片: 需要确认]\n[标签: 需要你]\n正文';
+    expect(mergeCardText(textA, '[卡片: 需要确认]\n正文')).toBe(
+      '[卡片: 需要确认]\n[标签: 需要你]\n正文',
+    );
+    expect(mergeCardText(textA, '[卡片: 需要确认]\n[标签: 需要你]\n正文'))
+      .toBe('[卡片: 需要确认]\n[标签: 需要你]\n正文');
+  });
+
+  it('unions distinct header tags by value instead of dropping a second tag by kind', () => {
+    const textA = '[卡片: 进度]\n[标签: 进行中]\n[标签: 需要你]\n正文';
+    const textB = '[卡片: 进度]\n[标签: 进行中]\n正文';
+    expect(mergeCardText(textA, textB)).toBe(
+      '[卡片: 进度]\n[标签: 需要你]\n[标签: 进行中]\n正文',
+    );
+  });
 });
 
 describe('wrapResolvedCardText sentinel', () => {
@@ -1246,6 +1638,72 @@ describe('Post message parsing', () => {
   });
 });
 
+// ─── Audio (voice) messages: placeholder + metadata extraction ────────────
+
+describe('Audio message parsing', () => {
+  it('renders audio content as [语音] placeholder via parseApiMessage', () => {
+    const result = parseApiMessage(makeMsg('audio', { file_key: 'file_voice', duration: 2000 }));
+    expect(result.msgType).toBe('audio');
+    expect(result.content).toBe(AUDIO_PLACEHOLDER);
+    expect(result.content).toBe('[语音]');
+  });
+
+  it('renders audio content as [语音] placeholder via parseEventMessage', () => {
+    const event = {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_audio',
+        message_type: 'audio',
+        content: JSON.stringify({ file_key: 'file_voice', duration: 2000 }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    const { parsed, resources } = parseEventMessage(event);
+    expect(parsed.msgType).toBe('audio');
+    expect(parsed.messageId).toBe('om_audio');
+    expect(parsed.content).toBe('[语音]');
+    // audio 不进 extractResources 的图片/文件清单
+    expect(resources).toEqual([]);
+  });
+
+  it('never leaks raw file_key JSON into parsed content', () => {
+    const raw = JSON.stringify({ file_key: 'file_secret', duration: 5000 });
+    expect(parseApiMessage(makeMsg('audio', raw)).content).not.toContain('file_secret');
+  });
+});
+
+describe('extractAudioMeta', () => {
+  it('extracts file_key and durationMs from valid audio content', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice', duration: 2000 })))
+      .toEqual({ fileKey: 'file_voice', durationMs: 2000 });
+  });
+
+  it('returns durationMs undefined when duration is absent', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice' })))
+      .toEqual({ fileKey: 'file_voice', durationMs: undefined });
+  });
+
+  it('ignores non-number duration', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice', duration: '2s' })))
+      .toEqual({ fileKey: 'file_voice', durationMs: undefined });
+  });
+
+  it('returns null for invalid JSON', () => {
+    expect(extractAudioMeta('not json')).toBeNull();
+  });
+
+  it('returns null when file_key is missing', () => {
+    expect(extractAudioMeta(JSON.stringify({ duration: 2000 }))).toBeNull();
+  });
+
+  it('returns null when file_key is empty or not a string', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: '' }))).toBeNull();
+    expect(extractAudioMeta(JSON.stringify({ file_key: 123 }))).toBeNull();
+  });
+});
+
 describe('extractResources: interactive cards', () => {
   it('should extract image_key from API format elements', () => {
     const card = {
@@ -1411,6 +1869,41 @@ describe('cmdQuoted shared-numberer invariant', () => {
     const parsed = parseApiMessage(msg, numberer);
     expect(resources).toEqual([{ type: 'image', key: 'img_zzz', name: 'img_zzz.jpg' }]);
     expect(parsed.content).toBe('[图片 1]');
+  });
+
+  it('post with a top-level files array extracts the upload for download', () => {
+    // Real Feishu shape observed when a user attaches an MD file to a rich-text
+    // message: the body only carries the @ mention, while the upload descriptor
+    // is a sibling of `content`/`content_v2`. It must still reach the shared
+    // resource downloader; otherwise agents see the @ but no attachment path.
+    const postContent = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      content_v2: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      files: [{
+        file_key: 'file_v3_top_level',
+        file_name: 'brief.md',
+        is_folder: false,
+      }],
+    });
+    const msg = {
+      message_id: 'om_post_top_level_file',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+
+    expect(resources).toEqual([{
+      type: 'file',
+      key: 'file_v3_top_level',
+      name: 'brief.md',
+    }]);
+    expect(parsed.content).toBe('@agent');
   });
 });
 
@@ -1616,5 +2109,77 @@ describe('messageMentionsBot', () => {
 
   it('matches an app_id mention even when botOpenId is not yet resolved', () => {
     expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
+  });
+});
+
+describe('extractPostAtParticipants (post inline @ → routing-only participants)', () => {
+  const post = (nodes: any[]) => ({ content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }) });
+
+  it('classifies ou_ → openId, cli_ → appId, carries user_name', () => {
+    const out = extractPostAtParticipants(post([
+      { tag: 'text', text: 'hi ' },
+      { tag: 'at', user_id: 'ou_human', user_name: '张三' },
+      { tag: 'at', user_id: 'cli_bot', user_name: 'OtherBot' },
+    ]));
+    expect(out).toEqual([
+      { key: '@_post_at_1', name: '张三', openId: 'ou_human', idType: 'open_id' },
+      { key: '@_post_at_2', name: 'OtherBot', appId: 'cli_bot', idType: 'app_id' },
+    ]);
+  });
+
+  it('an `all` inline at is surfaced WITHOUT an executable id (→ core marks incomplete)', () => {
+    const out = extractPostAtParticipants(post([{ tag: 'at', user_id: 'all', user_name: '所有人' }]));
+    expect(out).toHaveLength(1);
+    expect(out[0].openId).toBeUndefined();
+    expect(out[0].appId).toBeUndefined();
+  });
+
+  it('non-post shapes / parse errors → empty', () => {
+    expect(extractPostAtParticipants({ content: '{"text":"plain"}' })).toEqual([]);
+    expect(extractPostAtParticipants({ content: 'not json' })).toEqual([]);
+    expect(extractPostAtParticipants(undefined)).toEqual([]);
+  });
+});
+
+// ─── stripBotMentions（话题指令头的前置步骤：按身份剥、不限位置）─────────────
+
+describe('stripBotMentions', () => {
+  const SELF = { botOpenId: 'ou_self_bot', larkAppId: 'cli_self_app' };
+  const selfMention = { name: 'Claude', openId: 'ou_self_bot' };
+  const otherBot = { name: 'Codex', openId: 'ou_other_bot' };
+  const human = { name: '张三', openId: 'ou_human' };
+
+  it('剥掉句中与句尾的本 bot @', () => {
+    expect(stripBotMentions('标题 /t 干活 @Claude', [selfMention], SELF)).toBe('标题 /t 干活');
+    expect(stripBotMentions('标题 @Claude /t 干活', [selfMention], SELF)).toBe('标题 /t 干活');
+    expect(stripBotMentions('@Claude 标题 /t 干活 @Claude', [selfMention], SELF)).toBe('标题 /t 干活');
+  });
+
+  it('保留其他成员 / 其它 bot 的 @ —— 那是正文内容', () => {
+    expect(stripBotMentions('/t 让 @Codex 也看看 @Claude', [selfMention, otherBot], SELF))
+      .toBe('/t 让 @Codex 也看看');
+    expect(stripBotMentions('/t @张三 你怎么看 @Claude', [selfMention, human], SELF))
+      .toBe('/t @张三 你怎么看');
+  });
+
+  it('按 app_id 形式的 @ 也能认出自己', () => {
+    const appMention = { name: 'Claude', id: { app_id: 'cli_self_app' }, id_type: 'app_id' };
+    expect(stripBotMentions('/t 干活 @Claude', [appMention], SELF)).toBe('/t 干活');
+  });
+
+  it('长名字优先，避免短名把长名吃掉半截', () => {
+    const long = { name: 'Claude分身', openId: 'ou_self_bot' };
+    const short = { name: 'Claude', openId: 'ou_self_bot' };
+    expect(stripBotMentions('@Claude @Claude分身 /t 干活', [short, long], SELF)).toBe('/t 干活');
+  });
+
+  it('认不出本 bot（无 mentions / 全是别人）→ 原样返回', () => {
+    expect(stripBotMentions('/t 干活 @Claude', undefined, SELF)).toBe('/t 干活 @Claude');
+    expect(stripBotMentions('/t 干活 @Codex', [otherBot], SELF)).toBe('/t 干活 @Codex');
+  });
+
+  it('保留正文换行，只压同一行内的空白', () => {
+    expect(stripBotMentions('标题\n/t @Claude 第一行\n  第二行', [selfMention], SELF))
+      .toBe('标题\n/t 第一行\n  第二行');
   });
 });

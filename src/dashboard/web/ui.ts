@@ -1,5 +1,5 @@
 import {
-  fetchGroupsSnapshot,
+  fetchGroupsNamesSnapshot,
 } from './groups-api.js';
 
 import {
@@ -19,6 +19,11 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  type WorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
+import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
 
 type UiListener = () => void;
 
@@ -33,6 +38,16 @@ class DashboardUiState {
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // A legacy owner, H5 session, or platform-dashboard identity may operate the
+  // narrow Workbench capability set. Keep this separate from `authed`: the
+  // latter alone controls host-management affordances across the rest of the
+  // Dashboard.
+  workbenchAuthed = true;
+  // P1-4：服务端投影的最小操作能力集（GET /api/workbench/capabilities，由
+  // app.tsx 的 loadAuthState 严格解析后写入）。与 workbenchAuthed 相反，它默认
+  // fail-closed 全 false：workbenchAuthed 只证明可进工作台，三类操作入口（定位/
+  // 终端接管/Preview 交互）各自只看对应布尔，绝不回落 true。
+  workbenchCapabilities: WorkbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;
@@ -189,6 +204,19 @@ export function botAvatarUrlFor(name?: string, larkAppId?: string): string | und
   return name ? botAvatarByName.get(String(name)) : undefined;
 }
 
+/** 该 bot 在飞书/Lark 开放平台的应用后台深链。larkAppId 即开放平台 AppID
+ *  （cli_xxx），host 必须按 bot 的 brand 派生:feishu 租户走 open.feishu.cn、
+ *  国际版 lark 租户走 open.larksuite.com——两者是**独立平台上的独立应用**
+ *  （AppID 各自独立、登录域不同），拿 feishu host 打开 lark 应用后台不通，
+ *  反之亦然。brand 缺省 / 非法值经 normalizeBrand 归一为 feishu，向后兼容
+ *  旧 payload。非 cli_ 前缀（首屏聚合未回来时的占位键、按名聚合的历史卡、
+ *  headless 的 local_ 身份）返回 null，避免拼出无效地址。 */
+export function larkConsoleUrl(larkAppId?: string, brand?: string): string | null {
+  return larkAppId && larkAppId.startsWith('cli_')
+    ? `${larkHosts(normalizeBrand(brand)).openApi}/app/${encodeURIComponent(larkAppId)}`
+    : null;
+}
+
 export interface BotAvatarOpts {
   /** 展示名 —— 决定回退渐变球的色相，也用于按名查头像。 */
   name?: string;
@@ -308,7 +336,17 @@ export function overrideBotAvatar(larkAppId: string, name: string | undefined, u
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const data = await fetchGroupsSnapshot();
+      // 轻量视图：只要 bots 的名称/头像 + chats 的 chatId/name/avatar。完整矩阵
+      // 实测 12.59MB（memberBots 独占 12341KB），而这里一个字节都不用它——换成
+      // `?view=names` 后 372KB 级别，且省掉主线程 38-70ms 的 JSON.parse。
+      //
+      // 新鲜度**未被本次改动触及**：命中/失效时机完全照旧（成功后由下面的
+      // nameMapsPromise memo 持有，失败才清空重试），变的只有同一次请求传多少
+      // 字节。注意这个 memo 意味着名称/头像每个页面生命周期只真拉一次——这是
+      // 既有行为，不是本次引入的：bot 名称另有更快通路（/api/bots 每次刷新都带
+      // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
+      // 就地写内存+localStorage 生效，都不依赖本函数重跑。
+      const data = await fetchGroupsNamesSnapshot();
       for (const b of data.bots ?? []) {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
@@ -368,6 +406,7 @@ export function attentionReason(s: Record<string, any>): string | null {
   if (s.pendingRepo) return t('sessions.board.signalRepo');
   if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
   if (s.status === 'limited') return t('sessions.board.signalLimited');
+  if (s.status === 'stalled') return t('sessions.board.signalStalled');
   return null;
 }
 

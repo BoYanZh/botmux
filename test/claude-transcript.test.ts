@@ -26,6 +26,8 @@ import {
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
   isTranscriptRateLimitEvent,
+  classifyClaudeTerminalEvent,
+  isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
@@ -142,13 +144,11 @@ describe('pickAssistantTextEvents', () => {
     expect(pickAssistantTextEvents(events)).toEqual([]);
   });
 
-  it('still forwards non-rate API errors (server_error / auth) as text — no dedicated surface', () => {
-    // These have no `limited` equivalent, so their text is the user's only
-    // signal that the request failed; must NOT be suppressed.
+  it('drops non-rate API-error text because structured terminal handling owns it', () => {
     const events: TranscriptEvent[] = [
       { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
     ];
-    expect(pickAssistantTextEvents(events).map(e => e.uuid)).toEqual(['se']);
+    expect(pickAssistantTextEvents(events)).toEqual([]);
   });
 });
 
@@ -183,6 +183,200 @@ describe('isTranscriptRateLimitEvent', () => {
   it('apiErrorMessageText recovers the human retry clock from the record text', () => {
     const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm (America/Los_Angeles)" }] } };
     expect(apiErrorMessageText(ev)).toContain('resets 10:40pm');
+  });
+});
+
+describe('synthetic no-model-reply records', () => {
+  // Byte-shape of a record observed in a live Claude Code 2.1.263 transcript:
+  // the bridge resumed a turn that had been cut mid-flight, wrote an `isMeta`
+  // user "Continue from where you left off." and this assistant placeholder
+  // with the same timestamp, and never called the model (no `requestId`,
+  // usage all zero). The Lark message that started the turn got no answer.
+  function syntheticNoReply(extra: Record<string, unknown> = {}): TranscriptEvent {
+    return {
+      type: 'assistant',
+      uuid: 'a6e59f9c-8ca4-4907-bc62-b9ae78206e37',
+      timestamp: '2026-09-08T10:56:21.981Z',
+      isApiErrorMessage: false,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'No response requested.' }],
+      },
+      ...extra,
+    } as TranscriptEvent;
+  }
+
+  it('recognises the placeholder by model, not by text', () => {
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply())).toBe(true);
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply({
+      message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'anything' }] },
+    }))).toBe(true);
+  });
+
+  it('leaves API-error records to the API-error classifier', () => {
+    const apiErr = syntheticNoReply({ isApiErrorMessage: true, error: 'unknown' });
+    expect(isSyntheticNoModelReplyEvent(apiErr)).toBe(false);
+    expect(classifyClaudeTerminalEvent(apiErr)).toEqual({
+      status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false,
+    });
+  });
+
+  it('a real model reply of the same shape is still a completed turn', () => {
+    const real = syntheticNoReply({
+      requestId: 'req_011CN',
+      message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+    });
+    expect(isSyntheticNoModelReplyEvent(real)).toBe(false);
+    expect(classifyClaudeTerminalEvent(real)).toEqual({ status: 'completed' });
+  });
+
+  it('classifies the placeholder as a retryable failure, never as completed', () => {
+    expect(classifyClaudeTerminalEvent(syntheticNoReply())).toEqual({
+      status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+    });
+  });
+
+  it('ignores sidechain and non-assistant records', () => {
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply({ type: 'user', message: { role: 'user', model: '<synthetic>', content: 'x' } }))).toBe(false);
+    expect(classifyClaudeTerminalEvent(syntheticNoReply({ isSidechain: true }))).toBeUndefined();
+  });
+});
+
+describe('classifyClaudeTerminalEvent', () => {
+  it('classifies the observed unknown + unexpected EOF fixture as retryable failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+  });
+
+  it.each([
+    ['authentication_failed', undefined, 'API Error: authentication failed', 'provider_authentication_failed'],
+    ['invalid_request', 400, 'API Error: invalid request', 'provider_invalid_request'],
+    ['permission_error', 403, 'API Error: permission denied', 'provider_permission_denied'],
+    ['unknown', 404, 'API Error: endpoint not found', 'provider_invalid_request'],
+  ])('classifies %s as non-retryable', (error, apiErrorStatus, text, errorCode) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `non-retry-${error}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode,
+      retryable: false,
+    });
+  });
+
+  it('does not promote an unrecognized unknown API error into an automatic retry', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'unknown-other',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: something unfamiliar happened' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'ambiguous',
+      errorCode: 'provider_unknown_error',
+      retryable: false,
+    });
+  });
+
+  it('does not let transient-looking text override an explicit auth failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'auth-eof',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'authentication failed after unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_authentication_failed',
+      retryable: false,
+    });
+  });
+
+  it('keeps 429 on the existing rate-limit path instead of ordinary recovery', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rate-limit',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'rate limited' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    });
+  });
+
+  it.each([
+    ['server_error', 524, 'API Error: upstream timed out'],
+    ['unknown', undefined, 'API Error: 厂商资源问题断连：http2: client connection lost'],
+    ['unknown', undefined, 'API Error: Connection closed mid-response. The response above may be incomplete.'],
+    ['unknown', undefined, 'API Error: InternalServerException: Try your request again.'],
+  ])('classifies verified transient provider shape %s/%s as retryable', (error, apiErrorStatus, text) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `transient-${error}-${apiErrorStatus ?? 'none'}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
   });
 });
 

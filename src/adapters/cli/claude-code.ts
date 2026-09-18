@@ -15,14 +15,17 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand } from '../hook-command.js';
+import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -362,6 +365,12 @@ export function syncClaudeResumeTargetToCwd(
  *  the spawn-time flag. */
 const CLAUDE_PLUGIN_DIR = join(homedir(), '.botmux', 'claude-plugin');
 
+/** Effort levels Claude Code's `--effort` flag accepts (claude 2.1.259), taken
+ *  from the same catalog the config gate and the dashboard selector read, so the
+ *  accepted set cannot drift between them. The shared `reasoningEffort` type is a
+ *  superset — `ultra` is a codex/traex level Claude rejects. */
+const CLAUDE_EFFORT_LEVELS = new Set<string>(CLAUDE_REASONING_EFFORTS);
+
 /** Substrings that indicate Claude Code received our submit. We accept either:
  *  - `"role":"user","content":"` — direct submission while idle (the canonical
  *    user-message line; tool-result lines have array content `"content":[{...`
@@ -577,6 +586,14 @@ function findJsonlAcrossProjectsRoot(
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
+/** Busy footer for idle detection: the working-state status bar carries an
+ *  extra 「· esc to interrupt ·」 segment the idle composer lacks. Anchored to
+ *  the footer's STRUCTURE — a leading mode glyph (⏵⏵/⏸, mode name NOT
+ *  enumerated: manual/bypass strings are runtime-assembled, absent from the
+ *  binary) or a retry segment, joined by mid-dots — because the bare phrase
+ *  also appears in transcript prose on the same screen (busyProbeRegion scans
+ *  the bottom third), which would pin an idle session busy forever. */
+const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc to interrupt\b/m;
 /** Escape hatch: force a specific chat:submit key regardless of
  *  keybindings.json. Accepts the same spellings as the config (e.g.
  *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
@@ -730,6 +747,11 @@ export interface ClaudeFamilyVariant {
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
   readonly reliableTurnTerminal?: boolean;
+  /** True when this variant's CLI accepts `--effort <level>` (Claude Code
+   *  2.1.x). Forks and gateway variants whose flag surface is not Claude's
+   *  own leave it undefined, so `reasoningEffort` is silently ignored for
+   *  them rather than producing an unknown-flag launch. */
+  readonly supportsEffortFlag?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
@@ -740,12 +762,16 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // refuses durable submits unless it has first installed an attributable
     // bridge mark, and failure/exit paths share the same terminal deduper.
     reliableTurnTerminal: true,
+    // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
+    supportsEffortFlag: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
-    // alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体版本；具体 ID 锁版本。
-    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
+    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
+    // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
+    modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
 
@@ -828,7 +854,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -851,6 +877,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
+      // Per-bot reasoning effort. Claude's flag is `--effort` (not grok's
+      // `--reasoning-effort`), and its accepted set is low|medium|high|xhigh|max
+      // — `ultra` is NOT one of them: claude 2.1.259 answers an unknown value
+      // with `Warning: Unknown --effort value '<v>' — ignoring it and using the
+      // default effort.` and runs on regardless, so passing the shared type's
+      // `ultra` through would be a silent no-op plus a warning on every spawn.
+      // (Claude's own `ultracode` level is deliberately not mapped here: it is
+      // session-scoped — `/effort ultracode` inside the TUI — and additionally
+      // gated, so a declarative config value would silently resolve to `high`.)
+      if (variant.supportsEffortFlag && reasoningEffort && CLAUDE_EFFORT_LEVELS.has(reasoningEffort)) {
+        args.push('--effort', reasoningEffort);
+      }
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
       }
@@ -872,11 +910,34 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
-      // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
-      // 注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉 memory carve-out。）
+      // Per-bot env（bots.json `env`，如 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL）提升进
+      // --settings：Claude 会把 settings 源的 `env` 覆盖到进程环境之上（用户级
+      // ~/.claude/settings.json 的 env 会盖掉 pane 注入的进程 env），只走进程 env
+      // 的 bot 供应商配置会被用户全局 settings 静默改写。--settings 优先级高于
+      // 用户/项目 settings 文件，是能把 bot env 顶到最上面的最稳渠道。
+      const hasSettingsEnv = !!settingsEnv && Object.keys(settingsEnv).length > 0;
+      if (hasSettingsEnv) inlineSettings.env = settingsEnv;
+      // 仅在有内容（bypass 键 / env）时才传 --settings；disableCliBypass 且无 env 下
+      // 没东西可传就不传。（读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入
+      // 任何 sandbox 设置——注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉
+      // memory carve-out。）
       if (Object.keys(inlineSettings).length > 0) {
-        args.push('--settings', JSON.stringify(inlineSettings));
+        if (hasSettingsEnv && settingsFilePath) {
+          // env 含 AUTH_TOKEN 类密钥：写文件（0600）传路径，不走 inline JSON——
+          // argv 可被 `ps` 读到。同 bot 内容恒定，覆写幂等。
+          try {
+            mkdirSync(dirname(settingsFilePath), { recursive: true });
+            writeFileSync(settingsFilePath, JSON.stringify(inlineSettings), { mode: 0o600 });
+            args.push('--settings', settingsFilePath);
+          } catch {
+            // 写不进去则放弃 --settings：env 仍经 pane injectEnv 走进程环境（旧行为），
+            // 绝不把密钥 fallback 进 argv。
+          }
+        } else if (!hasSettingsEnv) {
+          args.push('--settings', JSON.stringify(inlineSettings));
+        }
+        // hasSettingsEnv 但 worker 没给 settingsFilePath：不内联（防密钥进 argv），
+        // env 仍经进程 env 传递，与旧行为一致。
       }
       const disallowedTools = ['EnterPlanMode', 'ExitPlanMode'];
       if (process.env[GOAL_ENV.V3_MARKER] === '1') {
@@ -888,7 +949,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth }));
       return args;
     },
 
@@ -1158,6 +1219,24 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
+    // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
+    // idle 判定只剩 2s 静默这一条负证据——长思考/网关延迟造成的一次 ≥2s 停顿
+    // 就会把工作中的会话错翻成 idle，且没有拉回手段。工作时 footer 比空闲态
+    // （⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents）多出
+    // 「· esc to interrupt ·」一段：busyPattern 让 deferPromptReadyWhileBusy
+    // 在翻绿前先查一次屏幕（否决错翻），idleToBusyPattern 让已错翻的绿卡在
+    // 下一帧拉回工作中。
+    //
+    // ⚠️ 必须锚 footer 的结构而不是裸短语：transcript 与 footer 同屏，busyProbeRegion
+    // 扫的是末 max(12, ⌈行数/3⌉) 行——正文只要出现裸短语（讨论中断快捷键、贴 diff、
+    // grep 源码）就会命中，把已空闲的会话钉死在「工作中」（probe 重试无上限）。
+    // 行首模式字形（⏵⏵/⏸，不枚举 mode 名——binary 里 manual/bypass 是运行时拼的）
+    // 或重试段「next try」+ `·` 分隔联合锚定：真 footer 7/7 命中（5 种模式 + 重试
+    // footer + ctrl+t 变体），散文 8/8 不误报（reviewer 与本机双向实测）。
+    // 窄视口（<80 列）footer 截断时拿不到中断段——安全降级回 2s 静默裸奔，
+    // 不产生误报。本机 242 个 tmux pane 扫末行实测 0 误报。
+    busyPattern: CLAUDE_BUSY_FOOTER_RE,
+    idleToBusyPattern: CLAUDE_BUSY_FOOTER_RE,
     // Claude 家族在 spawn 时注入 SessionStart hook，回调
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
@@ -1173,6 +1252,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       : undefined,
     systemHints: [],
     altScreen: false,
+    // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux
+    // 两边都无 scrollback；只读 Web 终端要把滚轮转成 SGR wheel 发回 CLI 才能翻页。
+    // 只读滚动走 worker 侧严格校验 + 限流的 `type:'scroll'` 通路（见 web-terminal-scroll.ts），
+    // 与 write 权限完全隔离，安全上与 opencode 一致。
+    readOnlyRemoteScroll: true,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.
@@ -1192,7 +1276,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
+      // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
+      // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。
+      // 仅 claude-code 安装 UserPromptSubmit hook；seed/relay 等共享 adapter 的
+      // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
+      // 装了也是每轮空跑一个子进程）。
+      userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
     },
+    // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
+    // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的
+    // developer message，不适用本机制。
+    supportsInvisiblePromptHook: variant.id === 'claude-code',
     asksViaHook: true,
   };
 }

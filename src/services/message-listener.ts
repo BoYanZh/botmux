@@ -123,6 +123,30 @@ export function extractListenerMessageText(message: any): string {
   return '';
 }
 
+/**
+ * Refresh a card match's observed text/title from the (now-resolved) message.
+ *
+ * The listener match is computed during filtering, off the SIMPLIFIED card the
+ * WS/history API first delivers — that view drops button jump URLs and lazy
+ * sub-card bodies. The live delivery path (daemon handleNewTopic) later runs
+ * resolveNonsupportMessage(data), merging the card's two representations
+ * (server-rendered + structured body.elements, incl. button open_url) into
+ * `message.content` — the same depth the direct-@bot path uses. Re-extracting
+ * here lets the model receive the button links, not the lossy match-time
+ * snapshot. Only interactive cards can differ (plain text/post already carried
+ * full content at match time). Fail-safe: a resolver miss (cross-tenant, REST
+ * unavailable) leaves `message.content` as the simplified view and yields the
+ * SAME text as match time, so guarding on a non-empty result never blanks a
+ * match — it only ever upgrades. Mutates `match` in place.
+ */
+export function refreshListenerCardTextFromResolved(match: MessageListenerMatch, message: any): void {
+  if (match.msgType !== 'interactive') return;
+  const text = extractListenerMessageText(message);
+  if (text.trim()) match.messageText = text;
+  const title = extractListenerMessageTitle(message);
+  if (title?.trim()) match.messageTitle = title;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }
@@ -193,6 +217,40 @@ function msgTypeAllowed(listener: MessageListenerConfig, msgType: string): boole
   return include.includes(msgType);
 }
 
+export type MessageListenerContentPolicy = NonNullable<MessageListenerConfig['contentPolicy']>;
+
+/**
+ * Pure keyword pre-filter for listener messages. SHARED by every leg that
+ * feeds evaluateMessageListener (realtime delivery, polled backfill, dashboard
+ * preview) so they can never diverge on content matching.
+ *
+ * - Absent policy, or one with no keywords → match everything (legacy
+ *   behavior: every non-mention text message woke the Agent).
+ * - Keywords: case-insensitive substring match (Chinese-friendly; both sides
+ *   lowercased, plain `includes`). Substring search is linear-time, so an
+ *   attacker-controlled group message cannot stall the daemon main loop.
+ * - matchMode 'any' (default): at least one keyword hits.
+ * - matchMode 'all': every keyword must hit.
+ *
+ * V1 deliberately has NO regex support: a JS regex with catastrophic
+ * backtracking (e.g. the 6-char `(a+)+$`) runs on the daemon's main event
+ * loop for every inbound AND backfilled message, so a ~30-char payload lying
+ * in listener-group history could freeze this single-daemon, multi-bot
+ * process for tens of seconds every poll round. A pattern-length cap does not
+ * bound backtracking. Regex can return later behind a linear-time engine.
+ */
+export function matchesContentPolicy(text: string, policy: MessageListenerContentPolicy | undefined): boolean {
+  if (!policy) return true;
+  const keywords = (policy.includeKeywords ?? []).filter(keyword => keyword.length > 0);
+  if (keywords.length === 0) return true;
+  const haystack = text.toLowerCase();
+  const keywordHits = (keyword: string): boolean => haystack.includes(keyword.toLowerCase());
+  if (policy.matchMode === 'all') {
+    return keywords.every(keywordHits);
+  }
+  return keywords.some(keywordHits);
+}
+
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
   const listener = bot.config.messageListeners?.[chatId];
   if (!listener?.enabled) return undefined;
@@ -250,6 +308,11 @@ export function evaluateMessageListener(input: {
   const messageText = extractListenerMessageText(input.message);
   if (!messageText && (msgType === 'text' || msgType === 'post')) return undefined;
   const messageTitle = extractListenerMessageTitle(input.message);
+
+  // Daemon-side keyword/regex pre-filter: the shared choke point for the
+  // realtime, polled-backfill and dashboard-preview legs. A configured policy
+  // that does not hit means the message never wakes the Agent (no model call).
+  if (!matchesContentPolicy(messageText, listener.contentPolicy)) return undefined;
 
   return {
     name: listener.name,

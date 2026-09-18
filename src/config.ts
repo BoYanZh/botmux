@@ -1,8 +1,10 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
   globalVcMeetingAgentListenerBotAppId,
+  isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
 } from './global-config.js';
@@ -62,14 +64,45 @@ function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
   return 'tmux';
 }
 
-// Computed once: the packaged fallback data dir. The effective dir is read
-// lazily (getter below) so that a SESSION_DATA_DIR set *after* this module is
-// first imported — e.g. cli.ts subcommands doing
-// `process.env.SESSION_DATA_DIR ??= resolveDataDir()` — is still honored. A
-// static value would freeze the packaged default at import time and make those
-// readers (resolveTeamRoleFile / getBotCapability / …) silently look in the
-// wrong directory. Mirrors the web/dashboard externalHost getters below.
-const packagedDataDir = new URL('../data', import.meta.url).pathname;
+// The fallback data dir used when SESSION_DATA_DIR is not set. Resolved through
+// the CANONICAL resolver (core/data-dir.ts), which is HOME-based:
+//   explicit SESSION_DATA_DIR → ~/.botmux/.data-dir breadcrumb → ~/.botmux/data
+// and never returns an install-relative path.
+//
+// It used to be `new URL('../data', import.meta.url)` — the INSTALL directory's
+// sibling. That was wrong in two ways and only stayed hidden because pm2's
+// ecosystem config baked SESSION_DATA_DIR into every managed app's env, so the
+// `??` branch was effectively dead in production:
+//   1. It pointed at a directory that does not exist and is not shipped
+//      (package.json `files` has no `data/`), so any reader that fell through
+//      here silently used a DIFFERENT store than the CLI's own
+//      resolveBotmuxDataDir() — cross-store drift for the ~389 readers of
+//      config.session.dataDir (broken /pair codes, hubsSynced:0, …).
+//   2. Inside a `bun build --compile` binary the install root is the read-only
+//      virtual `/$bunfs`, so writers hit EACCES (observed: the codex-notifier
+//      worker lease failing to mkdir '/$bunfs/data').
+// The built-in supervisor replaced pm2 and does not bake that env for free, so
+// the fallback has to be correct on its own. It is still read through the lazy
+// getter below so a SESSION_DATA_DIR set AFTER this module is first imported
+// (e.g. cli.ts subcommands doing `process.env.SESSION_DATA_DIR ??= …`) still wins.
+//
+// MEMOISED because the getter is on a HOT path: ~389 call sites read
+// `config.session.dataDir`, some in loops, and resolveBotmuxDataDir() performs up
+// to four filesystem syscalls (lstat + readFile + existsSync + stat) probing the
+// `~/.botmux/.data-dir` breadcrumb. Measured: 6.27µs per uncached call vs 0.50µs
+// for the env-set early return — 12.5×. The previous code computed its (wrong,
+// install-relative) fallback exactly once at module load, so making it lazy must
+// not also make it repeat the I/O on every read.
+//
+// Safe to cache: the fallback is only consulted when SESSION_DATA_DIR is unset,
+// and it derives from HOME plus a breadcrumb that the daemon writes at startup —
+// neither changes within a process's lifetime. A process that sets
+// SESSION_DATA_DIR later never reaches this function at all, because the getter
+// checks the env first.
+let cachedFallbackDataDir: string | undefined;
+function fallbackDataDir(): string {
+  return (cachedFallbackDataDir ??= resolveBotmuxDataDir());
+}
 
 export interface ChatBotDiscoveryConfig {
   listBotsApiEnabled: boolean;
@@ -80,6 +113,28 @@ export interface HerdrTraexPluginRuntimeConfig {
   enabled: boolean;
   source: string;
   ref: string;
+}
+
+/** Startup-only handoff for a local companion process.
+ *
+ * This is deliberately a path, not a secret value: this resolver performs no
+ * file IO. The startup boundary validates/loads the dedicated file and never
+ * logs or falls back to the Dashboard/internal HMAC secret. */
+export interface CompanionStartupConfig {
+  secretFile: string | undefined;
+  botAppId: string | undefined;
+}
+
+/** The sole supported private secret-file configuration input. */
+export const COMPANION_SECRET_FILE_ENV = 'BOTMUX_COMPANION_SECRET_FILE';
+export const COMPANION_BOT_APP_ID_ENV = 'BOTMUX_COMPANION_BOT_APP_ID';
+
+/** Resolve the fixed scoped startup handoff without touching the secret file. */
+export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.env): CompanionStartupConfig {
+  return {
+    secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]),
+    botAppId: nonBlankHost(env[COMPANION_BOT_APP_ID_ENV]),
+  };
 }
 
 /**
@@ -167,7 +222,7 @@ export const config = {
     appSecret: process.env.LARK_APP_SECRET ?? '',
   },
   session: {
-    get dataDir() { return process.env.SESSION_DATA_DIR ?? packagedDataDir; },
+    get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
     // Writable for back-compat: callers/tests historically assigned
     // `config.session.dataDir = ...`. Map writes onto SESSION_DATA_DIR so the
     // getter reflects them and the old assignable contract is preserved.
@@ -233,7 +288,7 @@ export const config = {
      *  schedules, SSE — are reachable WITHOUT a token, so a stale dashboard
      *  link degrades to read-only browsing instead of a dead "link expired"
      *  wall. Write actions (POST/PATCH/DELETE) and the raw PTY log always
-     *  require the rotated token. Opt out with
+     *  require the current token. Opt out with
      *  BOTMUX_DASHBOARD_PUBLIC_READONLY=false.
      *
      *  NOTE: this env value is only the DEFAULT. Once the toggle is changed on
@@ -242,6 +297,10 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
+  // A local companion process consumes this typed handoff. Keep it separate
+  // from dashboard/daemon HMAC configuration: there is intentionally no
+  // default path and therefore no credential reuse.
+  companion: resolveCompanionStartupConfig(),
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input
@@ -295,6 +354,10 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Default OFF (experimental; only an explicit stored true enables). Read live
+  // so a Dashboard change gates the next session upgrade without restarting
+  // daemons or changing the current turn.
+  get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without
@@ -303,6 +366,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental cross-principal
+  // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
+  // daemon delivers another principal's message normally instead of diverting it
+  // into a staged record, i.e. exactly the pre-#1348 behavior. Read per message
+  // so a Settings flip applies to the next turn without a daemon restart; the
+  // worker reads the same switch through isCrossPrincipalInterruptionEnabled so
+  // both ends of the IPC agree. `BOTMUX_XPI_ENABLED` overrides for one process.
+  get crossPrincipalInterruption(): boolean { return isCrossPrincipalInterruptionEnabled(); },
   // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
   // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
   // effect on the next session without a daemon restart (existing panes keep their
@@ -310,6 +381,7 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

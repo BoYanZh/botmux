@@ -92,6 +92,10 @@ const desktopShellInjectedCss = `
     grid-column: 1 / -1 !important;
     min-width: 0 !important;
     width: 100% !important;
+    /* 浏览器端侧边栏悬浮成 fixed 卡片后，.workspace 用 margin-left 让位；
+       桌面端靠注入 CSS 隐藏 .sidebar，必须把这段让位清零，否则内容整体右移
+       留下一条与隐藏侧栏等宽的空隙。 */
+    margin-left: 0 !important;
   }
 
   .attention-strip {
@@ -103,6 +107,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': '飞书 AI CLI 控制台',
     'nav.overview': '总览',
     'nav.sessions': '会话',
+    'nav.workbench': '驾驶舱',
     'nav.insights': '洞察',
     'nav.workflows': '工作流',
     'nav.groups': '群组',
@@ -167,6 +172,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'dashboard.urlUnavailable': '控制台 URL 暂不可用。',
     'dashboard.openFailed': '打开页面失败：{error}',
     'login.launchAtLogin': '开机启动 App',
+    'login.launchAtLoginOn': '已设为开机启动',
     'login.unavailable': '登录项不可用：{error}',
     'login.updateFailed': '登录项更新失败：{error}',
     'logs.title': '日志',
@@ -185,6 +191,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': 'Feishu AI CLI Control',
     'nav.overview': 'Overview',
     'nav.sessions': 'Sessions',
+    'nav.workbench': 'Cockpit',
     'nav.insights': 'Insight',
     'nav.workflows': 'Workflows',
     'nav.groups': 'Groups',
@@ -249,6 +256,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'dashboard.urlUnavailable': 'Dashboard URL is not available yet.',
     'dashboard.openFailed': 'Open page failed: {error}',
     'login.launchAtLogin': 'Launch app at login',
+    'login.launchAtLoginOn': 'Launches at login',
     'login.unavailable': 'Login item unavailable: {error}',
     'login.updateFailed': 'Login item update failed: {error}',
     'logs.title': 'Logs',
@@ -280,6 +288,8 @@ const addBotBtn = byId<HTMLButtonElement>('add-bot-btn');
 const logsBtn = byId<HTMLButtonElement>('logs-btn');
 const homeBtn = byId<HTMLButtonElement>('home-btn');
 const loginToggle = byId<HTMLInputElement>('login-toggle');
+const loginRow = byId<HTMLLabelElement>('login-row');
+const loginLabel = byId<HTMLSpanElement>('login-label');
 const versionLine = byId<HTMLDivElement>('version-line');
 const dashboardFrame = byId<DashboardWebviewElement>('dashboard-frame');
 const emptyDashboard = byId<HTMLDivElement>('empty-dashboard');
@@ -360,6 +370,15 @@ function paintChrome(): void {
     button.classList.toggle('active', button.dataset.locale === currentLocale);
     button.setAttribute('aria-pressed', String(button.dataset.locale === currentLocale));
   }
+  paintLoginState();
+}
+
+function paintLoginState(): void {
+  // The label reflects the persisted state, not just the control: enabled gets
+  // distinct copy and brighter text so on/off read differently at a glance.
+  const enabled = loginToggle.checked;
+  loginRow.dataset.enabled = String(enabled);
+  loginLabel.textContent = t(enabled ? 'login.launchAtLoginOn' : 'login.launchAtLogin');
 }
 
 async function initialize(): Promise<void> {
@@ -558,7 +577,13 @@ function paintControls(state: DesktopRuntimeState | null): void {
   const disabled = bridgeUnavailable || actionPending;
   const status = state?.status;
   const unmanagedRuntime = Boolean(state && !state.runtimeManaged);
+  // Show only the actions that fit the current state: stop/restart while the
+  // runtime is up (or on its way up), start otherwise.
+  const runningLike = status === 'running' || status === 'starting' || status === 'degraded';
 
+  startBtn.hidden = runningLike;
+  stopBtn.hidden = !runningLike;
+  restartBtn.hidden = !runningLike;
   startBtn.disabled = disabled || unmanagedRuntime || status === 'running' || status === 'starting';
   stopBtn.disabled =
     disabled || unmanagedRuntime || !status || status === 'not_configured' || status === 'stopped' || status === 'starting';
@@ -844,9 +869,11 @@ async function initializeLoginToggle(api: BotmuxDesktopApi): Promise<void> {
     setRuntimeNotice(t('login.unavailable', { error: formatError(error) }));
   } finally {
     loginToggle.disabled = false;
+    paintLoginState();
   }
 
   loginToggle.addEventListener('change', () => {
+    paintLoginState();
     void updateLoginItem(api, loginToggle.checked);
   });
 }
@@ -862,6 +889,7 @@ async function updateLoginItem(api: BotmuxDesktopApi, enabled: boolean): Promise
     setRuntimeNotice(t('login.updateFailed', { error: formatError(error) }));
   } finally {
     loginToggle.disabled = false;
+    paintLoginState();
   }
 }
 

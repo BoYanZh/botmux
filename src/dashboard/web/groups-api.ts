@@ -8,6 +8,13 @@ export interface GroupMemberBot extends GroupBot {
   inChat: boolean;
   hasRole?: boolean;
   error?: unknown;
+  pinStreamingCardMasterEnabled?: boolean;
+  pinStreamingCardChatEnabled?: boolean;
+  pinStreamingCardEffectiveEnabled?: boolean;
+  agentCliId?: string;
+  agentModel?: string;
+  agentReasoningEffort?: string;
+  defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }
 
@@ -16,7 +23,63 @@ export interface GroupChat {
   name?: string;
   ownerId?: string | null;
   avatar?: string;
+  chatMode?: string;
+  sessionGroup?: boolean;
+  collaborationMode?: 'standard' | 'project';
+  projectCoordinatorAppId?: string;
+  projectWorkerAppIds?: string[];
+  projectAutoEnrollWorkers?: boolean;
+  projectProgressCard?: ProjectProgressCardConfig;
+  projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];
+}
+
+export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
+export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+
+export interface ProjectProgressCardConfig {
+  schemaVersion: 1;
+  templateId: ProjectProgressCardTemplateId;
+  sections: ProjectProgressCardSectionId[];
+  milestonesExpanded: boolean;
+}
+
+export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
+  return {
+    schemaVersion: 1,
+    templateId: 'status-dashboard',
+    sections: ['goal', 'blockers', 'workstreams', 'milestones'],
+    milestonesExpanded: false,
+  };
+}
+
+export interface ProjectGroupRuntimeSummary {
+  status: 'active' | 'paused' | 'completed';
+  phase: string;
+  focus: string;
+  progress: number;
+  remaining: string;
+  workstreamCount: number;
+  completedWorkstreamCount: number;
+  blockerCount: number;
+  cardPinned: boolean;
+  updatedAt: string;
+}
+
+export interface GroupCollaborationModeResponse {
+  ok: boolean;
+  config: {
+    chatId: string;
+    mode: 'standard' | 'project';
+    coordinatorAppId?: string;
+    workerAppIds?: string[];
+    autoEnrollWorkers?: boolean;
+    progressCard?: ProjectProgressCardConfig;
+  };
+  project: ProjectGroupRuntimeSummary | null;
+  cardRefresh?: 'updated' | 'deferred' | 'not_needed';
+  cardRefreshError?: string;
+  error?: string;
 }
 
 export interface GroupsSnapshot {
@@ -40,7 +103,8 @@ let cachedSnapshot: GroupsSnapshot = emptyGroupsSnapshot;
 let cachedAt = 0;
 let inFlight: Promise<GroupsSnapshot> | null = null;
 let requestSeq = 0;
-let latestRequestSeq = 0;
+let latestSuccessfulRequestSeq = 0;
+let cacheEpoch = 0;
 
 function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
   return {
@@ -54,6 +118,74 @@ export function primeGroupsSnapshotCache(snapshot: GroupsSnapshot): void {
   cachedAt = Date.now();
 }
 
+export function __testOnly_resetGroupsSnapshotCache(): void {
+  cacheEpoch += 1;
+  cachedSnapshot = emptyGroupsSnapshot;
+  cachedAt = 0;
+  inFlight = null;
+  requestSeq = 0;
+  latestSuccessfulRequestSeq = 0;
+  cachedNames = emptyGroupsSnapshot;
+  cachedNamesAt = 0;
+  namesInFlight = null;
+}
+
+// ─── 名称/头像专用轻量缓存（与上面的完整矩阵缓存**完全分离**）──────────────
+//
+// 为什么必须分开存：完整矩阵（12.59MB）里 chats[].memberBots 占 12341KB，而
+// 名称/头像链路一个字节都不用它。但群组页 / 角色页 / 日程页 / 本页的反馈设置
+// 区块（FeedbackSettingsSection）都**真的**要读 memberBots —— 如果把轻量结果
+// 灌进共享的 `cachedSnapshot`，那些页面会拿到 `memberBots: []`，表现为「群里
+// 一个 bot 都没有」的静默错数据（不是报错，更难发现）。
+//
+// 所以轻量视图有自己的 cachedNames/cachedNamesAt，两条缓存互不写入。
+let cachedNames: GroupsSnapshot = emptyGroupsSnapshot;
+let cachedNamesAt = 0;
+let namesInFlight: Promise<GroupsSnapshot> | null = null;
+
+/**
+ * 拉取「只含 bot 名称/头像 + 会话名称/头像」的轻量快照（`?view=names`）。
+ *
+ * **实时性**：缓存语义与完整矩阵逐字一致（同样默认 3s，仅用于消掉同一次挂载内
+ * 的重复请求；服务端也是同一份 30s 快照 + 同一条 roster 失效通知）。也就是说
+ * 名称/头像的新鲜度**与改动前完全相同**，变化的只有同一次请求传多少字节。
+ * 这里刻意不加长任何 TTL：名称/头像正是最忌讳陈旧的数据。
+ *
+ * 需要 memberBots 的调用方必须继续用 {@link fetchGroupsSnapshot}。
+ */
+export async function fetchGroupsNamesSnapshot(
+  options: FetchGroupsSnapshotOptions = {},
+): Promise<GroupsSnapshot> {
+  const cacheMs = options.cacheMs ?? 3000;
+  const now = Date.now();
+  // 完整矩阵是轻量视图的超集：若它刚拿过新鲜数据，直接复用，省掉一次请求。
+  // （反向不成立——轻量结果永远不能喂给完整矩阵的消费方。）
+  if (!options.force && cachedAt > 0 && now - cachedAt <= cacheMs) return cachedSnapshot;
+  if (!options.force && cachedNamesAt > 0 && now - cachedNamesAt <= cacheMs) return cachedNames;
+  if (!options.force && namesInFlight) return namesInFlight;
+
+  const epoch = cacheEpoch;
+  const request = (async () => {
+    const r = await fetch('/api/groups?view=names');
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const snapshot = normalizeGroupsSnapshot(body);
+    if (epoch === cacheEpoch) {
+      cachedNames = snapshot;
+      cachedNamesAt = Date.now();
+    }
+    return snapshot;
+  })();
+
+  if (!options.force) {
+    namesInFlight = request.finally(() => {
+      if (epoch === cacheEpoch) namesInFlight = null;
+    });
+    return namesInFlight;
+  }
+  return request;
+}
+
 export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = {}): Promise<GroupsSnapshot> {
   const cacheMs = options.cacheMs ?? 3000;
   const now = Date.now();
@@ -61,22 +193,71 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   if (!options.force && inFlight) return inFlight;
 
   const seq = ++requestSeq;
-  latestRequestSeq = seq;
+  const epoch = cacheEpoch;
   const request = (async () => {
-    const r = await fetch('/api/groups');
+    const r = await fetch(options.force ? '/api/groups?refresh=1' : '/api/groups');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);
-    if (seq === latestRequestSeq) primeGroupsSnapshotCache(snapshot);
+    if (epoch === cacheEpoch && seq > latestSuccessfulRequestSeq) {
+      primeGroupsSnapshotCache(snapshot);
+      latestSuccessfulRequestSeq = seq;
+    }
     return snapshot;
   })();
 
   if (!options.force) {
     inFlight = request.finally(() => {
-      inFlight = null;
+      if (epoch === cacheEpoch) inFlight = null;
     });
     return inFlight;
   }
 
   return request;
+}
+
+export async function setGroupPinStreamingCard(
+  chatId: string,
+  appId: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; status: number; body: any }> {
+  const r = await fetch(
+    `/api/groups/${encodeURIComponent(chatId)}/pin-streaming-card/${encodeURIComponent(appId)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  const body = await r.json().catch(() => ({}));
+  return { ok: r.ok && body?.ok !== false, status: r.status, body };
+}
+
+export async function fetchGroupCollaborationMode(chatId: string): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`);
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
+}
+
+export async function saveGroupCollaborationMode(
+  chatId: string,
+  input:
+    | { mode: 'standard' }
+    | {
+        mode: 'project';
+        coordinatorAppId: string;
+        workerAppIds: string[];
+        autoEnrollWorkers: boolean;
+        progressCard: ProjectProgressCardConfig;
+      },
+): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
 }

@@ -7,12 +7,14 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { expandHome } from '../core/working-dir.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
+import { getSession } from './session-store.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { findTraexRolloutBySessionId } from './traex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
+import { findGrokUpdatesBySessionId } from './grok-transcript.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'antigravity';
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -264,7 +266,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'antigravity',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'grok', 'antigravity',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -290,6 +292,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'claude' } : null;
     }
     case 'codex': {
+      const session = getSession(q.sessionId);
+      if (session?.cliInstanceBinding && q.larkAppId && q.larkAppId !== session.larkAppId) return null;
+      const binding = (!q.larkAppId || q.larkAppId === session?.larkAppId) ? session?.cliInstanceBinding : undefined;
+      if (binding) {
+        const path = codexRolloutInHome(q, binding.codexHome, binding.source !== 'legacy');
+        return path ? { path, kind: 'codex' } : null;
+      }
       // Resolve on every call: CODEX_HOME is intentionally dynamic, and the
       // absolute path is part of the cache key so changing it cannot reuse a
       // rollout discovered under a previous root.
@@ -322,8 +331,23 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'cursor' } : null;
     }
     case 'traex': {
-      const path = cachedTranscriptPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`traex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
+        const mappedSid = q.cliSessionId
+          ? undefined
+          : findTraexSessionIdByBotmuxSessionId(q.sessionId);
+        const traexSid = q.cliSessionId || mappedSid || q.sessionId;
+        return findTraexRolloutBySessionId(traexSid) ?? null;
+      }, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
+    }
+    case 'grok': {
+      const path = cachedTranscriptPathLookup(
+        `grok:${sid}:${q.cwd ?? ''}`,
+        null,
+        () => findGrokUpdatesBySessionId(sid, q.cwd) ?? null,
+        { retryMiss: q.fresh },
+      );
+      return path ? { path, kind: 'grok' } : null;
     }
     case 'pi': {
       const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => findPiTranscriptBySessionId(sid, q.cwd) ?? null, { retryMiss: q.fresh });

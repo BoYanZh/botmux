@@ -32,9 +32,13 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
+  classifyClaudeTerminalEvent,
+  type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
 
@@ -57,6 +61,13 @@ export interface BridgePendingTurn {
    * never settle from screen-idle alone; worker terminal emission requires
    * this bit (or an explicit failure/exit path outside the queue). */
   terminalObserved?: boolean;
+  /** Structured execution result. This is independent from whether transcript
+   * fallback text is visible or suppressed by a prior `botmux send`. */
+  terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
+  /** Structured 429 observed for this turn. It remains owned by the existing
+   * limited/reset path and must not be converted into ordinary ambiguity when
+   * the following turn_duration closes the transcript boundary. */
+  rateLimited?: boolean;
   /** Set when this turn was synthesised from a local-terminal user event
    *  (no matching Lark fingerprint). Causes the worker emit path to format
    *  the Lark message with both user text and assistant text under a
@@ -94,6 +105,11 @@ export interface BridgePendingTurn {
    *  the turn — short fingerprints ("hello", "test") would otherwise risk
    *  matching pre-existing user lines in unrelated sibling jsonls. */
   markTimeMs?: number;
+  /** Set when this mark was re-created from the durable turn journal after a
+   *  worker/daemon restart interrupted the turn. The emit path prefixes the
+   *  delivered fallback with an "interrupted by restart" notice so the user
+   *  can tell a recovered partial answer from a live one. */
+  restoredFromJournal?: boolean;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -107,10 +123,63 @@ export function makeFingerprint(message: string, len = 30): string | undefined {
   return collapsed.substring(0, len);
 }
 
+/** Minimum tail length (normalised chars) required for a truncation-proof
+ *  match. A non-trivial length floor so a very short surviving tail can't
+ *  coincide with an unrelated short local prompt. This is a length gate, NOT a
+ *  uniqueness/entropy claim — the actual proof is the SUFFIX anchor below. */
+const TRUNCATION_MATCH_MIN_CHARS = 16;
+
+/** Capability-agnostic proof that a recorded transcript user line is THIS
+ *  turn's user event even though its head-substring fingerprint didn't match.
+ *
+ *  claude-code TRUNCATES the leading envelope lines (`<user_message>` +
+ *  `<botmux_task …>`) when persisting the user turn, so the head fingerprint is
+ *  gone — but the surviving text is exactly the TAIL of what we sent, i.e. a
+ *  contiguous SUFFIX of the mark's full normalised content. We anchor the proof
+ *  to that observed invariant with `endsWith`, NOT a loose `includes`: an
+ *  interior substring (a command like `run pnpm test --project unit`, or the
+ *  bare closing tags `</botmux_task> </user_message>`) that happens to appear
+ *  in the middle of the task body is NOT a suffix, so a Web Terminal operator
+ *  typing such a phrase can't spoof this and steal the pending durable mark
+ *  (the interior-substring false-match codex demonstrated on PR #724). Length
+ *  (16) is a floor, not the proof — the suffix anchor is. Proof is by CONTENT
+ *  shape, not session type (apiOnly/adopt), so it holds regardless of whether
+ *  the session can mint a Web Terminal write token.
+ *
+ *  `recordedNorm` and `markContentNorm` are both already normaliseForFingerprint'd.
+ *  Guards: require a real mark content, a recorded tail of at least
+ *  TRUNCATION_MATCH_MIN_CHARS, and a strict suffix match.
+ *
+ *  NOTE: if a future claude-code build stops truncating at the head (recorded
+ *  line no longer a suffix of what we sent), this correctly returns false and
+ *  the turn falls back to local-synth — never a wrong-mark bind. Re-proving a
+ *  non-suffix truncation would need a truncation-surviving turn nonce/closing
+ *  marker, not a relaxed substring test. */
+export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string): boolean {
+  if (!markContentNorm || markContentNorm.length === 0) return false;
+  if (recordedNorm.length < TRUNCATION_MATCH_MIN_CHARS) return false;
+  return markContentNorm.endsWith(recordedNorm);
+}
+
 export class BridgeTurnQueue {
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
+  /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
+   *  the worker. This queue is pure (no fs), so it cannot clear the durable
+   *  journal itself — it reports, the worker retires. Same contract as
+   *  `pruneExpired`'s return value, just accumulated because the drop happens
+   *  deep inside ingest() rather than at an explicit call boundary. */
+  private droppedNeedingJournalClear: BridgePendingTurn[] = [];
+
+  /** Hand over (and forget) the turns dropped head-of-line since the last
+   *  call. The worker drains this after every ingest and clears each one's
+   *  journal entry; leaving them would let a later restart re-mark a turn
+   *  that can never complete. */
+  takeDroppedNeedingJournalClear(): BridgePendingTurn[] {
+    if (this.droppedNeedingJournalClear.length === 0) return [];
+    return this.droppedNeedingJournalClear.splice(0);
+  }
 
   /** Register events as historical — their uuids are now considered seen
    *  but no attribution happens. Used at attach time to baseline. */
@@ -134,6 +203,7 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
+    opts?: { restoredFromJournal?: boolean },
   ): string {
     this.queue.push({
       turnId,
@@ -143,6 +213,7 @@ export class BridgeTurnQueue {
       contentFingerprint,
       contentNormalized,
       markTimeMs,
+      ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
     return turnId;
   }
@@ -205,7 +276,18 @@ export class BridgeTurnQueue {
    *  were originally observed in. Without this, a sessionId rotation
    *  between ingest and emit would silently drop the reply, since the
    *  global current jsonl path would no longer contain those uuids. */
-  ingest(events: TranscriptEvent[], sourceJsonlPath?: string): void {
+  ingest(
+    events: TranscriptEvent[],
+    sourceJsonlPath?: string,
+    /** Cosmetic side-channel observer: called at the moment an event is
+     *  attributed to a turn (the then-collecting turn) for
+     *    - every non-sidechain, non-error assistant event, and
+     *    - every non-sidechain pure-tool_result user event (intra-turn tool
+     *      output — skipped by turn-start handling but part of the turn).
+     *  Used by the worker to extract thinking/tool entries for the native
+     *  CoT message. Must never mutate the queue or influence attribution. */
+    onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+  ): void {
     for (const ev of events) {
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
@@ -222,7 +304,17 @@ export class BridgeTurnQueue {
         // assistant text after them, and (b) let a synthetic line that
         // accidentally contains the fingerprint substring start the
         // wrong turn.
-        if (!isMeaningfulUserEvent(ev)) continue;
+        if (!isMeaningfulUserEvent(ev)) {
+          // Pure tool_result events are intra-turn tool output — never a
+          // turn boundary, but the CoT observer wants them for the tool
+          // timeline of the currently-collecting turn.
+          if (this.collecting && onAssistantAttributed
+            && (ev as any).isSidechain !== true
+            && isPureToolResultUserEvent(ev.message?.content)) {
+            try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+          }
+          continue;
+        }
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
         // Type-ahead path: Claude writes `attachment(queued_command)` the
@@ -246,11 +338,49 @@ export class BridgeTurnQueue {
         // here: a rate-limited turn produced no real answer, so let the normal
         // terminal marker (or retry) close it.
         //
-        // Other API errors (server_error / authentication_failed / the
-        // terms-acceptance 400 / …) are NOT suppressed: they have no `limited`
-        // surface, so forwarding their text is the user's only signal that the
-        // request failed — matching pre-existing behavior.
-        if (isTranscriptRateLimitEvent(ev)) continue;
+        // Every API-error record is execution metadata, never a model answer.
+        // Its structured terminal outcome is retained below; user visibility
+        // and bounded retry are owned by the worker/daemon, respectively.
+        if (isTranscriptRateLimitEvent(ev)) {
+          if (this.collecting) this.collecting.rateLimited = true;
+          continue;
+        }
+        const terminalOutcome = classifyClaudeTerminalEvent(ev);
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced. The exit is
+        // shared; the assignment below is NOT - see the two branches.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
+          if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
+            // The two signals that share this exit are NOT of equal authority,
+            // so they do not share an assignment operator (maintainer ruling on
+            // PR #1330):
+            if (ev.isApiErrorMessage === true) {
+              // An API-error line is authoritative execution metadata. When the
+              // connection drops mid-response, Claude force-closes the stream
+              // with an `end_turn` record whose text is a half-finished
+              // sentence, and that record has already written `completed` here.
+              // Letting the error win is what keeps the turn `failed` +
+              // retryable, which is the only thing ordinary-turn-recovery acts
+              // on (`status !== 'failed' || retryable !== true` → no
+              // continuation). Unconditional assignment, therefore.
+              this.collecting.terminalOutcome = terminalOutcome;
+            } else {
+              // The `<synthetic>` placeholder is the WEAKEST terminal signal
+              // there is - no model call happened at all (no requestId, usage
+              // all zero). It must not downgrade an already-`completed` turn:
+              // `emitReadyTurns` (`status !== 'completed' → continue`) would
+              // then withhold the real answer text AND let the daemon post a
+              // failure card for a turn that had in fact been answered. With no
+              // earlier terminal outcome it still records the failure.
+              this.collecting.terminalOutcome ??= terminalOutcome;
+            }
+            this.collecting.terminalObserved = true;
+          }
+          continue;
+        }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any
@@ -277,14 +407,28 @@ export class BridgeTurnQueue {
           this.collecting = headless;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
+        if (this.collecting && onAssistantAttributed) {
+          try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+        }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
+          if (terminalOutcome?.status !== 'rate_limited') {
+            this.collecting.terminalOutcome ??= terminalOutcome;
+          }
         }
       } else if (isClaudeTurnTerminalEvent(ev)) {
         // Claude normally writes this as `system/turn_duration` immediately
-        // after the final assistant line. It is a second marker for the same
-        // logical boundary; setting a bit is naturally idempotent.
-        if (this.collecting) this.collecting.terminalObserved = true;
+        // after the final assistant line. A local transcript can legitimately
+        // contain visible text with `stop_reason:null`; the duration marker is
+        // still authoritative proof that the turn completed. Keep a previously
+        // classified API failure, but otherwise use the same completed default
+        // as the next-turn-start compatibility boundary below.
+        if (this.collecting) {
+          this.collecting.terminalObserved = true;
+          if (!this.collecting.rateLimited) {
+            this.collecting.terminalOutcome ??= { status: 'completed' };
+          }
+        }
       }
     }
   }
@@ -325,6 +469,15 @@ export class BridgeTurnQueue {
       && this.collecting.assistantUuids.length === 0) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
+      // This turn will never reach drainEmittable, which is where the worker
+      // retires its durable journal entry. Record it so the worker can clear
+      // the journal here too — otherwise the entry survives, and every later
+      // restart re-marks it and replays the same stretch of transcript. That
+      // is not hypothetical: one entry was restored on six consecutive
+      // restarts, twice resurfacing a hours-old provider error as a fresh
+      // 「本轮执行失败」card. Local turns are skipped: they are synthesised by
+      // this queue and never had a journal entry to begin with.
+      if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
@@ -343,8 +496,26 @@ export class BridgeTurnQueue {
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
+        } else if (isTruncatedMatch(userText, next.contentNormalized)) {
+          // TRUNCATION-PROOF bind (capability-agnostic — see isTruncatedMatch).
+          // The head-substring fingerprint didn't match because claude-code
+          // TRUNCATES the leading envelope lines (`<user_message>` +
+          // `<botmux_task …>`) when persisting the user turn. But the recorded
+          // line is PROVABLY this turn's user event: its normalised text is a
+          // non-trivial contiguous substring of the FULL marked content
+          // (`contentNormalized`), i.e. exactly the surviving tail of what we
+          // sent. This does NOT guess from session type (apiOnly/adopt) —
+          // unrelated local terminal input like `pwd` is not a substring of the
+          // marked API/Lark prompt, so it can never steal the durable mark
+          // (the write-terminal race codex flagged on PR #724).
+          next.started = true;
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+          next.markTimeMs = eventTimeMs;
+          this.collecting = next;
+          consumedNext = true;
         }
-        // Mismatch falls through to local-turn synthesis below.
+        // Otherwise (no fingerprint match, not a provable truncation) falls
+        // through to local-turn synthesis below (adopt) or is skipped (managed).
       } else {
         // Legacy mark() with no fingerprint — start on the next turn-start.
         next.started = true;
@@ -355,10 +526,16 @@ export class BridgeTurnQueue {
       }
     }
     if (!consumedNext) {
-      // Local-terminal input (or a queued_command whose prompt didn't
-      // match any pending Lark fingerprint). Synthesise a started turn
-      // ahead of any unstarted Lark turn so chronological order matches
-      // transcript order at emit time.
+      // The user event neither fingerprint-matched nor proved a truncation of a
+      // pending durable mark. Treat it as local-terminal input: synthesise a
+      // started local turn ahead of any unstarted turn so chronological order
+      // matches transcript order at emit time. This is SAFE regardless of
+      // session type — it never steals a pending durable mark (the mark stays
+      // unstarted, to be bound by its real user line). Restoring the original
+      // pre-PR behavior here (no session-type gate) is what keeps codex's
+      // requirement: a genuine local turn on a normal managed writable terminal
+      // still emits and is not silently dropped. The mark-stealing bug lived in
+      // the fingerprint-MISMATCH bind above, now gated on the truncation proof.
       const localTurn: BridgePendingTurn = {
         turnId: `local-${uuid}`,
         started: true,

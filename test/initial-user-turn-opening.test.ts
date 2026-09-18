@@ -23,9 +23,10 @@
  * Run:  pnpm vitest run test/initial-user-turn-opening.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const mocks = vi.hoisted(() => {
   process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-initial-turn-${process.pid}`;
@@ -43,6 +44,7 @@ const mocks = vi.hoisted(() => {
             openId,
             type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const,
             name: openId === 'ou_owner' ? '凡辞' : undefined,
+            email: openId === 'ou_owner' ? 'owner@example.com' : undefined,
           }
         : undefined
     )),
@@ -107,6 +109,12 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+// hook 注入的 preflight：默认 false（不影响现有 codex 测试），特定用例置 true。
+const preflightMock = vi.fn(() => false);
+vi.mock('../src/adapters/hook-installer.js', () => ({
+  hasInstalledPromptHookCached: (...args: any[]) => preflightMock(...args),
+}));
+
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -116,6 +124,7 @@ import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-con
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_computeCodexAppSteerable as computeCodexAppSteerable,
 } from '../src/daemon.js';
 
 const APP = 'initial_turn_app';
@@ -139,11 +148,12 @@ function writeBots(entries: unknown[]): void {
 
 function makeEventData(messageId: string, text: string, rootId?: string, extra?: {
   senderOpenId?: string;
+  senderType?: string;
   mentions?: any[];
   parentId?: string;
 }): any {
   return {
-    sender: { sender_id: { open_id: extra?.senderOpenId ?? OWNER }, sender_type: 'user' },
+    sender: { sender_id: { open_id: extra?.senderOpenId ?? OWNER }, sender_type: extra?.senderType ?? 'user' },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -242,6 +252,11 @@ function openingExpectations(cliId: CliId, mode: 'prompt' | 'off' | 'global') {
 describe('empty-started session — first real business turn must use the new-topic opening', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Production forkWorker has a strict boolean contract: false is reserved
+    // for an unaccepted fork. Keep the default fixture on the successful path
+    // so orchestration that reads the return value does not misclassify an
+    // unconfigured vi.fn() (undefined) as a real rejection.
+    mocks.forkWorker.mockReturnValue(true);
     home = mkdtempSync(join(tmpdir(), 'botmux-initial-turn-'));
     vi.stubEnv('HOME', home);
     vi.stubEnv('CODEX_HOME', '');
@@ -331,6 +346,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).not.toContain('<botmux_reminder>');
     // … with every per-turn datum still threaded through.
     expect(opening).toContain('<sender type="user" open_id="ou_owner"');
+    expect(opening).toContain('email="owner@example.com"');
     expect(opening).toContain('<mentions>');
     expect(opening).toContain('ou_peer');
     expect(opening).toContain('<available_bots');
@@ -377,6 +393,96 @@ describe('empty-started session — first real business turn must use the new-to
       .toContain('ou_owner');
   });
 
+  it('live worker: a plain human Codex App turn is admitted as steerable (R4-B1 production wiring, not hand-injected)', async () => {
+    const anchor = 'om_steer_live_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_live_msg', '第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_live_msg'),
+    );
+
+    // The daemon computes codexAppSteerable and passes it as sendWorkerInput's
+    // 4th arg (opts) — this is the production path the worker init COPY depends
+    // on. The test does NOT hand-inject the flag anywhere.
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+  });
+
+  it('live worker: a foreign-bot @steer turn is steerable and the directive is not model content', async () => {
+    const anchor = 'om_bot_steer_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_bot_steer_msg', '@steer\n改用新的 API 继续做', anchor, { senderType: 'bot' }),
+      makeCtx(anchor, 'om_bot_steer_msg'),
+    );
+
+    const payload = liveInputs()[0]!;
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+    expect(payload.content).toContain('改用新的 API 继续做');
+    expect(payload.content).not.toContain('@steer');
+  });
+
+  it('live worker: a plain foreign-bot @mention stays queued', async () => {
+    const anchor = 'om_bot_queue_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_bot_queue_msg', '普通 bot-to-bot 消息', anchor, { senderType: 'bot' }),
+      makeCtx(anchor, 'om_bot_queue_msg'),
+    );
+
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('worker-null refork: a plain human Codex App opening carries the frozen steerable flag on the fork payload (R4-B1)', async () => {
+    const anchor = 'om_steer_cold_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_cold_msg', '冷启后的第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_cold_msg'),
+    );
+
+    // The worker-null re-fork opening must carry the frozen steer authorization
+    // on the CliTurnPayload handed to forkWorker (the gap codex flagged: the
+    // production init path never set it, only the hand-injected test did).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBe(true);
+  });
+
   // ─── worker-null / refork ───────────────────────────────────────────────────
 
   it('worker-null refork: opens with new-topic context and does NOT resume a never-used CLI', async () => {
@@ -395,8 +501,51 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).toContain('<botmux_routing>');
     expect(opening).toContain('<user_message>\n重启之后的第一条真实消息\n</user_message>');
     expect(opening).not.toContain('<botmux_reminder>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: false, turnId: 'om_cold_first' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: false, turnId: 'om_cold_first' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('worker-null refork + auto hook: opening 轮写合法 sidecar（非 speculative follow-up reminder）', async () => {
+    // 三审发现：opening 分支曾无条件先跑 buildReforkCliInput（有写 sidecar 的副作用），
+    // 结果被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份没发出去的 speculative reminder → 双注入。
+    // 修复后 opening 分支直接用 buildNewTopicCliInput。#794 后续后 opening 也走 hook
+    // 注入：写的是**合法** opening sidecar（whiteboard/sender/mentions，无 follow-up
+    // reminder），opening 内容只剩正文。本测试锁住：sidecar 是 opening envelope（claim
+    // 回的内容不含 <botmux_reminder>），不是 speculative follow-up reminder。
+    const anchor = 'om_hook_opening_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    // 切到 claude-code + auto hook + preflight 通过
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    bot.botName = 'TestBot';
+    bot.botOpenId = 'ou_selfbot';
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_hook_first', '第一条消息', anchor),
+      makeCtx(anchor, 'om_hook_first'),
+    );
+
+    // opening 走 hook 模式：PTY 文本只剩正文，无 <user_message> 外壳 / reminder
+    const opening = forkInputs()[0]!.content;
+    expect(opening).toBe('第一条消息');
+    expect(opening).not.toContain('<user_message>');
+    expect(opening).not.toContain('<botmux_reminder>');
+    // sidecar 是合法 opening envelope：claim 回的内容含 sender，不含 follow-up reminder
+    // （若写的是 speculative buildReforkCliInput sidecar，envelope 会含 <botmux_reminder>）
+    const envelope = claimPromptContext(ds.session.sessionId, 'om_hook_first', fingerprintPromptText(opening), prefixOf(opening));
+    expect(envelope).toBeDefined();
+    expect(envelope).toContain('<sender ');
+    expect(envelope).not.toContain('<botmux_reminder>');
   });
 
   it('worker-null refork keeps --resume when a non-IM path already fed the CLI', async () => {
@@ -416,7 +565,7 @@ describe('empty-started session — first real business turn must use the new-to
 
     const opening = forkInputs()[0]!.content;
     expect(opening).toContain('<botmux_routing>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: true, turnId: 'om_after_schedule' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: true, turnId: 'om_after_schedule' }));
   });
 
   it('worker-null refork without the marker keeps the ordinary resume follow-up path', async () => {
@@ -432,7 +581,7 @@ describe('empty-started session — first real business turn must use the new-to
     const content = forkInputs()[0]!.content;
     expect(content).toContain('<botmux_reminder>');
     expect(content).not.toContain('<botmux_routing>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: true, turnId: 'om_plain_cold' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: true, turnId: 'om_plain_cold' }));
   });
 
   // ─── restart durability ─────────────────────────────────────────────────────
@@ -514,6 +663,11 @@ describe('empty-started session — first real business turn must use the new-to
       type: 'raw_input',
       content: '/model opus',
       turnId: 'om_model',
+      trustedController: {
+        senderType: 'user',
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+      },
     });
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
     expect(ds.session.initialUserTurnPending).toBe(true);
@@ -590,6 +744,7 @@ describe('empty-started session — first real business turn must use the new-to
   it('a rejected live send restores the pending opening for the next message', async () => {
     const anchor = 'om_reject_root';
     const ds = seedEmptyStarted(anchor);
+    ds.currentTurnId = 'om_previous_accepted';
     mocks.sendWorkerInput.mockReturnValueOnce(false);
 
     await handleThreadReply(
@@ -601,6 +756,9 @@ describe('empty-started session — first real business turn must use the new-to
     expect(liveInputs()[0]!.content).toContain('<botmux_routing>');
     // … but the worker refused it, so the one-shot state goes back.
     expect(ds.session.initialUserTurnPending).toBe(true);
+    // The rejected turn never became authoritative. Keeping the previous
+    // lineage lets its late nothing-to-send terminal still close the live card.
+    expect(ds.currentTurnId).toBe('om_previous_accepted');
 
     await handleThreadReply(
       makeEventData('om_retry', '再试一次', anchor),
@@ -608,6 +766,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
     expect(liveInputs()[1]!.content).toContain('<botmux_routing>');
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ds.currentTurnId).toBe('om_retry');
   });
 
   it('a throwing cold fork restores the pending opening', async () => {
@@ -622,6 +781,29 @@ describe('empty-started session — first real business turn must use the new-to
 
     expect(forkInputs()[0]!.content).toContain('<botmux_routing>');
     expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('a rejected cold fork restores the pending opening without recording a phantom turn', async () => {
+    const anchor = 'om_fork_reject_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true });
+    mocks.forkWorker.mockReturnValueOnce(false);
+
+    await handleThreadReply(
+      makeEventData('om_fork_rejected', '冷启拒绝', anchor),
+      makeCtx(anchor, 'om_fork_rejected'),
+    );
+
+    expect(forkInputs()[0]!.content).toContain('<botmux_routing>');
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(ds.lastCliInput ?? ds.session.lastCliInput).toBeFalsy();
+
+    await handleThreadReply(
+      makeEventData('om_fork_retry', '冷启重试', anchor),
+      makeCtx(anchor, 'om_fork_retry'),
+    );
+    expect(forkInputs()[1]!.content).toContain('<botmux_routing>');
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ds.currentTurnId).toBe('om_fork_retry');
   });
 
   // ─── regression: a FAILED delivery must not poison last* / --resume ──────────
@@ -656,7 +838,7 @@ describe('empty-started session — first real business turn must use the new-to
     const retryInput = forkInputs()[forkInputs().length - 1]!;
     expect(retryInput.content).toContain('<botmux_routing>');
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
-      .toEqual({ resume: false, turnId: 'om_boom_retry' });
+      .toEqual(expect.objectContaining({ resume: false, turnId: 'om_boom_retry' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
@@ -687,7 +869,78 @@ describe('empty-started session — first real business turn must use the new-to
     const retryInput = forkInputs()[forkInputs().length - 1]!;
     expect(retryInput.content).toContain('<botmux_routing>');
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
-      .toEqual({ resume: false, turnId: 'om_after_death' });
+      .toEqual(expect.objectContaining({ resume: false, turnId: 'om_after_death' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+});
+
+describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)', () => {
+  const humanFacts = {
+    humanSender: true,
+    adopted: false,
+    isForeignBot: false,
+    isBotSenderType: false,
+    explicitBotSteer: false,
+    substituteTrigger: false,
+    controlRewrite: false,
+    messageListener: false,
+    vcMeetingReceiver: false,
+    vcMeetingImTurnOrigin: false,
+  };
+
+  it('authorizes ONLY a positive human sender with no special semantics', () => {
+    expect(computeCodexAppSteerable({ ...humanFacts })).toBe(true);
+  });
+
+  it('is fail-closed: NO humanSender ⇒ serial even when every exclusion is absent (the fail-open root)', () => {
+    // The bug codex caught: excluding a list of known non-human sources is not
+    // enough — an un-enumerated non-user source (humanSender:false) must still be
+    // denied. This is the core positive-assert guarantee.
+    expect(computeCodexAppSteerable({ ...humanFacts, humanSender: false })).toBe(false);
+  });
+
+  it('each special-source fact independently forces serial', () => {
+    for (const key of [
+      'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
+    }
+  });
+
+  it('a known peer bot (isForeignBot true / humanSender false) stays serial even if sender_type looked user-like', () => {
+    // The known-peer fallback: an anomalous sender_type from a known peer must
+    // NOT be authorized. Both the humanSender=false and isForeignBot=true facts
+    // (which the daemon derives via isKnownPeerBot) independently deny it.
+    expect(computeCodexAppSteerable({
+      ...humanFacts, humanSender: false, isForeignBot: true,
+    })).toBe(false);
+  });
+
+  it('authorizes a known peer bot only when it carries an explicit @steer directive', () => {
+    const botFacts = {
+      ...humanFacts,
+      humanSender: false,
+      isForeignBot: true,
+      isBotSenderType: true,
+    };
+    expect(computeCodexAppSteerable({ ...botFacts })).toBe(false);
+    expect(computeCodexAppSteerable({ ...botFacts, explicitBotSteer: true })).toBe(true);
+  });
+
+  it('keeps every special control lane serial even for explicit bot @steer', () => {
+    const botFacts = {
+      ...humanFacts,
+      humanSender: false,
+      isForeignBot: true,
+      isBotSenderType: true,
+      explicitBotSteer: true,
+    };
+    for (const key of [
+      'adopted', 'substituteTrigger', 'controlRewrite', 'messageListener',
+      'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...botFacts, [key]: true })).toBe(false);
+    }
   });
 });

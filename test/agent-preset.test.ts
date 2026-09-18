@@ -34,6 +34,7 @@ describe('buildPreset — secret-free allow-list', () => {
       allowedChatGroups: ['oc_team'],
       oncallChats: ['oc_oncall'],
       workingDir: '/Users/alice/projects',
+      nativeSubagentRuntime: { model: { mode: 'custom', value: 'private-model' } },
     });
 
     // Structural guarantee: the object carries ONLY allow-listed keys — no
@@ -44,6 +45,7 @@ describe('buildPreset — secret-free allow-list', () => {
     for (const leaked of ['larkAppId', 'larkAppSecret', 'allowedUsers', 'allowedChatGroups', 'oncallChats', 'workingDir']) {
       expect(preset).not.toHaveProperty(leaked);
     }
+    expect(preset).not.toHaveProperty('nativeSubagentRuntime');
 
     // Value guarantee: no secret VALUE leaks into the serialized JSON. (We check
     // values, not key names — the guide text deliberately *names* the excluded
@@ -81,6 +83,8 @@ describe('buildPreset — version + guide stamping', () => {
     expect(preset.botmuxPreset).toBe(PRESET_VERSION);
     expect(preset.guide).toBe(PRESET_GUIDE);
     expect(preset.guide).toContain('不包含任何凭证');
+    expect(preset.guide).toContain('daemon 注入的 `BOTMUX_OWNER_OPEN_ID`');
+    expect(preset.guide).toContain('`open_id` 只属于签发它的应用');
   });
 });
 

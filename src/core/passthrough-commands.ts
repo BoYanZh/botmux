@@ -10,7 +10,7 @@
  * chat) rather than relayed to the CLI. Used both for routing and to reject
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth']);
+export const DAEMON_COMMANDS = new Set(['/close', '/cleanup-wt', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -30,13 +30,28 @@ export const PASSTHROUGH_COMMANDS = new Set([
   // 推理强度调档。放全局（而非某个 adapter 的 defaultPassthroughCommands）是刻意的：
   //   ① 这里的命令本就是「尽力透传」——/plugin /mcp /btw 也并非所有 CLI 都支持，
   //      CLI 认得就生效、认不得顶多回一句 unknown-command（不崩溃 / 不损坏 / 不泄露）。
-  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort，Codex 亦有 reasoning
-  //      effort；未来别的 CLI 补上后零改动自动生效，无需再逐个 adapter 加。
+  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort。Codex 的 effort
+  //      通过 model_reasoning_effort / 原生模型菜单设置，不依赖此命令；误透传只会
+  //      得到 unknown-command，不会改写 Codex 配置。
   //   ② 全局集合刻意不带「空 topic 冷启动」能力（那只认 adapter 层的
   //      defaultPassthroughCommands，见 isInitialSessionPassthrough）——/effort 是
   //      「调档」而非「开一段工作」的命令，空话题里单发 /effort 不应凭空拉起会话。
   //      对照 /goal（开启目标工作）仍留在 adapter 层，保留其冷启动语义。
   '/effort',
+  // Codex 原生 /fast 切换 service_tier。放全局 passthrough（同 /effort，非 adapter
+  // 冷启动层）：botmux 不接管,只把命令透传给 Codex 让它自己切档,卡片只读展示当前
+  // 档位徽标。刻意不进 adapter defaultPassthroughCommands —— owner 政策是空话题里
+  // 单发 /fast 不该凭空拉起会话（它是「调档」非「开一段工作」）。别的 CLI 认不得
+  // 顶多回 unknown-command,不崩溃 / 不泄露。
+  //
+  // ⚠️ 能力边界（只对原生 paste TUI 成立）：passthrough 是往 CLI 敲字（PTY write）。
+  // Codex RPC 模式的 pane 是纯 viewer、无 terminal input（turn 走 JSON-RPC）,
+  // /fast 敲进去到不了 app-server;codex+Riff 后端把文本+回车当两次远端 task。这两
+  // 种形态下 /fast 不会真正切档,徽标也只反映 rollout 实际记录（RPC app-server 仍写
+  // rollout;Riff 无 rollout/tier 概念,tracker 只在 structuredBridgeIsCodex 且有
+  // rollout 时 bind,天然 fail-closed 不显示徽标）。此处仅登记 passthrough 语义,不
+  // 声称在非 paste 形态下能切档。
+  '/fast',
 ]);
 
 /**
@@ -49,6 +64,53 @@ export const PASSTHROUGH_COMMANDS = new Set([
  * recognized as a command by the restriction gate.
  */
 export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
+
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
+ * requires every user message to pass through its service-user envelope and
+ * structured turn ledger. Raw passthrough (a literal `/compact\n` written to the
+ * PTY) bypasses that framing entirely: dsh's runner logs `ignoring non-frame
+ * input` and drops it, while mira/mir enqueue the line as an ordinary USER
+ * MESSAGE and burn a turn asking the model about it.
+ *
+ * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
+ * the Lark card builder can gate its own `/compact` affordance on the SAME
+ * predicate the router uses. Importing command-handler from card-builder would
+ * cycle (command-handler imports card-builder). The `remote-cli-ids.ts` header
+ * documents what happens when a card open-codes a single id instead: adding mojo
+ * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
+ * "can this CLI receive typed input" must call the predicate below, never
+ * hand-write a member of this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
+
+/**
+ * True for a CLI with no raw-passthrough surface (see
+ * {@link NO_RAW_PASSTHROUGH_CLI_IDS}).
+ *
+ * `dsh` is RUNTIME-DEPENDENT: a bot with `dshRuntime: 'tui'` runs the PTY-driven
+ * `dsh-tui` adapter — a genuine interactive TUI (same interaction model as
+ * claude-code) that DOES accept a raw `/compact`. That resolution happens inside
+ * the worker (`worker.ts`'s `cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'`),
+ * so daemon/card-side callers only ever see the bare `'dsh'` and must pass the
+ * runtime to get the right answer.
+ *
+ * `dshRuntime` is read from the LIVE bot config, never from
+ * `SessionCliLaunchSnapshotV1` — that snapshot has no such field, and the worker
+ * likewise pairs a frozen `cliId` with the live `dshRuntime`. Reading bot config
+ * therefore matches what actually spawns.
+ *
+ * Omitting `opts` is deliberately FAIL-CLOSED: bare `'dsh'` resolves to the
+ * headless JSON-RPC runner and returns true (no raw surface). Refusing a
+ * passthrough is recoverable; feeding one to a runner wedges the session or
+ * burns a turn.
+ */
+export function cliHasNoRawPassthroughSurface(
+  cliId: string | undefined,
+  opts?: { dshRuntime?: 'official' | 'tui' },
+): boolean {
+  if (!cliId) return false;
+  if (cliId === 'dsh' && opts?.dshRuntime === 'tui') return false;
+  return NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
 
 /**
  * Normalize a single custom passthrough command: lowercase, must match the

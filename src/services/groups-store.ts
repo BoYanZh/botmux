@@ -18,6 +18,7 @@ export interface ChatBrief {
   name?: string;
   description?: string;
   chatMode?: string;
+  chatStatus?: string;
   ownerId?: string;
   /** 群头像 URL（/open-apis/im/v1/chats 的 avatar 字段）。 */
   avatar?: string;
@@ -41,11 +42,19 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
       throw new Error(`Failed to list chats: ${res.msg} (code: ${res.code})`);
     }
     for (const c of res.data?.items ?? []) {
+      const chatStatus = typeof c.chat_status === 'string' ? c.chat_status : undefined;
+      // Feishu keeps dissolved_save chats in /im/v1/chats so users can retain
+      // their history. They are no longer manageable groups, though: member
+      // APIs reject them with 232009 even while is_in_chat may still say true.
+      // Fail closed for missing/future states as well: the groups board offers
+      // mutating controls, so only an explicit normal status is manageable.
+      if (chatStatus !== 'normal') continue;
       out.push({
         chatId: c.chat_id,
         name: c.name,
         description: c.description,
         chatMode: c.chat_mode,
+        chatStatus,
         ownerId: c.owner_id,
         avatar: c.avatar,
       });
@@ -167,10 +176,21 @@ function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api
 }
 
 /**
+ * Feishu chat topology chosen at CREATION time. It is fixed for the chat's
+ * lifetime through this API — it is NOT the same as `group_message_type`
+ * (a normal group can opt into threaded messages while staying `group`).
+ * `p2p` is not creatable here (it is a direct message, not a group).
+ */
+export type ChatMode = 'group' | 'topic';
+
+/**
  * Create a brand-new chat with `bot_id_list` as initial bot members.  The
  * `creatorLarkAppId` bot becomes the chat's owner and an implicit member; the
  * other bots in `botIds` are added in the same call.  Used by the dashboard's
  * "Create new group" flow.
+ *
+ * `chatMode: 'topic'` creates a 话题群 (every top-level message starts its own
+ * thread). Omit it to keep Feishu's default, a 普通群.
  *
  * Returns the new chatId on success.  Throws on any non-zero Lark response so
  * the route can surface a real error.  We deliberately don't soften failures
@@ -179,7 +199,7 @@ function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api
  */
 export async function createChat(
   creatorLarkAppId: string,
-  opts: { name?: string; botIds: string[]; userIds?: string[] },
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
@@ -190,6 +210,10 @@ export async function createChat(
   if (opts.name) data.name = opts.name;
   if (otherBots.length > 0) data.bot_id_list = otherBots;
   if (userIds.length > 0) data.user_id_list = userIds;
+  // Only send chat_mode when the caller explicitly chose one: an omitted field
+  // keeps Feishu's default ('group') and avoids pinning behavior that a future
+  // API default might change.
+  if (opts.chatMode) data.chat_mode = opts.chatMode;
   const params: Record<string, unknown> = {};
   if (userIds.length > 0) params.user_id_type = 'open_id';
   const res: any = await (client as any).im.v1.chat.create({ data, params });
@@ -230,6 +254,32 @@ export async function transferChatOwner(
       path: { chat_id: chatId },
       params: { user_id_type: userIdType },
       data: { owner_id: newOwnerId },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
+ * Disband a chat the calling bot OWNS. Used by the session-group birth flow
+ * to clean up an orphan group when the initiating user's invite was rejected
+ * — the group can never serve as a conversation home, so leaving it behind
+ * would strand an empty bot-owned chat in the tenant (PR review).
+ *
+ * Calls DELETE /open-apis/im/v1/chats/:chat_id (owner-only).
+ */
+export async function deleteChat(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await (client as any).im.v1.chat.delete({
+      path: { chat_id: chatId },
     });
     if (res.code !== 0 && res.code !== undefined) {
       return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };

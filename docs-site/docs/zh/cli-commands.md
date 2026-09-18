@@ -5,9 +5,9 @@
 | 命令 | 说明 |
 |------|------|
 | `botmux setup` | 交互式配置（首次 / 添加 / 编辑 / 删除机器人） |
-| `botmux start` | 启动 daemon（PM2 管理） |
+| `botmux start [--companion-secret-file <path> --companion-bot <appId>]` | 启动 daemon；两个 companion 参数同时提供时，为唯一绑定的隔离测试 Bot 开启封闭本机 API（见[本地 Companion API](/companion-api)） |
 | `botmux stop` | 停止 daemon |
-| `botmux restart [--include-pm2]` | 重启 daemon（自动恢复活跃会话）；`--include-pm2` 会同时重启 botmux 专用 PM2 God daemon |
+| `botmux restart [--companion-secret-file <path> --companion-bot <appId>]` | 重启 daemon（自动恢复活跃会话）；接受与 `start` 相同的封闭 Companion API 参数 |
 | `botmux logs [--lines N]` | 查看日志 |
 | `botmux status` | 查看 daemon 状态 |
 | `botmux upgrade` | 升级到最新版本 |
@@ -15,7 +15,7 @@
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理进程已退出的僵尸会话 |
-| `botmux dashboard` | 输出一次 Web Dashboard URL（每次刷 token） |
+| `botmux dashboard [current\|rotate]` | 获取当前 Dashboard 登录 URL，尚无 token 时创建第一个；`rotate` 才显式替换已有 token |
 
 daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/close`
 一致的生命周期收口：移除内存中的活跃会话、持久化关闭状态，并回收
@@ -43,7 +43,11 @@ session 信息通过祖先进程标记自动推断，agent 直接调：
 | 命令 | 说明 |
 |------|------|
 | `botmux send [content]` | 向当前话题发消息（stdin / heredoc / `--content-file`；`--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`） |
-| `botmux bots list` | 列出当前群里的机器人（含 open_id） |
+| `botmux card patch --message-id <om_xxx> (--card-file <path> \| --card-json <json>)` | 原地更新之前 send 发出的自定义卡片（不发新消息，messageId 取自 send 输出） |
+| `botmux bots list` | 列出当前群里的机器人（含 open_id）；`--scope team [--team <id>]` 跨机发现同团队、已 opt-in 的 agent（按专长） |
+| `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | 往「你已在场」的群补入同团队 agent + 各自 owner（平台 app 不在时自动拉进群再补） |
 | `botmux history [--limit N]` | 拉会话历史（JSON） |
 | `botmux quoted <message_id>` | 拉被引用的单条消息（JSON） |
 | `botmux schedule add/list/remove/pause/resume/run` | 管理定时任务 |
+| `botmux session rename "<标题>"` | 改**当前会话**的 botmux 规范标题（会话自动识别，不接受 `--session-id` 指定他人会话）；Dashboard 与 `/sessions` 列表即时更新，并 best-effort 同步 CLI 原生会话名。飞书群名、omt 话题名均不变（话题名平台无接口）。建议「类型｜具体事项」，最长 200 字符 |
+| `botmux chat rename <新群名称> [--proactive]` | 改**当前会话所在飞书群**的群名（话题群里是整个 `oc_` 群，全部话题/成员可见）；`--proactive` 用于 agent 因阶段变化主动改名，带 10 分钟防抖 |

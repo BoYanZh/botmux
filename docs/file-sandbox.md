@@ -13,6 +13,42 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+> ⚠️ **前置条件：这台机器要先做过「lark-cli 按 bot 拆配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。
+> 白名单 deny 掉了共享的 `~/.lark-cli`，只放行本 bot 的 `~/.lark-cli-bots/<自己appId>`；没配过的机器上，沙盒内所有 `lark-cli` 命令会以 `not configured` / `operation not permitted` 失败。
+> lark-cli 的密钥并**不**在 per-bot 目录里（那里只有 `config.json`），而在各平台共享的 keystore；两平台都是「整目录 deny + 只放行本 bot 自己的 master key 与 `appsecret_<自己>.enc`」，落点和文件名不同，见那篇的「平台差异」一节。
+
+## Codex 的 per-bot 登录态
+
+`codexAuthSync` 控制 Codex 使用全局登录态还是该 bot 的独立登录态：
+
+```json
+{
+  "cliId": "codex",
+  "sandbox": true,
+  "codexAuthSync": "isolated"
+}
+```
+
+- 缺省或 `shared`：保持旧版行为。非沙箱直接使用全局 `~/.codex`；沙箱把
+  `CODEX_HOME` 指向 per-bot 目录，并在每次冷启动用全局 `~/.codex/auth.json`
+  刷新其中的 auth 副本。全局重新登录后，下次冷启动自动同步。
+- `isolated`：无论是否启用沙箱，都把 `CODEX_HOME` 指向
+  `<BOTMUX_HOME>/bots/<larkAppId>/codex`，且从不读取或复制全局 auth。首次启动前执行
+  `CODEX_HOME=<BOTMUX_HOME>/bots/<larkAppId>/codex codex login --with-api-key`。
+  缺少凭证时 worker 只记录路径、策略和明确登录指引，不记录 key/token/auth 内容。
+
+`isolated` 是显式迁移项，不会自动启用；升级后未配置的 bot 继续使用 `shared`。
+私有 `auth.json` 在 daemon 重启、会话休眠/恢复和其它冷启动中保持不变。凭证文件
+始终为 `0600`，符号链接或逃出 BOT_HOME 的 Codex 目录会被拒绝。
+
+注意：`sandbox: false` 只表示不启用 OS 文件访问隔离。缺省的 `shared` 仍使用
+全局 `~/.codex`；显式设置 `codexAuthSync: "isolated"` 则仍会使用独立
+`CODEX_HOME`，但不会阻止该 CLI 读取其它宿主文件。
+
+`bots.json` 的 per-bot `env` 在 Linux bwrap 中会随该 pane 的进程环境传入 CLI
+（PTY 与 tmux 均覆盖），不会写进共享 tmux server 环境。它可以为自定义 provider
+提供 endpoint/key，但不能替代 `requires_openai_auth = true` 时 Codex 选择的登录凭证。
+
 ## 工作原理
 
 ```
@@ -52,6 +88,40 @@ worker spawnCli
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
 → **所有飞书密钥全程不进沙盒**。
+
+### Linux 隔离判据
+
+环境变量只是路由提示，不是安全边界。完整 bwrap 和仅凭据隔离 bwrap 在启动 CLI
+前都会安装一个很窄的 seccomp 规则：拒绝 `getpriority(PRIO_PROCESS, 1)`，其它
+已支持 ABI 的系统调用保持原策略。内核会把规则传给 fork / exec 的后代；清空环境、
+替换 HOME / 数据目录或再创建 namespace 都不能移除它。
+
+CLI 通过 `os.getPriority(1)` 查询这个判据，只把成功且位于合法 nice 范围
+`[-20, 19]` 的结果视为普通宿主。不能只匹配 EPERM：后代可以叠加 seccomp 规则
+替换 errno，但不能恢复真实调用；即使伪造 errno 0，libc 返回的 nice 20 仍会被拒绝。
+规则通过匿名管道传给 bwrap，不落可修改的配置文件，也不占用交互终端的 stdin。
+
+确认处于隔离中的 `send` 不能因缺失 capability 或伪造进程标记降级为宿主直发；
+daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正常宿主 relay 不安装此
+规则，普通宿主命令不依赖 HOME 中是否存在探针文件。
+
+兼容边界：支持 Linux x64 / arm64 及其 i386 / ARM EABI / x32 调用约定；未知 ABI
+或无法安装 seccomp 时拒绝启动，不静默关闭保护。查询 PID 1 的 nice 值会被拒绝，
+查询当前进程优先级、调整优先级不受此规则影响。如果外层容器策略本来就禁止这个
+查询，宿主命令也会按隔离处理，需要先核对外层策略，不能靠环境变量绕过。
+隔离 pane 标记版本升至 15，旧 pane 必须冷启动一次才能获得新规则。
+
+这是受信 CLI 的隔离分类防线，不代替文件和凭据隔离，也不承诺阻止修改 CLI 代码、
+持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
+[Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
+
+## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
+
+no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读写范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（以同一 OS 用户身份对宿主文件有完整**读写**权，能读宿主 `bots.json`、也能改写宿主配置）；配了 → 照常隔离。
+
+> 早先版本曾把「会话没有飞书 transport 通道」当作强制隔离条件（no-transport ⇒ 一律关进沙盒）。现已去掉这条写死的强制，改为跟随 owner 自己的配置——单 bot 部署 / 载荷可信时不再被无谓束缚。**多 bot 同机**、且担心某个半受信任的 no-transport 会话横向读到**兄弟 bot 的凭证**（`bots.json` 里各 bot 的 app secret）时，需 owner **显式**给该 bot 开 `sandbox`（或 `readIsolation` / 全局 `BOTMUX_SANDBOX=1`）。不开沙盒时 agent 拿到的是同一 OS 用户的宿主读写能力：不仅能读出各 bot secret，还能据此直接调 Lark API、或改写宿主上的任意配置——这正是「载荷可信」这一前提要承担的信任面。
+
+两条与文件沙盒正交、不受此放宽影响的边界仍在：① **本 bot 自己的 transport secret 不进 CLI 进程 env**（gated on transport 能力）——这只关闭 **Botmux 内建的 transport 调用链**（本 bot 的 send 路径），**不构成恶意代码下的凭证隔离**：不开沙盒时 agent 仍能从磁盘 `bots.json` 读出 secret 自行调 Lark；② enrolled 设备上的 **device-credential 强制隔离**独立生效，与本开关无关。
 
 ## 落盘（改动去向）
 

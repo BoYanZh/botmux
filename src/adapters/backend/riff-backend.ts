@@ -1,8 +1,15 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import type { SessionBackend, SpawnOpts } from './types.js';
+import type {
+  SessionBackend,
+  SessionDestroyResult,
+  SessionShutdownDetachResult,
+  SpawnOpts,
+} from './types.js';
 import { logger } from '../../utils/logger.js';
 import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 
@@ -77,6 +84,28 @@ export interface RiffBackendConfig {
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
+  /**
+   * Command to refresh the ByteCloud JWT when the keychain holds no live token.
+   * When neither `config.jwt` nor the env token is set and `readBytecloudKeychainJwt`
+   * returns null (every candidate expired / within the safety window / absent),
+   * riff task creation would fail with a 401 that aborts the whole turn. Before
+   * giving up, we run this command ONCE (debounced) to let the owning CLI
+   * (bytedcli / kaboo-cli) refresh credentials and rewrite the keychain, then
+   * re-read. bytedcli is the ByteCloud JWT owner: `bytedcli auth
+   * get-bytecloud-jwt-token --force-refresh` refreshes via its Auth SDK and
+   * writes the token to `~/.local/share/bytedcli/data/bytecloud-auth/…`, which is
+   * already a `bytecloudKeychainCandidates` path.
+   *
+   * Shape: [binary, ...args]. When unset, resolves in order:
+   *   1. env `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split, e.g. `bytedcli auth get-bytecloud-jwt-token --force-refresh`)
+   *   2. a `bytedcli` binary found on PATH → `bytedcli auth get-bytecloud-jwt-token --force-refresh`
+   *   3. otherwise no auto-refresh (fail-closed to the old behaviour — a 401).
+   * We intentionally do NOT default to `npx @bytedance-dev/bytedcli@latest`: an
+   * uncached/`@latest` npx resolve can block ~30s per call, far too slow for a
+   * synchronous pre-request refresh. Deployments wanting npx must set the env
+   * explicitly (and ideally pin the version).
+   */
+  jwtRefreshCmd?: string[];
   /** Sandbox resource pool selected for newly-created tasks. Riff defaults to
    *  BOE when omitted; follow-ups inherit the parent task's sandbox. */
   sandboxCluster?: RiffSandboxCluster;
@@ -121,6 +150,29 @@ export interface RiffBackendConfig {
    * after the mandatory botmux install commands.
    */
   setupCommands?: string[];
+  /**
+   * Extra HTTP headers added to EVERY riff outbound request (task-execute,
+   * task-follow-up, task-stream, the reconcile tasks query, task-cancel,
+   * task-detail). Intended for PPE/lane routing — e.g. { 'x-tt-env':
+   * 'ppe_shenhan_sh', 'x-use-ppe': '1' } to hit a PPE deployment instead of
+   * production. Empty/unset → no extra headers (production, current behavior).
+   * MUST cover all requests uniformly: routing only task-execute to PPE while
+   * task-stream hits production would split a session across environments.
+   * Also mergeable from the BOTMUX_RIFF_EXTRA_HEADERS env var (JSON object);
+   * config wins on key conflicts.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Override the follow-up fetch timeout budgets (ms). Both optional; when unset
+   * the built-in defaults apply (hot 30s / cold 60s). Cold covers a follow-up
+   * that must synchronously wake a reclaimed sandbox (idle gap / daemon-restart
+   * resume); hot covers a follow-up right after the previous turn. Exposed so the
+   * values can be tuned against riff's measured P50/P99 without a code change,
+   * and so tests/live-repro can force a timeout by shrinking them. Non-positive
+   * or non-finite values are ignored.
+   */
+  followUpHotTimeoutMs?: number;
+  followUpColdTimeoutMs?: number;
 }
 
 /** Valid riff service base URL: non-empty http(s). Shared by the worker's
@@ -241,13 +293,20 @@ export function deriveRiffReposFromDirs(
  * retry; failures are logged, never thrown.
  */
 export async function cancelRiffTaskById(
-  cfg: { baseUrl: string; jwt?: string; jwtEnv?: string },
+  cfg: { baseUrl: string; jwt?: string; jwtEnv?: string; extraHeaders?: Record<string, string> },
   taskId: string,
 ): Promise<boolean> {
   const attempt = async (): Promise<void> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']();
+    // Reuse a throwaway instance for BOTH resolveJwt and applyExtraHeaders so the
+    // orphan-cancel path routes to the same env/lane as the live session (else a
+    // PPE session's orphan cancel would hit production). allowRefresh:false is
+    // kept from the daemon-side contract — orphan-cancel must never trigger a
+    // host-identity JWT refresh.
+    const inst = new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel');
+    const jwt = await inst['resolveJwt']({ allowRefresh: false });
     if (jwt) headers['x-jwt-token'] = jwt;
+    inst['applyExtraHeaders'](headers);
     const resp = await fetch(`${cfg.baseUrl}/api/task-cancel`, {
       method: 'POST', headers, body: JSON.stringify({ id: taskId }), signal: AbortSignal.timeout(4000),
     });
@@ -265,6 +324,383 @@ export async function cancelRiffTaskById(
  *  subdomain IS the write capability, so neither URL nor host may be logged. */
 export function hashUrlForLog(u: string): string {
   return createHash('sha256').update(u).digest('hex').slice(0, 8);
+}
+
+/** The keychain leaf under a ByteCloud tool's storage root:
+ *  `<root>/bytecloud-auth/keychain/auth/cn/default`, whose JSON holds the
+ *  `bytecloud_jwt` field. `cn` is ByteCloud CN (riff is an internal CN
+ *  service). NOTE the sibling `bytecloud-auth/auth/cn/credentials.json` (no
+ *  `keychain/` segment) carries only metadata (app_id / expires_at / user) and
+ *  NO `bytecloud_jwt` — we deliberately never read it. */
+const BYTECLOUD_KEYCHAIN_LEAF = join('bytecloud-auth', 'keychain', 'auth', 'cn', 'default');
+
+/**
+ * Reproduce bytedcli's `sanitizeFilenamePart` + AIME base-dir assembly EXACTLY
+ * (from `@bytedance-dev/bytedcli` dist/bytedcli-core.js, verified against
+ * 0.124.0): a username path segment keeps only `[a-zA-Z0-9._-]` (every other
+ * char → `_`), then a lone `.` → `_` and a lone `..` → `__`. Must match
+ * byte-for-byte or the AIME keychain path we build won't line up with where
+ * bytedcli actually wrote the token.
+ */
+function sanitizeAimeUser(user: string): string {
+  return user.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.$/, '_').replace(/^\.\.$/, '__');
+}
+
+/**
+ * bytedcli's data-home base when running inside an AIME workspace. bytedcli
+ * uses it (in place of `os.homedir()`) ONLY when both `AIME_WORKSPACE_PATH` and
+ * `AIME_CURRENT_USER` are set (trimmed non-empty); it then stores under
+ * `<workspace>/<sanitizedUser>/.local/share/bytedcli/data/…`. We return the
+ * `<workspace>/<sanitizedUser>/.local/share` prefix (parallel to the plain
+ * `~/.local/share` data-home, so the shared `join(base,'bytedcli','data')`
+ * below lands on the right leaf), or null when this is not an AIME runtime.
+ */
+function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
+  const workspace = env.AIME_WORKSPACE_PATH?.trim();
+  const user = env.AIME_CURRENT_USER?.trim();
+  if (!workspace || !user) return null;
+  return join(workspace, sanitizeAimeUser(user), '.local', 'share');
+}
+
+/** True when BOTH AIME vars are set (trimmed non-empty), i.e. bytedcli swaps its
+ *  storage root to the AIME workspace. In that runtime we must not trigger a
+ *  host-identity JWT refresh — see resolveJwt's fail-closed skip. */
+function isFullAimeRuntime(env: NodeJS.ProcessEnv): boolean {
+  return aimeDataHome(env) !== null;
+}
+
+/**
+ * The keychain candidates for a ByteCloud tool's `bytecloud-auth/` store, across
+ * the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk / bytedcli).
+ *
+ * ⚠️ This is NOT a "cast a wide net" list. The selector in
+ * `readBytecloudKeychainJwt` picks the globally-freshest token by `exp`
+ * REGARDLESS of order, so an extra candidate is not free: a stale/foreign token
+ * at a location the tool never actually writes could WIN and shadow the real
+ * one. Every entry must be a location the tool genuinely uses on THIS host:
+ *   - Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+ *     Go's os.UserConfigDir (verified against kaboo 1.3.77): macOS →
+ *     `~/Library/Application Support`, Windows → `%AppData%` (Go errors, does
+ *     NOT default to `~/AppData/Roaming`, when it is unset — so we emit no
+ *     config candidate then), otherwise → `$XDG_CONFIG_HOME` (else `~/.config`).
+ *     We list ONLY the current platform's root, never several — a
+ *     foreign-platform root is never live here and would only invite shadowing.
+ *   - cjadk also uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
+ *   - bytedcli stores under `~/.local/share/bytedcli/data` on Linux, macOS AND
+ *     Windows: its `bytedcliBaseDir()` (bytedcli-core.js, 0.125.0) has no
+ *     platform branch and ignores `$XDG_DATA_HOME`. Inside an AIME workspace it
+ *     swaps the home base for `$AIME_WORKSPACE_PATH/<sanitized $AIME_CURRENT_USER>`
+ *     — see the fail-closed early return below.
+ * Order is otherwise NOT significant (selection is by `exp`, not position).
+ * Non-existent candidates simply fail the read and are skipped.
+ */
+export function bytecloudKeychainCandidates(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
+  const isMac = platform === 'darwin';
+
+  // --- Full AIME runtime: fail-closed to the AIME identity domain ---------
+  // When BOTH AIME vars are set, bytedcli swaps its storage root to
+  // `$AIME_WORKSPACE_PATH/<sanitized user>/.local/share/bytedcli/data` and,
+  // crucially, does NOT fall back to the host HOME (bytedcliBaseDir returns the
+  // AIME root and stops). `os.homedir()` here is still the HOST home — that is
+  // precisely WHY bytedcli needs the override — so EVERY host-HOME-derived
+  // keychain (the config-style CLIs under ~/.config or Application Support,
+  // ~/.cjadk, ~/.aipaas) belongs to a DIFFERENT identity. Reading any of them
+  // would cross AIME user identities, and the exp-aware selector below would
+  // happily prefer a longer-lived host token. The safe boundary is the
+  // identity domain, not the tool name: in a full AIME runtime the ONLY
+  // in-domain source is the AIME-scoped bytedcli store. If it holds no live
+  // token we return nothing here and the caller fails closed (the user logs in
+  // inside AIME) rather than silently authenticating as someone else.
+  const aimeHome = aimeDataHome(env);
+  if (aimeHome) {
+    return [join(aimeHome, 'bytedcli', 'data', BYTECLOUD_KEYCHAIN_LEAF)];
+  }
+
+  // --- Ordinary (non-AIME) runtime ---------------------------------------
+  // Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+  // Go's os.UserConfigDir (verified against kaboo 1.3.77's embedded ByteCloud
+  // auth). That maps per-platform: macOS → `~/Library/Application Support`;
+  // Windows → `%AppData%`; everything else → `$XDG_CONFIG_HOME` (falling back
+  // to `~/.config`). A single process only ever uses ONE of these — the current
+  // platform's. We must key off the actual platform, NOT list several: the
+  // exp-aware selector picks the globally-freshest token regardless of order,
+  // so a stale token under another platform's root could otherwise shadow the
+  // authoritative one (a foreign-platform root is never a live location on this
+  // host anyway). `platform` is injectable so every spelling stays testable.
+  //
+  // `configHome` is null when we cannot name the platform's real config root:
+  // on Windows Go ERRORS if `%AppData%` is unset (it does NOT default to
+  // `~/AppData/Roaming`), so with APPDATA absent we emit NO config-style
+  // candidate rather than invent a phantom path a stale token could shadow
+  // from. The other verified candidates (bytedcli, dot-dirs) are unaffected.
+  const xdgConfig = env.XDG_CONFIG_HOME?.trim();
+  let configHome: string | null;
+  if (isMac) {
+    configHome = join(home, 'Library', 'Application Support');
+  } else if (platform === 'win32') {
+    configHome = env.APPDATA?.trim() || null;
+  } else {
+    configHome = xdgConfig || join(home, '.config');
+  }
+  // bytedcli keeps `bytedcli/data/bytecloud-auth/...` under its data home.
+  // `bytedcliBaseDir()` in `@bytedance-dev/bytedcli` (dist/bytedcli-core.js,
+  // 0.125.0) has NO platform branch: in the ordinary case it unconditionally
+  // uses `~/.local/share/bytedcli` on Linux, macOS AND Windows, and it ignores
+  // $XDG_DATA_HOME. So the single `~/.local/share` data home is correct on
+  // every platform — there is no Application Support / %AppData% spelling to
+  // add. (The AIME workspace override is the only base swap, handled above.)
+  const bytedcliHome = join(home, '.local', 'share');
+  const roots: string[] = [];
+  // Config-dir CLIs (single platform-correct base, when we can name one).
+  if (configHome) {
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(configHome, cli));
+  }
+  // Home dot-dir layouts (Linux-observed; harmless as extra candidates elsewhere).
+  roots.push(join(home, '.cjadk'));
+  roots.push(join(home, '.aipaas'));
+  // Data-dir CLI (bytedcli) — the extra `data/` segment is part of its layout.
+  roots.push(join(bytedcliHome, 'bytedcli', 'data'));
+  return dedupe(roots).map((root) => join(root, BYTECLOUD_KEYCHAIN_LEAF));
+}
+
+/**
+ * Decode a JWT's `exp` (seconds since epoch) from its payload without verifying
+ * the signature — we only need the expiry to prefer a live token over a stale
+ * one. Returns null for anything we cannot confidently parse as an expiry so it
+ * ranks below any parseable-live token (opaque/non-JWT strings, malformed
+ * base64, missing/non-number `exp`).
+ *
+ * A JWS compact JWT is EXACTLY three non-empty base64url segments
+ * (`header.payload.signature`) whose header and payload are JSON. We require
+ * that shape up front: a 2- or 4-segment string, a segment that isn't
+ * base64url (incl. the signature), or a header/payload that isn't a JSON
+ * object is NOT a JWT and must never be ranked as a live token where its
+ * (accidentally decodable) `exp` could shadow a genuine JWT. We do NOT verify
+ * the signature (that is riff's job) — only that the structure is a real JWT.
+ */
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+function decodeJoseJson(seg: string): Record<string, unknown> | null {
+  try {
+    const obj = JSON.parse(Buffer.from(seg, 'base64url').toString('utf-8')) as unknown;
+    // A JOSE header / JWT payload is a JSON object (not an array, not a scalar).
+    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+export function decodeJwtExp(jwt: string): number | null {
+  const parts = jwt.split('.');
+  // Exactly three non-empty, strictly-base64url segments (header.payload.sig).
+  if (parts.length !== 3) return null;
+  if (!parts[0] || !parts[1] || !parts[2]) return null;
+  if (parts.some((p) => !BASE64URL_RE.test(p))) return null;
+  // Header must decode to a JSON object (confirms it's really JOSE, not just
+  // base64url-shaped noise); we don't require a specific `typ`/`alg`.
+  if (!decodeJoseJson(parts[0]!)) return null;
+  const payload = decodeJoseJson(parts[1]!);
+  if (!payload) return null;
+  const exp = payload['exp'];
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp : null;
+}
+
+/**
+ * Read the ByteCloud JWT from the keychain candidates, preferring a live token.
+ * Pure + injectable (home/env/now) so it is unit-testable without touching the
+ * real HOME. Never throws — unreadable/malformed candidates are skipped.
+ *
+ * Selection (fixes the stale-token-shadows-valid-token hazard: an expired token
+ * from an earlier-listed tool must not mask a valid token from a later one):
+ *   1. Collect every candidate's non-empty `bytecloud_jwt`, in candidate order.
+ *   2. Drop tokens whose decoded `exp` is already past `now`.
+ *   3. Among the survivors, pick the one with the greatest `exp` (freshest);
+ *      candidates whose `exp` we cannot parse (opaque values) rank BELOW any
+ *      parseable live token and are used only as a last-resort fallback when no
+ *      parseable-live token exists — so a broken/opaque old value can never
+ *      shadow a clearly-valid newer token.
+ * Returns null when nothing yields a usable token.
+ */
+/**
+ * Treat a token that expires within this many seconds as already expired. riff
+ * task creation reads the JWT once and does a single fetch; a 401 there throws
+ * and fails the whole turn (SSE reconnect only covers an ALREADY-created task),
+ * and a fresh sandbox cold-boot costs minutes — so a token about to expire
+ * mid-request is worse than skipping to a longer-lived candidate. Also absorbs
+ * small client/server clock skew.
+ */
+export const JWT_EXPIRY_SAFETY_WINDOW_SEC = 30;
+
+export function readBytecloudKeychainJwt(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const cutoffSec = nowMs / 1000 + JWT_EXPIRY_SAFETY_WINDOW_SEC;
+  let bestLive: { jwt: string; exp: number } | null = null; // parseable, unexpired, freshest
+  let opaqueFallback: string | null = null;                 // first exp-less, non-expired-unknown token
+  for (const path of bytecloudKeychainCandidates(home, env, platform)) {
+    let jwt: string;
+    try {
+      const data = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      const v = data['bytecloud_jwt'];
+      if (typeof v !== 'string' || v.length === 0) continue;
+      jwt = v;
+    } catch { continue; }
+    const exp = decodeJwtExp(jwt);
+    if (exp === null) {
+      // Cannot parse expiry — keep only the first as a last-resort fallback.
+      if (opaqueFallback === null) opaqueFallback = jwt;
+      continue;
+    }
+    if (exp <= cutoffSec) continue; // expired or about to expire — never select.
+    if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
+  }
+  return bestLive?.jwt ?? opaqueFallback;
+}
+
+/**
+ * Locate a `bytedcli` binary on PATH (used to build the default JWT-refresh
+ * command). Returns the bare name `bytedcli` when found so execFileSync resolves
+ * it via PATH, or null when absent. Injectable env/platform for testing.
+ *
+ * We look for a real installed binary rather than defaulting to
+ * `npx @bytedance-dev/bytedcli@latest`: an uncached / `@latest` npx resolve can
+ * block ~30s, which is unacceptable on the synchronous pre-request path. If
+ * bytedcli is not installed we simply do not auto-refresh (fail-closed to the
+ * prior behaviour — the request may 401, exactly as before this change).
+ */
+export function findBytedcliBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const pathVar = env.PATH ?? env.Path ?? '';
+  if (!pathVar) return null;
+  const names = platform === 'win32' ? ['bytedcli.cmd', 'bytedcli.exe', 'bytedcli'] : ['bytedcli'];
+  for (const dir of pathVar.split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        if (existsSync(join(dir, name))) return 'bytedcli';
+      } catch { /* ignore unreadable PATH entry */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the JWT-refresh command: explicit config → env
+ * `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split) → a PATH-resident bytedcli →
+ * null (no auto-refresh). See RiffBackendConfig.jwtRefreshCmd for the rationale.
+ */
+export function resolveJwtRefreshCmd(
+  configured: string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] | null {
+  if (configured && configured.length > 0) return configured;
+  const fromEnv = env.BOTMUX_RIFF_JWT_REFRESH_CMD?.trim();
+  if (fromEnv) {
+    const parts = fromEnv.split(/\s+/).filter(Boolean);
+    if (parts.length > 0) return parts;
+  }
+  const bin = findBytedcliBinary(env, platform);
+  if (bin) return [bin, 'auth', 'get-bytecloud-jwt-token', '--force-refresh'];
+  return null;
+}
+
+/** Minimum gap between speculative JWT refresh attempts. When the keychain
+ *  holds no live token, a reconnect/follow-up loop would otherwise trigger a
+ *  refresh on EVERY getJwt() call; we cap proactive refreshes at one per window
+ *  and let the shared keychain re-read serve the rest. Also caps the cost of a
+ *  refresh command that keeps failing (e.g. bytedcli not logged in). A refresh
+ *  driven by an actual server 401 bypasses this window (see `force`). */
+export const JWT_REFRESH_DEBOUNCE_MS = 60_000;
+
+/** How long a single refresh command may run before we give up. Once the
+ *  refresh is asynchronous (below) this no longer blocks the event loop — it
+ *  only bounds one awaited child process — so we keep it generous: a cold
+ *  bytedcli token fetch can take a few seconds, and a session that cannot get a
+ *  JWT has nothing useful to do anyway. */
+export const JWT_REFRESH_TIMEOUT_MS = 30_000;
+
+/** Process-wide last-attempt timestamp (ms). Shared across RiffBackend instances
+ *  because the orphan-cancel path builds a throwaway instance per call — a
+ *  per-instance clock there would never debounce. `-Infinity` means "never
+ *  attempted", so the first call always runs regardless of the clock's
+ *  magnitude. Reset helper for tests. */
+let lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+/** In-flight refresh, shared process-wide so concurrent callers COALESCE onto a
+ *  single child process instead of each spawning their own bytedcli. `null`
+ *  between attempts. */
+let inFlightJwtRefresh: Promise<boolean> | null = null;
+export function __resetJwtRefreshDebounceForTest(): void {
+  lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+  inFlightJwtRefresh = null;
+}
+
+export interface RefreshBytecloudJwtOpts {
+  /** Injectable async runner (defaults to a real execFile). */
+  runner?: (bin: string, args: string[]) => Promise<void>;
+  /** Injectable clock for the debounce window (defaults to Date.now()). */
+  nowMs?: number;
+  /** Bypass the debounce window. Set only when an actual server 401/403 proved
+   *  the current token is bad — a rejection is authoritative evidence worth one
+   *  more attempt even inside the window. Never set for speculative refreshes. */
+  force?: boolean;
+}
+
+/**
+ * Run the JWT-refresh command once, ASYNCHRONOUSLY. Never throws: a missing
+ * command, a non-zero exit, or a timeout all resolve to `false` (the caller then
+ * falls back to whatever the keychain holds — i.e. the pre-change behaviour).
+ * Resolves true only when a command actually ran to completion.
+ *
+ * Async + injectable (runner / now / force) so it never blocks the event loop
+ * (critical on the daemon-side orphan-cancel path) and the debounce / coalesce /
+ * fail-closed paths are unit-testable without spawning a real process.
+ *
+ * COALESCE: if a refresh is already in flight, ride it instead of spawning a
+ * second bytedcli — concurrent getJwt() callers share one refresh.
+ */
+export function refreshBytecloudJwt(
+  cmd: string[] | null,
+  opts: RefreshBytecloudJwtOpts = {},
+): Promise<boolean> {
+  const { runner = defaultJwtRefreshRunner, nowMs = Date.now(), force = false } = opts;
+  if (!cmd || cmd.length === 0) return Promise.resolve(false);
+  // Coalesce first: a forced caller still rides an in-flight refresh rather than
+  // racing a second child — the running one will rewrite the keychain either way.
+  if (inFlightJwtRefresh) return inFlightJwtRefresh;
+  // Debounce: cap the cost of a refresh that keeps failing. A forced (401-driven)
+  // refresh bypasses the window — the token was provably rejected.
+  if (!force && nowMs - lastJwtRefreshAtMs < JWT_REFRESH_DEBOUNCE_MS) return Promise.resolve(false);
+  lastJwtRefreshAtMs = nowMs;
+  const [bin, ...args] = cmd;
+  const run = (async (): Promise<boolean> => {
+    try {
+      await runner(bin!, args);
+      return true;
+    } catch (err) {
+      logger.warn(`[riff] JWT refresh command failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  })();
+  inFlightJwtRefresh = run;
+  return run.finally(() => { if (inFlightJwtRefresh === run) inFlightJwtRefresh = null; });
+}
+
+const execFileAsync = promisify(execFile);
+/** Default refresh runner: async execFile with a bounded timeout. stdout/stderr
+ *  are discarded — the command's SIDE EFFECT (rewriting the keychain) is what
+ *  matters; we re-read the keychain afterwards rather than parse its output. */
+async function defaultJwtRefreshRunner(bin: string, args: string[]): Promise<void> {
+  await execFileAsync(bin, args, { timeout: JWT_REFRESH_TIMEOUT_MS });
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
@@ -287,6 +723,52 @@ interface RiffAttachment {
   type: 'image' | 'file';
 }
 
+/**
+ * riff route-B `display` projection carried on stdout `log` SSE events
+ * (feat/riff-agent-log-display, TaskLogDisplay = DerivedExecuteLogEvent minus
+ * commandId/payload). A per-line, stateless distillation of a codex app-server
+ * event; `kind` drives our timeline prefix + colour, `title` is riff-localized.
+ */
+interface RiffLogDisplay {
+  kind: string;
+  actor?: string;
+  title?: string;
+  text?: string;
+  summary?: string;
+  command?: string;
+  status?: 'running' | 'completed' | 'failed';
+  stream?: 'stdout' | 'stderr';
+  exitCode?: number;
+}
+
+// Defensive backstop only: riff already downgrades codex lifecycle "noise" lines
+// (thread.started / item.started / usage-only turns) to channel:'raw' so a default
+// subscription never receives them. If an un-projected bare codex event still slips
+// through, this recognizes it so we suppress rather than render a wall of JSON.
+// Deliberately narrow: only a single-line JSON object whose `type` is a known
+// no-content lifecycle marker — never plain shell output.
+// Kept in sync with riff's CODEX_NOISE_EVENT_TYPES (agentExecuteLogParser.ts) — the
+// authoritative classifier. Mirror it exactly so our fallback matches riff's filter.
+const CODEX_NOISE_TYPES = new Set([
+  'thread.started',
+  'turn.started',
+  'item.started',
+  'item.updated',
+  'turn.completed',
+  'response.completed',
+  'response.done',
+]);
+function isBareCodexNoiseLine(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: unknown };
+    return typeof parsed.type === 'string' && CODEX_NOISE_TYPES.has(parsed.type);
+  } catch {
+    return false;
+  }
+}
+
 interface RiffTaskResponse {
   success: boolean;
   data: {
@@ -297,6 +779,33 @@ interface RiffTaskResponse {
     queuePosition?: number | null;
   };
 }
+
+/** One node from `GET /api/tasks?threadId=&view=summary` (summary projection).
+ *  NOTE the primary-key field is `id` (the DB `taskId` is serialized out as
+ *  `id`) — never read `.taskId` here. `followUpParentTaskId` is absent on the
+ *  root task. `interaction.status` is a retired V1 field (not written by new
+ *  tasks) — status comes from the top-level `status` only.
+ *  Fields verified against riff's TASK_THREAD_SUMMARY_PROJECTION: the summary
+ *  view really does project `followUpParentTaskId`/`followUpRootTaskId`, so the
+ *  reconcile below can match on them. */
+interface RiffThreadNode {
+  id: string;
+  threadId?: string;
+  status?: string;
+  origin?: string;
+  useRunner?: boolean;
+  followUpParentTaskId?: string;
+  followUpRootTaskId?: string;
+  /** ISO timestamp of task creation. In riff's summary projection; used as the
+   *  reconcile floor so a task stranded by an earlier turn is never adopted. */
+  createdAt?: string;
+}
+
+/** Terminal riff task statuses (riff openApiDocs task contract). Once a task
+ *  reaches one of these it will emit no further progress — an `init` replay or
+ *  a `done` event carrying one of these IS the task's completion. Non-terminal:
+ *  pending / creating_session / running. */
+const TERMINAL_RIFF_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timeout']);
 
 /**
  * RiffBackend — bridges botmux's SessionBackend interface to riff's HTTP API.
@@ -336,11 +845,94 @@ export class RiffBackend implements SessionBackend {
    *  cleared past 64 entries (a session rarely exceeds a few dozen turns). */
   private completedTaskIds = new Set<string>();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
+  private maxReconnectAttempts = 6;
+  /** Wall-clock ms when the CURRENT SSE connection was established, or `null`
+   *  when none is open / the last fetch never connected. Typed `number | null`
+   *  (not a 0 sentinel) on purpose: 0 is both "not connected" AND a valid number
+   *  you could subtract, so a future edit dropping the guard would compute a
+   *  bogus multi-decade lifetime from `Date.now() - 0` and refund forever. `null`
+   *  makes "never connected" un-subtractable and forces the guard at the type
+   *  level. The reconnect budget is refunded only when a broken connection had
+   *  LIVED long enough to be a healthy long connection merely severed by the
+   *  upstream proxy's fixed ~183s lifetime cap — NOT merely because a connection
+   *  opened. Keying on "connection lived ≥ reconnectHealthyConnMs" (not on
+   *  receiving init, and not on any data event — both were falsified/
+   *  insufficient) is what separates the two cases that look identical from the
+   *  client:
+   *    • healthy cap:   connection lives ~183s, EOFs → refund → task streams on
+   *    • dead/hot-loop: connection opens then EOFs within ~1s, repeatedly →
+   *      NO refund → budget exhausts and bails. Covers BOTH a fetch that never
+   *      connects (stays null) AND a "connect→init→instant-EOF" loop against a
+   *      stale-running orphan (lives <threshold) — the latter is exactly the
+   *      infinite-retry hole a naive "reset on connect/init" would reopen. */
+  private connectionStartedAtMs: number | null = null;
   /** 预算层级（单调覆盖，见 destroySession 注释）；字段化以便测试注入边界。 */
   private cancelTimeoutMs = 4_000;
-  private createTimeoutMs = 10_000;
+  /** task-execute（首建）的 fetch 预算。create 只是服务端入队，快，保持较小。 */
+  private createTimeoutMs = 15_000;
+  /** task-follow-up 的 fetch 预算，冷/热两档。follow-up 返回前的同步预检（JWT 刷新
+   *  + 读沙箱状态 + lark/meego/agentBuddy 授权检查）本就比 create 重；沙箱变冷时
+   *  （空闲被回收 / daemon 重启后 resume 血缘）还会叠加 archive+snapshot+IDE-proxy
+   *  探测——正是当初顶穿共用 10s 预算的慢路径（实测 spawn→timeout 恰好 10.01s）。
+   *  故 follow-up 给更大预算并按冷/热分档。30/60s 为暂定值，待 riff 侧 P50/P99
+   *  回填；字段化以便测试注入。 */
+  private followUpHotTimeoutMs = 30_000;
+  private followUpColdTimeoutMs = 60_000;
+  /** follow-up 距上次任务活动超过此阈值（或本进程尚无任何活动，见 followUpTimeoutMs）
+   *  即判为冷沙箱，走 followUpColdTimeoutMs。 */
+  private coldFollowUpThresholdMs = 90_000;
+  /** follow-up 超时后对 thread 的对账查询预算 / 最多尝试次数 / 重试间隔。查询是只读的，
+   *  刚在超时瞬间建好的子任务可能要一小会才可查到，故允许一次短重试。字段化以便测试注入。 */
+  private reconcileTimeoutMs = 8_000;
+  private reconcileMaxAttempts = 2;
+  private reconcileRetryDelayMs = 1_500;
+  /** 对账「发送时刻下限」的容差，分两档（见 pickReconciledChild）：
+   *  - 已从 `Date` 头实测到服务端偏差 → 只需覆盖测量误差本身（`Date` 头整秒精度
+   *    ~0.5s + 一个往返 + 期间的小漂移），取 5s。
+   *  - 尚未观测到 `Date` 头（首次对账、代理剥掉了该头等） → 偏差完全未知，退回
+   *    30s 盲兜底：宁可窗口宽一些，也不要因本机时钟快而永远认领不到子任务。
+   *  容差直接就是误接窗口宽度（创建于本轮发送前该时长内的遗留任务会被误判为本轮
+   *  的），所以能测到偏差时必须收窄。字段化以便测试注入。 */
+  private reconcileClockSkewMs = 5_000;
+  private reconcileBlindClockSkewMs = 30_000;
+  /** riff 服务端时钟减本机时钟（ms），由 tasks 响应的 `Date` 头实测得出；`null`
+   *  表示尚未观测到（此时按偏差未知处理，走盲兜底容差）。用于把「发送时刻」换算到
+   *  服务端时间轴，再与服务端写入的 `createdAt` 比较。 */
+  private serverClockOffsetMs: number | null = null;
+  /** 最近一次「任务活动」的 wall-clock ms（成功建任务/续任务，或收到任意 SSE 事件），
+   *  本进程尚无活动时为 null。驱动 follow-up 冷/热判据：长时间空闲或全新进程
+   *  （daemon 重启 resume）意味着 riff 沙箱大概率已被回收，下一次 follow-up 需同步
+   *  唤醒它——正是需要更大预算的慢路径。 */
+  private lastTaskActivityMs: number | null = null;
   private destroyDeadlineMs = 20_000;
+  /** SSE 重连退避基数（指数退避的第一档）；字段化以便测试把重连间隔压到 0。 */
+  private reconnectBaseDelayMs = 1_000;
+  private reconnectMaxDelayMs = 30_000;
+  /** A broken SSE connection that lived at least this long is treated as a
+   *  healthy long connection severed by the ~183s proxy cap → refund the
+   *  reconnect budget. Shorter-lived breaks (dead endpoint / instant-EOF hot
+   *  loop) do NOT refund. 30s: the cap is metronomic at ~181-183s (6× margin)
+   *  while pathological EOFs are sub-second, so the two separate cleanly.
+   *  Field-ized for test injection. */
+  private reconnectHealthyConnMs = 30_000;
+  /** Exact late/current task whose close cancellation failed. Retained across
+   * the prepare-close handshake so the daemon can persist a retry handle. */
+  private closeFailureTaskId: string | null = null;
+  private closeFailureError: string | null = null;
+  private closeLateTaskHandled = false;
+  private closePrepared = false;
+  private closeAttempt: symbol | null = null;
+  private destroyInFlight: Promise<SessionDestroyResult> | null = null;
+  private cancelInFlight: Promise<boolean> | null = null;
+  private abortInFlight: Promise<void> | null = null;
+  /** Graceful daemon shutdown is a non-cancelling two-phase detach. It fences
+   * only writes arriving after prepare; writes already appended to writeChain
+   * still drain so a late child id can be durably handed to the daemon. */
+  private shutdownDetaching = false;
+  private shutdownDetachPrepared = false;
+  private shutdownDetachAttempt: symbol | null = null;
+  private shutdownDetachInFlight: Promise<SessionShutdownDetachResult> | null = null;
+  private shutdownDetachAbortInFlight: Promise<SessionShutdownDetachResult> | null = null;
   /** Serializes write() → createTask/followUp. Without this, a second message
    *  arriving before the first task-execute HTTP returns would see
    *  currentTaskId === null and create a duplicate task. */
@@ -353,6 +945,11 @@ export class RiffBackend implements SessionBackend {
     // follow-up lineage — the first write after restart continues the riff
     // conversation instead of cold-booting a context-less fresh task.
     if (config.resumeParentTaskId) this.currentTaskId = config.resumeParentTaskId;
+    // Optional follow-up timeout overrides (P50/P99 tuning without a code change,
+    // or forcing a timeout in live repro). Only positive finite values apply.
+    const pos = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0;
+    if (pos(config.followUpHotTimeoutMs)) this.followUpHotTimeoutMs = config.followUpHotTimeoutMs;
+    if (pos(config.followUpColdTimeoutMs)) this.followUpColdTimeoutMs = config.followUpColdTimeoutMs;
   }
 
   /** Called when the riff sandbox accessUrl becomes available or changes. */
@@ -374,44 +971,101 @@ export class RiffBackend implements SessionBackend {
     if (this.currentTaskId) cb(this.currentTaskId);
   }
 
-  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh works. */
-  private getJwt(): string | null {
-    return this.resolveJwt();
+  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh
+   *  works. Async because a keychain miss may trigger a (non-blocking) CLI
+   *  refresh. `opts.allowRefresh=false` skips the refresh entirely (daemon-side
+   *  orphan-cancel: a best-effort teardown must never freeze the daemon on a
+   *  host-identity refresh). `opts.forceRefresh=true` bypasses the debounce
+   *  window (an actual server 401 proved the token bad). */
+  private getJwt(opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {}): Promise<string | null> {
+    return this.resolveJwt(opts);
   }
 
-  private resolveJwt(): string | null {
+  /** Merge the configured extra headers (PPE/lane routing, see config.extraHeaders)
+   *  into an outbound request's header map, in place. Precedence: existing headers
+   *  already set (JWT, Content-Type) are never overwritten; config.extraHeaders
+   *  wins over the BOTMUX_RIFF_EXTRA_HEADERS env var on key conflicts. Applied to
+   *  EVERY riff request so a session never splits across environments. No-op when
+   *  nothing is configured (production, current behavior). */
+  private applyExtraHeaders(headers: Record<string, string>): void {
+    const merged = this.resolveExtraHeaders();
+    for (const [k, v] of Object.entries(merged)) {
+      if (!(k in headers)) headers[k] = v;
+    }
+  }
+
+  /** Extra headers from the env var (JSON object) overlaid by config.extraHeaders.
+   *  Malformed env JSON is ignored with a warning rather than throwing. */
+  private resolveExtraHeaders(): Record<string, string> {
+    const out: Record<string, string> = {};
+    const raw = process.env.BOTMUX_RIFF_EXTRA_HEADERS?.trim();
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v != null && v !== '') out[k] = String(v);
+        }
+      } catch (err) {
+        logger.warn(`[riff] ignoring malformed BOTMUX_RIFF_EXTRA_HEADERS: ${err}`);
+      }
+    }
+    if (this.config.extraHeaders) {
+      for (const [k, v] of Object.entries(this.config.extraHeaders)) {
+        if (v != null && v !== '') out[k] = String(v);
+      }
+    }
+    return out;
+  }
+
+  private async resolveJwt(
+    opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {},
+  ): Promise<string | null> {
+    const { allowRefresh = true, forceRefresh = false } = opts;
     if (this.config.jwt) return this.config.jwt;
     const envKey = this.config.jwtEnv ?? 'RIFF_JWT';
     const fromEnv = process.env[envKey];
     if (fromEnv) return fromEnv;
 
-    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk)
+    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk / bytedcli)
     const fromKeychain = this.readJwtFromBytecloudKeychain();
-    if (fromKeychain) {
+    // A forced refresh (post-401) intentionally ignores an existing keychain
+    // token: the server just rejected whatever we had, so re-reading the same
+    // store without refreshing first would hand back the same bad token.
+    if (fromKeychain && !forceRefresh) {
       logger.info(`[riff] JWT loaded from ByteCloud keychain`);
       return fromKeychain;
     }
 
+    // No live keychain token (or a forced post-401 refresh) — every candidate is
+    // expired, within the safety window, or absent. This is exactly the "token
+    // expired mid-task" / "expired at startup" case (the JWT is re-read per
+    // request). Before giving up to a 401 that would abort the turn, ask the
+    // owning CLI to refresh (non-blocking async, coalesced, non-fatal), then
+    // re-read once. Skipped when allowRefresh=false (daemon-side orphan-cancel)
+    // and inside a full AIME runtime (fail-closed identity boundary — we never
+    // trigger a host-identity refresh there; the AIME store is refreshed inside
+    // AIME).
+    if (allowRefresh && !isFullAimeRuntime(process.env)) {
+      const cmd = resolveJwtRefreshCmd(this.config.jwtRefreshCmd);
+      if (await refreshBytecloudJwt(cmd, { force: forceRefresh })) {
+        const refreshed = this.readJwtFromBytecloudKeychain();
+        if (refreshed) {
+          logger.info(`[riff] JWT refreshed via ByteCloud CLI and reloaded from keychain`);
+          return refreshed;
+        }
+      }
+    }
+
+    // Forced refresh found nothing new — fall back to the (rejected) keychain
+    // token rather than null: a stale token is no worse than no token, and the
+    // caller already knows it 401'd.
+    if (fromKeychain) return fromKeychain;
     logger.warn(`[riff] JWT not found in config, env ${envKey}, or ByteCloud keychain; API calls will fail`);
     return null;
   }
 
   private readJwtFromBytecloudKeychain(): string | null {
-    const home = process.env.HOME ?? '~';
-    const candidates = [
-      `${home}/.config/kaboo-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.config/aiden-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.cjadk/bytecloud-auth/keychain/auth/cn/default`,
-    ];
-    for (const path of candidates) {
-      try {
-        const raw = readFileSync(path, 'utf-8');
-        const data = JSON.parse(raw) as Record<string, unknown>;
-        const jwt = data['bytecloud_jwt'] as string | undefined;
-        if (jwt) return jwt;
-      } catch { /* try next */ }
-    }
-    return null;
+    return readBytecloudKeychainJwt();
   }
 
   spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
@@ -419,8 +1073,16 @@ export class RiffBackend implements SessionBackend {
     // No actual process to spawn. Task creation happens on first write().
   }
 
-  write(data: string): void {
-    if (this.killed || this.closing) return;
+  write(data: string): boolean {
+    if (this.killed) return false;
+    if (this.shutdownDetaching) {
+      logger.warn('[riff] write rejected while graceful shutdown detach is preparing/prepared');
+      return false;
+    }
+    if (this.closing) {
+      logger.warn('[riff] write rejected while explicit close is preparing/prepared');
+      return false;
+    }
 
     const { text, attachments } = this.extractAttachments(data);
 
@@ -442,6 +1104,7 @@ export class RiffBackend implements SessionBackend {
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
       });
+    return true;
   }
 
   resize(_cols: number, _rows: number): void {
@@ -469,8 +1132,8 @@ export class RiffBackend implements SessionBackend {
     this.exitCb?.(0, null);
   }
 
-  async destroySession(): Promise<void> {
-    // /close（及 /restart 的替换路径）必须把远端任务真正取消掉——fire-and-forget
+  async destroySession(): Promise<SessionDestroyResult> {
+    // /close 必须把远端任务真正取消掉——fire-and-forget
     // 在 worker 紧接 process.exit 时大概率发不出去，已关闭话题的远端 agent 会
     // 继续拿着注入的凭证发消息。有界 await + 一次重试，失败也明确留痕。
     //
@@ -478,36 +1141,249 @@ export class RiffBackend implements SessionBackend {
     // currentTaskId 还是 null/旧值，直接 cancel 会漏掉 late task。先立 closing
     // 门（拒新写 + 令 in-flight 完成后自取消），再有界等 writeChain 沉降，最后
     // cancel 沉降后的 current task。
+    if (this.shutdownDetaching) {
+      return {
+        ok: false,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+        error: 'shutdown_detach_in_progress',
+      };
+    }
+    if (this.destroyInFlight) return this.destroyInFlight;
+    if (this.closePrepared) {
+      return {
+        ok: true,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+      };
+    }
+    const attempt = Symbol('riff-close-prepare');
+    this.closeAttempt = attempt;
     this.closing = true;
+    this.closeFailureTaskId = null;
+    this.closeFailureError = null;
+    this.closeLateTaskHandled = false;
     // 预算层级（单调覆盖，无内层 race——writeChain 本身有界）：
     //   create/follow-up fetch 10s + late cancel 4s×2 = chain 最坏 18s
     //   own cancel 4s×2 = 8s（与 late 情形互斥：closing 分支不登记 current）
-    //   → destroySession 总 deadline 20s → worker close/restart race 22s
+    //   → destroySession 总 deadline 20s → worker close handshake 22s
     //   → daemon SIGTERM backstop 24s / SIGKILL 29s。
     // 对 writeChain 只整体 await：单独给它小窗口会在窗口边缘掐掉链内的
     // late cancel（create 于 t≈窗口末返回 → cancel 尚 pending → teardown 提前
     // resolve → process.exit 掐断取消）。
-    const teardown = (async () => {
+    const teardown = (async (): Promise<SessionDestroyResult> => {
       try {
         await this.writeChain;
       } catch { /* writeChain never rejects (caught internally) */ }
-      if (this.currentTaskId && !this.taskDone) {
+      if (this.closeAttempt !== attempt) {
+        return {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      if (this.closeFailureTaskId) {
+        return {
+          ok: false,
+          taskId: this.closeFailureTaskId,
+          error: this.closeFailureError ?? 'late_task_cancel_failed',
+        };
+      }
+      // A task materialized while closing was already cancelled inside the
+      // writeChain. Do not then cancel its stale parent lineage as if it were
+      // still the active execution.
+      if (!this.closeLateTaskHandled && this.currentTaskId && !this.taskDone) {
         const id = this.currentTaskId;
-        try {
-          await this.cancelTask(id);
+        const cancelled = await this.cancelTaskWithRetry(id, 'close');
+        // abortDestroySession invalidates the exact attempt before waiting for
+        // an already-issued cancellation. A late successful HTTP response must
+        // not resurrect that aborted generation as a prepared close.
+        if (this.closeAttempt !== attempt || !this.closing) {
+          return {
+            ok: false,
+            ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+            error: 'close_aborted',
+          };
+        }
+        if (cancelled) {
           logger.info(`[riff] task ${id} cancelled on close`);
-        } catch (err) {
-          try {
-            await this.cancelTask(id);
-            logger.info(`[riff] task ${id} cancelled on close (retry)`);
-          } catch (err2) {
-            logger.warn(`[riff] task-cancel failed on close (task ${id} may keep running remotely): ${err2}`);
-          }
+        } else {
+          return {
+            ok: false,
+            taskId: id,
+            error: this.closeFailureError ?? 'task_cancel_failed',
+          };
         }
       }
+      if (this.closeAttempt !== attempt || !this.closing) {
+        return {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      return {
+        ok: true,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+      };
     })();
-    await Promise.race([teardown, new Promise((r) => setTimeout(r, this.destroyDeadlineMs))]);
-    this.kill();
+    this.destroyInFlight = Promise.race([
+      teardown,
+      new Promise<SessionDestroyResult>(resolve => setTimeout(() => resolve({
+        ok: false,
+        ...(this.closeFailureTaskId || this.currentTaskId
+          ? { taskId: this.closeFailureTaskId ?? this.currentTaskId! }
+          : {}),
+        error: 'close_timeout',
+      }), this.destroyDeadlineMs)),
+    ]).then(async (result) => {
+      // Promise.race and the teardown continuation each add a microtask
+      // boundary. Revalidate the generation immediately before publishing the
+      // prepared bit so a concurrent abort can never be overwritten.
+      if (result.ok && (this.closeAttempt !== attempt || !this.closing)) {
+        result = {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      if (result.ok) {
+        this.closePrepared = true;
+      } else {
+        // A failed prepare is not a terminal close. Restore admission so the
+        // still-active durable owner can accept a follow-up or a close retry.
+        await this.abortDestroySession();
+      }
+      return result;
+    }).finally(() => {
+      this.destroyInFlight = null;
+    });
+    return this.destroyInFlight;
+  }
+
+  async abortDestroySession(): Promise<void> {
+    if (this.killed) return;
+    if (this.abortInFlight) return this.abortInFlight;
+    this.closeAttempt = null;
+    this.closePrepared = false;
+    const pendingCancel = this.cancelInFlight;
+    this.abortInFlight = (async () => {
+      // A close timeout can win Promise.race after task-cancel was already
+      // issued. Reopening admission before that request settles lets a new
+      // follow-up race a late successful cancellation of its parent. Keep the
+      // backend fenced until the exact cancellation attempt reaches terminal.
+      if (pendingCancel) {
+        try { await pendingCancel; } catch { /* cancel helper returns boolean */ }
+      }
+      if (this.killed || this.closeAttempt !== null || this.closePrepared) return;
+      this.closing = false;
+      this.closeFailureTaskId = null;
+      this.closeFailureError = null;
+      this.closeLateTaskHandled = false;
+      logger.info('[riff] explicit close aborted; write admission restored');
+    })().finally(() => {
+      this.abortInFlight = null;
+    });
+    return this.abortInFlight;
+  }
+
+  commitDestroySession(): void {
+    // The daemon has durably published the closed row. Keep admission fenced
+    // until the worker immediately detaches/exits.
+    this.closePrepared = false;
+    this.closeAttempt = null;
+    this.closing = true;
+  }
+
+  async prepareShutdownDetach(): Promise<SessionShutdownDetachResult> {
+    if (this.shutdownDetachInFlight) return this.shutdownDetachInFlight;
+    if (this.shutdownDetachPrepared) {
+      return { ok: true, taskId: this.currentTaskId };
+    }
+    if (this.killed) {
+      return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+    }
+    if (this.closing || this.destroyInFlight || this.closePrepared) {
+      return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
+    }
+
+    const attempt = Symbol('remote-shutdown-detach');
+    this.shutdownDetachAttempt = attempt;
+    this.shutdownDetaching = true;
+    // Existing SSE delivery is presentation-only. Stop it now, but do not
+    // cancel the remote task. Any create/follow-up already accepted before the
+    // fence remains in writeChain and is allowed to materialize below.
+    this.abortController?.abort();
+
+    const drain = (async (): Promise<SessionShutdownDetachResult> => {
+      try { await this.writeChain; }
+      catch { /* writeChain catches its own failures */ }
+      if (this.killed || this.shutdownDetachAttempt !== attempt || !this.shutdownDetaching) {
+        return { ok: false, taskId: this.currentTaskId, error: 'shutdown_detach_aborted' };
+      }
+      if (this.closing || this.closePrepared) {
+        return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
+      }
+      this.shutdownDetachPrepared = true;
+      logger.info(
+        `[riff] graceful shutdown detach prepared`
+        + `${this.currentTaskId ? ` (task ${this.currentTaskId})` : ' (no task lineage)'}`,
+      );
+      return { ok: true, taskId: this.currentTaskId };
+    })();
+    this.shutdownDetachInFlight = drain.finally(() => {
+      this.shutdownDetachInFlight = null;
+    });
+    return this.shutdownDetachInFlight;
+  }
+
+  async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
+    if (this.killed) {
+      return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+    }
+    if (this.shutdownDetachAbortInFlight) return this.shutdownDetachAbortInFlight;
+    const pending = this.shutdownDetachInFlight;
+    const pendingCancel = this.cancelInFlight;
+    this.shutdownDetachAttempt = null;
+    this.shutdownDetachPrepared = false;
+    this.shutdownDetachAbortInFlight = (async (): Promise<SessionShutdownDetachResult> => {
+      // Normally shutdown detach never cancels a remote task. Still wait for
+      // any exact cancellation already issued by an overlapping explicit close
+      // before reopening admission, otherwise its late result could invalidate
+      // a newly accepted follow-up.
+      await Promise.all([
+        pending ? pending.catch(() => undefined) : Promise.resolve(),
+        pendingCancel ? pendingCancel.catch(() => false) : Promise.resolve(),
+      ]);
+      if (this.killed) {
+        return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+      }
+      if (this.closing || this.shutdownDetachAttempt !== null) {
+        return {
+          ok: false,
+          taskId: this.currentTaskId,
+          error: this.closing ? 'explicit_close_in_progress' : 'new_shutdown_detach_in_progress',
+        };
+      }
+      this.shutdownDetaching = false;
+      // prepare stopped SSE before the persistence ACK. If shutdown is
+      // aborted, reconnect the exact current task so the still-live owner
+      // resumes normal output and completion tracking.
+      if (this.currentTaskId && !this.taskDone) {
+        this.reconnectAttempts = 0;
+        void this.streamTask(this.currentTaskId);
+      }
+      logger.info('[riff] graceful shutdown detach aborted; write admission restored');
+      return { ok: true, taskId: this.currentTaskId };
+    })().finally(() => {
+      this.shutdownDetachAbortInFlight = null;
+    });
+    return this.shutdownDetachAbortInFlight;
+  }
+
+  commitShutdownDetach(): void {
+    this.shutdownDetachPrepared = false;
+    this.shutdownDetachAttempt = null;
+    // Keep admission fenced until the worker exits immediately after commit.
+    this.shutdownDetaching = true;
   }
 
   getChildPid(): number | null {
@@ -534,13 +1410,14 @@ export class RiffBackend implements SessionBackend {
    * lines stair-step to the right, which is the main reason the raw log view
    * was hard to read. Always emit `\r\n` and reset ANSI styling per line.
    */
-  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain' = 'info'): void {
+  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
     const codes: Record<string, string> = {
       info: '\x1b[36m',   // cyan — routine status
       warn: '\x1b[33m',   // yellow — degraded/attention
       ok: '\x1b[32m',     // green — completion
       err: '\x1b[31m',    // red — failure
       title: '\x1b[1m',   // bold — section separators
+      dim: '\x1b[2m',     // faint — low-signal (reasoning / usage)
       plain: '',
     };
     const open = codes[style] ?? '';
@@ -556,6 +1433,105 @@ export class RiffBackend implements SessionBackend {
     this.outputBuffer += normalized;
     this.dataCb?.(normalized);
   }
+
+  /**
+   * Emit ONE timeline row for a route-B display projection. Unlike {@link emitLine}
+   * (which brackets every call with a leading + trailing CRLF → blank lines between
+   * consecutive rows, and leaves internal `\n` un-normalized → xterm stair-stepping),
+   * this normalizes ALL internal newlines to CRLF and appends exactly ONE trailing
+   * CRLF, with NO leading CRLF. Consecutive rows therefore sit on adjacent lines and
+   * multi-line bodies render flush-left.
+   */
+  private emitTimelineRow(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
+    const codes: Record<string, string> = {
+      info: '\x1b[36m', warn: '\x1b[33m', ok: '\x1b[32m',
+      err: '\x1b[31m', title: '\x1b[1m', dim: '\x1b[2m', plain: '',
+    };
+    const open = codes[style] ?? '';
+    const close = open ? '\x1b[0m' : '';
+    // Color the whole (possibly multi-line) row, then normalize every newline —
+    // including the internal ones — to CRLF, and terminate with exactly one CRLF.
+    const body = `${open}${text}${close}`.replace(/\r?\n/g, '\r\n');
+    const line = `${body}\r\n`;
+    this.outputBuffer += line;
+    this.dataCb?.(line);
+  }
+
+  /**
+   * Render a riff route-B `display` projection (a codex app-server event distilled
+   * to {kind,title,text,command,exitCode,status}) as one human-readable timeline
+   * row: `[思路] …` / `[命令] <cmd> (exit N)` / `[回答] …`. The Chinese label comes
+   * from riff's already-localized `title` when present (i18n follows riff); we only
+   * fall back to a kind→label table when it is absent. Colour follows the kind
+   * (failed command / error → red, completed command → green, reasoning/usage dim).
+   */
+  private emitDisplay(display: RiffLogDisplay): void {
+    const kind = display.kind;
+    // Kind → default label. `title` (localized by riff) wins when present.
+    const LABEL: Record<string, string> = {
+      message: '回答',
+      reasoning: '思路',
+      command: '命令',
+      tool: '工具',
+      system: '系统',
+      usage: '用量',
+      error: '错误',
+      stage: '阶段',
+      trace: '追踪',
+      stdout: '',
+      stderr: '',
+    };
+    const label = display.title || LABEL[kind] || kind;
+    // For a codex `command` projection riff sets {command,status,exitCode,
+    // summary:'命令执行完成'} PLUS `text` = the captured command output (stdout/
+    // stderr, already truncated to 32KB by riff's collapseCommandOutputIntoPrimary).
+    // `summary` is a status blurb we never render; `text` is the real output we DO
+    // render beneath the header. For non-command kinds `text` is the content itself.
+    const body = (display.text ?? '').trimEnd();
+
+    if (kind === 'command') {
+      const cmd = display.command || '已执行命令';
+      const completed = display.status === 'completed' || display.exitCode === 0;
+      const failed = display.status === 'failed' || (display.exitCode != null && display.exitCode !== 0);
+      const exit = display.exitCode != null ? ` (exit ${display.exitCode})` : '';
+      // Green ONLY for a confirmed-completed/exit-0 command; red for failure;
+      // neutral (info) for a still-running command (no exit code yet).
+      const style = failed ? 'err' : completed ? 'ok' : 'info';
+      this.emitTimelineRow(`[${label}] ${cmd}${exit}`, style);
+      // Render the captured command output (riff folds it into `text`) beneath the
+      // header, verbatim/uncolored. `summary` ('命令执行完成') is NOT this — it never
+      // reaches `body` (we read `text` only), so no fake output line.
+      if (body) this.emitTimelineRow(body, 'plain');
+      return;
+    }
+    switch (kind) {
+      case 'reasoning':
+      case 'usage':
+        this.emitTimelineRow(`[${label}] ${body}`, 'dim');
+        return;
+      case 'error':
+        this.emitTimelineRow(`[${label}] ${body}`, 'err');
+        return;
+      case 'stderr':
+        this.emitTimelineRow(body, 'warn');
+        return;
+      case 'stdout':
+        // Plain shell output projected as-is (no label prefix).
+        if (body) this.emitTimelineRow(body, 'plain');
+        return;
+      case 'message':
+        this.emitTimelineRow(`[${label}] ${body}`, 'title');
+        return;
+      case 'tool':
+      case 'system':
+      case 'stage':
+      case 'trace':
+      default:
+        this.emitTimelineRow(`[${label}] ${body}`, 'info');
+        return;
+    }
+  }
+
 
   private extractAttachments(content: string): { text: string; attachments: RiffAttachment[] } {
     const attachments: RiffAttachment[] = [];
@@ -636,8 +1612,9 @@ export class RiffBackend implements SessionBackend {
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
       if (!(await this.adoptLateTask(taskId))) return;
+      this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
@@ -645,22 +1622,75 @@ export class RiffBackend implements SessionBackend {
     }
   }
 
+  /** Record a "task activity" tick — drives the follow-up cold/hot decision.
+   *  Called on every SSE event and on each successful create/adopt so a long
+   *  idle gap (sandbox likely reclaimed) or a fresh process is detectable. */
+  private markActivity(): void {
+    this.lastTaskActivityMs = Date.now();
+  }
+
+  /** Pick the follow-up fetch budget. Cold (larger budget) when the riff sandbox
+   *  has likely gone cold and this follow-up must synchronously wake it:
+   *    • this process has seen NO task activity yet — the daemon-restart resume
+   *      case (currentTaskId came from resumeParentTaskId, sandbox long idle);
+   *      this is exactly the logged 10.01s timeout.
+   *    • the last activity was longer ago than coldFollowUpThresholdMs.
+   *  Hot budget otherwise (a follow-up right after the previous turn). */
+  private followUpTimeoutMs(): number {
+    const last = this.lastTaskActivityMs;
+    const cold = last === null || (Date.now() - last) >= this.coldFollowUpThresholdMs;
+    return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
+  }
+
   private async followUp(prompt: string, attachments: RiffAttachment[]): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
+
+    // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
+    // exact parent this follow-up hung off, independent of any later mutation.
+    const parentTaskId = this.currentTaskId;
 
     // riff task-follow-up body: parentTaskId + origin + prompt at top level
     const payload: Record<string, unknown> = {
       origin: 'botmux',
-      parentTaskId: this.currentTaskId,
+      parentTaskId,
       prompt: this.injectSystemPrompt(prompt),
     };
 
+    // Send-time floor for reconcile-on-timeout: only a task created at/after this
+    // instant can be THIS follow-up's child (see reconcileAfterFollowUpTimeout).
+    // Read before the request so a slow pre-flight cannot push it past the child's
+    // own createdAt.
+    const sentAtMs = Date.now();
+
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
       if (!(await this.adoptLateTask(taskId))) return;
+      this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
+      // A client-side fetch timeout does NOT mean the server did nothing. riff
+      // task-follow-up is "accept → return taskId", but returns only AFTER a
+      // synchronous pre-flight (auth refresh + sandbox-status read + lark/meego/
+      // agentBuddy checks, plus archive/snapshot/IDE-proxy probes when the sandbox
+      // is cold). That pre-flight can outlast our fetch budget while the child task
+      // is ALREADY being created server-side. Clearing the lineage here (old
+      // behavior) would cold-boot a fresh context-less task on the next message AND
+      // strand that in-flight child. Instead: reconcile against the thread — if the
+      // child already exists, adopt it (no lost context, no duplicate); only a true
+      // broken lineage resets to a fresh task.
+      if (this.isTimeoutError(err) && parentTaskId) {
+        if (await this.reconcileAfterFollowUpTimeout(parentTaskId, sentAtMs)) return;
+        // Reconcile found no child. Deliberately NO auto-resend: riff has no
+        // request-dedup (no X-Idempotency-Key / clientRequestId server-side), and
+        // its follow-up redirects the parent to the thread's latest node — so a
+        // blind resend can genuinely build a SECOND task for one user message.
+        // Keep the lineage instead: the parent is still valid, so the next message
+        // continues the conversation rather than cold-booting a fresh sandbox.
+        // THIS turn's prompt is dropped; say so plainly so the user can resend.
+        this.emitError(`riff follow-up 超时，本次未送达（血缘保留，请重发本条消息）: ${err}`);
+        return;
+      }
       // Broken lineage (parent expired/GC'd etc.) — fall back to a fresh task
       // on the next message instead of failing every follow-up forever. Also
       // clear the DAEMON-side persisted lineage: without the null broadcast a
@@ -669,6 +1699,174 @@ export class RiffBackend implements SessionBackend {
       this.taskIdCb?.(null);
       this.emitError(`riff follow-up 失败: ${err}（下一条消息将新建任务）`);
     }
+  }
+
+  /** Node's AbortSignal.timeout() rejects with a DOMException/Error named
+   *  "TimeoutError" ("The operation was aborted due to timeout"). Match by name
+   *  (message wording is locale/runtime-dependent). AbortError (manual abort) is
+   *  deliberately NOT treated as a timeout — that is teardown, handled elsewhere. */
+  private isTimeoutError(err: unknown): boolean {
+    return err instanceof Error && err.name === 'TimeoutError';
+  }
+
+  /**
+   * After a follow-up fetch times out, ask the thread whether the child task was
+   * in fact created (the pre-flight simply outran our budget). botmux sends its
+   * own sessionId as the riff threadId (task-execute threadId: this.sessionId),
+   * and riff stores it verbatim (no rewrite/mapping) — so we query by sessionId
+   * directly, no task-detail hop needed.
+   *
+   * IDENTITY INVARIANT (locked by design with the riff side): riff's
+   * `GET /api/tasks` is owner-scoped. This reconcile MUST reuse the CURRENT
+   * backend instance's getJwt() — the same identity that created the task — or it
+   * would query as a different owner and get an empty list. Never introduce a
+   * different credential here.
+   *
+   * Returns true iff this follow-up's child task was found and adopted (streaming
+   * resumed / terminal result fetched). False means "no child yet" → caller keeps
+   * the lineage without adopting.
+   *
+   * MATCHING ANCHOR — `followUpParentTaskId` PLUS a send-time floor:
+   *   riff has no per-request id we could echo back (no clientRequestId in the
+   *   task document, no X-Idempotency-Key handling), so the parent link is the
+   *   only server-side signal tying a task to this follow-up.
+   *   It is not unique on its own: riff redirects a follow-up's parent to the
+   *   thread's LATEST node (api/lambda/task-follow-up.ts — "普通追问必须从 thread
+   *   最新节点发起"), so several siblings can share one parent — including a task
+   *   stranded by an EARLIER timed-out turn. Adopting that one would replay a
+   *   previous turn's output and silently drop this turn's prompt.
+   *   Hence `sentAtMs`: only a child created at/after the moment we issued THIS
+   *   follow-up can be its child. `createdAt` is in riff's
+   *   TASK_THREAD_SUMMARY_PROJECTION, so the summary view really carries it.
+   *   A node with an absent/unparsable createdAt is NOT adopted — fail closed,
+   *   because a wrong adopt is worse than a missed one (the caller keeps the
+   *   lineage and the user just resends).
+   *   Ties are broken by the OLDEST qualifying child: the first task created
+   *   after we sent is the one our request produced.
+   */
+  private async reconcileAfterFollowUpTimeout(parentTaskId: string, sentAtMs: number): Promise<boolean> {
+    for (let attempt = 1; attempt <= this.reconcileMaxAttempts; attempt++) {
+      if (this.killed || this.closing || this.shutdownDetaching) return false;
+      let nodes: RiffThreadNode[];
+      try {
+        nodes = await this.fetchThreadNodes(this.sessionId);
+      } catch (err) {
+        logger.warn(`[riff] reconcile thread query failed (attempt ${attempt}): ${err}`);
+        nodes = [];
+      }
+      // Diagnostic: what did the thread query return, and what are we matching on?
+      // ids/times only — surfaces missing (timing/scope) vs present-but-unmatched.
+      // Print the EFFECTIVE floor (offset + tolerance applied), not the raw send
+      // instant: a log that names a different threshold than the code applies
+      // would send whoever debugs this down the wrong path.
+      logger.info(`[riff] reconcile attempt ${attempt}: match by parent=${parentTaskId.slice(0, 8)} createdAt>=${new Date(this.reconcileFloorMs(sentAtMs)).toISOString()} (sent=${new Date(sentAtMs).toISOString()}, serverOffset=${this.serverClockOffsetMs ?? 'unmeasured'}), thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},created=${n.createdAt ?? 'none'},${n.status})`).join(' ')}`);
+      const child = this.pickReconciledChild(nodes, parentTaskId, sentAtMs);
+      if (child) {
+        const childId = child.id;
+        // Re-check we can still adopt (a concurrent close/kill may have landed).
+        if (!(await this.adoptLateTask(childId))) return true;
+        this.markActivity();
+        this.reconnectAttempts = 0;
+        this.emitLine(`[riff] follow-up 超时，但服务端已建任务，自动续接（未丢上下文）`, 'warn');
+        if (this.isTerminalStatus(child.status)) {
+          // Already finished while we were blind — fire the turn boundary + fetch
+          // its final report instead of streaming a stream that will never speak.
+          this.completeTask(childId, child.status, undefined);
+        } else {
+          this.streamTask(childId);
+        }
+        return true;
+      }
+      if (attempt < this.reconcileMaxAttempts) {
+        await new Promise((r) => setTimeout(r, this.reconcileRetryDelayMs));
+      }
+    }
+    return false;
+  }
+
+  /** The effective reconcile floor in riff's time frame: our send instant,
+   *  translated by the measured server clock offset, minus the tolerance.
+   *  `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
+   *  sentAtMs is ours — two different machines. The tolerance IS the mis-adopt
+   *  window (a leftover task created within it, just before we sent, still
+   *  passes), so it is kept tight once the offset is known and only stays wide
+   *  while it is unknown.
+   *  CAVEAT: an intermediary (proxy/gateway) may rewrite `Date`, in which case
+   *  the measured offset is that hop's clock, not riff's — harmless while the two
+   *  agree to within the tolerance. A server-side NTP jump between stamping
+   *  `createdAt` and sending the response is absorbed the same way.
+   *  Single-sourced so the diagnostic log can never name a different threshold
+   *  than the filter actually applies. */
+  private reconcileFloorMs(sentAtMs: number): number {
+    const measured = this.serverClockOffsetMs;
+    const tolerance = measured === null ? this.reconcileBlindClockSkewMs : this.reconcileClockSkewMs;
+    return sentAtMs + (measured ?? 0) - tolerance;
+  }
+
+  /** The thread node this follow-up created, or undefined. Requires BOTH the
+   *  parent link AND creation at/after the effective floor (see
+   *  reconcileFloorMs + the anchor notes on reconcileAfterFollowUpTimeout — the
+   *  parent alone can match a task stranded by an earlier timed-out turn).
+   *  Unparsable/absent createdAt → not a candidate. Oldest qualifying node wins. */
+  private pickReconciledChild(
+    nodes: RiffThreadNode[],
+    parentTaskId: string,
+    sentAtMs: number,
+  ): RiffThreadNode | undefined {
+    const floorMs = this.reconcileFloorMs(sentAtMs);
+    let best: RiffThreadNode | undefined;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (const n of nodes) {
+      if (!n.id || n.followUpParentTaskId !== parentTaskId) continue;
+      const createdMs = n.createdAt ? Date.parse(n.createdAt) : NaN;
+      if (!Number.isFinite(createdMs) || createdMs < floorMs) continue;
+      if (createdMs < bestMs) {
+        best = n;
+        bestMs = createdMs;
+      }
+    }
+    return best;
+  }
+
+  /** riff terminal task statuses — whitelist so future intermediate states are
+   *  never mis-classified as "done" (they default to "still running"). Mirrors
+   *  TERMINAL_RIFF_STATUSES. */
+  private isTerminalStatus(status: string | undefined): boolean {
+    return status != null && TERMINAL_RIFF_STATUSES.has(status);
+  }
+
+  /** GET /api/tasks?threadId=&view=summary → { success, data: RiffThreadNode[] }.
+   *  Owner-scoped (see reconcileAfterFollowUpTimeout). view=summary is the
+   *  lightweight projection (no logs/results) suited to this hot-path probe. */
+  private async fetchThreadNodes(threadId: string): Promise<RiffThreadNode[]> {
+    const url = `${this.config.baseUrl}/api/tasks?threadId=${encodeURIComponent(threadId)}&view=summary`;
+    const headers: Record<string, string> = {};
+    const jwt = await this.getJwt();
+    if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(this.reconcileTimeoutMs) });
+    if (!resp.ok) throw new Error(`tasks query HTTP ${resp.status}`);
+    // Measure the server↔client clock offset off this very response, so the
+    // reconcile floor compares like with like (see observeServerClock).
+    this.observeServerClock(resp.headers.get('date'));
+    const result = (await resp.json()) as { success?: boolean; data?: RiffThreadNode[] };
+    // Envelope is { success, data: [...] } — data is the array directly (NOT
+    // data.tasks). Empty/no-permission → [].
+    return Array.isArray(result.data) ? result.data : [];
+  }
+
+  /** Record how far riff's clock sits from ours, read from an HTTP `Date`
+   *  response header (RFC 9110 requires it, and it is generated by the same
+   *  machine that stamps `createdAt`). Lets the reconcile floor correct for a
+   *  real measured offset instead of assuming the two clocks agree.
+   *  Whole-second resolution, and the value is one round-trip old, so callers
+   *  still add a small tolerance on top. Unparsable/missing header → leave the
+   *  previous observation (or none) in place. */
+  private observeServerClock(dateHeader: string | null): void {
+    if (!dateHeader) return;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return;
+    this.serverClockOffsetMs = serverMs - Date.now();
   }
 
   /**
@@ -711,12 +1909,16 @@ export class RiffBackend implements SessionBackend {
     url: string,
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
+    timeoutMs: number,
   ): Promise<string> {
+    // Assemble the request body FIRST (attachment reads can be slow on large
+    // files / slow disks), THEN resolve the JWT immediately before fetch. The
+    // keychain selector skips tokens expiring within a safety window, but that
+    // guarantee only holds if we read the token close to the request — reading
+    // it before a multi-second upload prep could hand off a token that expires
+    // mid-flight. createTimeout only bounds the fetch, not the prep before it.
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
-    if (jwt) headers['x-jwt-token'] = jwt;
-
-    let resp: Response;
+    let body: BodyInit;
     if (attachments.length > 0) {
       const form = new FormData();
       form.append('payload', JSON.stringify(payload));
@@ -728,10 +1930,48 @@ export class RiffBackend implements SessionBackend {
           logger.warn(`[riff] failed to read attachment ${att.path}: ${err}`);
         }
       }
-      resp = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = form;
     } else {
       headers['Content-Type'] = 'application/json';
-      resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = JSON.stringify(payload);
+    }
+
+    // Resolve JWT last — right before the request — so the safety-window
+    // freshness check reflects the token that actually goes on the wire. `body`
+    // (string or FormData) is re-extractable per fetch, so the retry below can
+    // reuse it.
+    this.applyExtraHeaders(headers);
+    // Observability: record the outbound target + which routing headers were
+    // attached (names only — never the JWT value). Makes "did this request carry
+    // the PPE/lane headers?" answerable from logs instead of guesswork.
+    const routingHeaderKeys = Object.keys(headers).filter(k => k.toLowerCase() !== 'x-jwt-token' && k.toLowerCase() !== 'content-type');
+    logger.info(`[riff] → POST ${url} headers=[${routingHeaderKeys.join(',') || 'none'}]`);
+    // The routing headers live in `headers`, which `post` spreads — so the
+    // 401/403 retry below carries them too (a retry that dropped them would land
+    // in the wrong environment). The timeout is the caller's per-endpoint budget
+    // (create vs follow-up cold/hot), not a fixed constant.
+    const post = (jwt: string | null): Promise<Response> => {
+      const h = { ...headers };
+      if (jwt) h['x-jwt-token'] = jwt;
+      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(timeoutMs) });
+    };
+
+    const firstJwt = await this.getJwt();
+    let resp = await post(firstJwt);
+
+    // One retry on an auth rejection. A 401/403 is authoritative proof the token
+    // was bad (expired mid-flight / stale at startup), so it justifies forcing a
+    // JWT refresh that bypasses the debounce window. We retry ONLY when the
+    // refresh produced a genuinely different token — otherwise the second POST
+    // would just replay the same rejected credential (this also naturally
+    // no-ops inside a full AIME runtime, where the host refresh is skipped).
+    // Other statuses (400/5xx) are not auth problems and are not retried.
+    if (resp.status === 401 || resp.status === 403) {
+      const freshJwt = await this.getJwt({ forceRefresh: true });
+      if (freshJwt && freshJwt !== firstJwt) {
+        logger.warn(`[riff] task create/follow-up got HTTP ${resp.status}; retrying once with a refreshed JWT`);
+        resp = await post(freshJwt);
+      }
     }
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
@@ -762,8 +2002,8 @@ export class RiffBackend implements SessionBackend {
    * Post-await adoption gate for a freshly created/followed-up task id.
    * - closing（/close 竞态窗口）：这个 late task 已经没有会话可服务——立即取消
    *   （有界+一次重试），绝不 stream/登记，防远端 orphan；
-   * - killed（detach：重启/休眠）：登记 id 让 daemon 持久化血缘，但不 stream
-   *   （任务合法续跑，重启后 follow-up 接上）；
+   * - killed / shutdownDetaching（detach）：登记 id 让 daemon 持久化血缘，
+   *   但不 stream（任务合法续跑，重启后 follow-up 接上）；
    * - 正常：登记 + 由调用方启动 stream。
    */
   private async adoptLateTask(taskId: string): Promise<boolean> {
@@ -771,20 +2011,21 @@ export class RiffBackend implements SessionBackend {
       // 在 writeChain 内 await——destroySession 等 writeChain 沉降时就能把这次
       // 取消一起等到（void 触发会在 worker exit 时被掐断）。
       logger.info(`[riff] task ${taskId} created during close — cancelling late task`);
-      try {
-        await this.cancelTask(taskId);
-      } catch {
-        try {
-          await this.cancelTask(taskId);
-        } catch (err) {
-          logger.warn(`[riff] late-task cancel failed (task ${taskId} may keep running remotely): ${err}`);
-        }
-      }
+      this.closeLateTaskHandled = true;
+      // Preserve the exact newest lineage even when cancellation succeeds.
+      // If the daemon cannot durably commit the close and sends abort, the
+      // next follow-up must continue from this child rather than its stale
+      // parent. Publishing before the cancel also makes a failed cancel
+      // retryable by the daemon.
+      this.currentTaskId = taskId;
+      this.taskIdCb?.(taskId);
+      const cancelled = await this.cancelTaskWithRetry(taskId, 'late-task close');
+      if (!cancelled) this.taskDone = false;
       return false;
     }
     this.currentTaskId = taskId;
     this.taskIdCb?.(taskId);
-    if (this.killed) return false;
+    if (this.killed || this.shutdownDetaching) return false;
     return true;
   }
 
@@ -799,8 +2040,9 @@ export class RiffBackend implements SessionBackend {
   private async cancelTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-cancel`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
     const resp = await fetch(url, {
       method: 'POST',
       headers,
@@ -811,23 +2053,61 @@ export class RiffBackend implements SessionBackend {
     if (!resp.ok) throw new Error(`task-cancel HTTP ${resp.status}`);
   }
 
+  private async cancelTaskWithRetry(taskId: string, context: string): Promise<boolean> {
+    const operation = (async (): Promise<boolean> => {
+      try {
+        await this.cancelTask(taskId);
+        return true;
+      } catch {
+        try {
+          await this.cancelTask(taskId);
+          logger.info(`[riff] task ${taskId} cancelled on ${context} (retry)`);
+          return true;
+        } catch (err) {
+          this.closeFailureTaskId = taskId;
+          this.closeFailureError = err instanceof Error ? err.message : String(err);
+          logger.warn(`[riff] ${context} cancel failed (task ${taskId} may keep running remotely): ${err}`);
+          return false;
+        }
+      }
+    })();
+    this.cancelInFlight = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.cancelInFlight === operation) this.cancelInFlight = null;
+    }
+  }
+
   private async streamTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api2/task-stream?id=${encodeURIComponent(taskId)}`;
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
 
     this.abortController = new AbortController();
+    // Per-connection lifetime clock (see field doc): null until this connection
+    // is confirmed established below. Reset PER streamTask invocation so a fetch
+    // that never connects can't inherit the previous connection's start time.
+    this.connectionStartedAtMs = null;
 
     try {
       const resp = await fetch(url, { headers, signal: this.abortController.signal });
       if (!resp.ok || !resp.body) {
         throw new Error(`SSE HTTP ${resp.status}`);
       }
+      // Connection established — start its lifetime clock. On break, catch
+      // compares elapsed against reconnectHealthyConnMs to decide whether this
+      // was a healthy ~183s-capped connection (refund budget) or a short-lived
+      // dead/hot-loop break (do not refund).
+      this.connectionStartedAtMs = Date.now();
 
-      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp), not
-      // here — resetting on every 200 would let a "connect OK → immediate
-      // clean EOF" loop retry forever.
+      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp) AND
+      // whenever a broken connection had LIVED ≥ reconnectHealthyConnMs (see the
+      // catch) — NOT unconditionally on every 200, which would let a "connect OK
+      // → instant EOF" loop retry forever (the hole the per-task-only reset
+      // originally guarded, which a naive "reset on connect/init" reopens).
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -870,10 +2150,29 @@ export class RiffBackend implements SessionBackend {
       if (taskId !== this.currentTaskId || this.completedTaskIds.has(taskId)) return;
       logger.warn(`[riff] SSE stream error: ${err}`);
 
+      // Core fix: an upstream proxy caps each task-stream connection at a fixed
+      // ~183s lifetime and closes it with a clean EOF (no done event) — verified
+      // against live data: tasks that "重连失败" had actually COMPLETED server-
+      // side; botmux gave up ~22s early on one, 16min early on another. A healthy
+      // long runner task thus breaks every ~183s. If this just-broken connection
+      // had LIVED long enough (≥ reconnectHealthyConnMs), it was such a healthy
+      // capped connection — refund the reconnect budget so those periodic caps
+      // never accumulate into a false failure, letting the task stream until it
+      // truly finishes. A short-lived break (dead endpoint that never connected,
+      // or a connect→instant-EOF hot loop against a stale-running orphan) does
+      // NOT refund, so it still exhausts the budget and bails (no infinite
+      // retry). Keyed on connection LIFETIME — not on connect/init receipt,
+      // which would refund every attempt and reopen the infinite-retry hole.
+      const connLivedMs = this.connectionStartedAtMs !== null ? Date.now() - this.connectionStartedAtMs : 0;
+      if (connLivedMs >= this.reconnectHealthyConnMs) this.reconnectAttempts = 0;
+
       // Attempt reconnect if task is still running
       if (!this.killed && !this.taskDone && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
-        const delay = 1000 * this.reconnectAttempts;
+        // Exponential backoff with a cap: 1s,2s,4s,8s,16s,30s(cap). Linear 1s/2s/3s
+        // was negligible against a ~180s connection lifetime anyway; the cap keeps
+        // a truly-unreachable gateway from stalling teardown for minutes.
+        const delay = Math.min(this.reconnectMaxDelayMs, this.reconnectBaseDelayMs * 2 ** (this.reconnectAttempts - 1));
         logger.info(`[riff] SSE reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
         this.emitLine(`[riff] 连接中断，正在重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
         await new Promise((r) => setTimeout(r, delay));
@@ -887,12 +2186,57 @@ export class RiffBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Fire a task's completion exactly once — the turn boundary + final-output
+   * fetch. Called from BOTH the `done` SSE event AND an `init` replay carrying a
+   * terminal status (the task finished while a prior connection was dead and its
+   * `done` was lost with the closed stream). Idempotency & staleness — per TASK,
+   * not per backend: streams can deliver done more than once (observed ~500ms
+   * apart live), and by the time a duplicate (or a reconnect's init replay)
+   * arrives, a queued follow-up may already be running as the NEXT task (write()
+   * reset the global taskDone). A plain boolean guard would re-fire the boundary
+   * mid-way through that next task and falsely mark it done, so gate on:
+   *   1) the completion must belong to the CURRENT task (stale streams no-op)
+   *   2) each task fires the boundary at most once (completedTaskIds)
+   */
+  private completeTask(taskId: string, status: string | undefined, exitCode: number | undefined): void {
+    if (taskId !== this.currentTaskId) return;
+    if (this.completedTaskIds.has(taskId)) return;
+    this.completedTaskIds.add(taskId);
+    // Bounded FIFO eviction — never a blanket clear(), which would drop the id
+    // just added and let its ~500ms duplicate done re-fire.
+    while (this.completedTaskIds.size > 64) {
+      const oldest = this.completedTaskIds.values().next().value!;
+      if (oldest === taskId) break;
+      this.completedTaskIds.delete(oldest);
+    }
+    this.taskDone = true;
+    if (this.config.injectStatusLines !== false) {
+      this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
+    }
+    // Fetch final output from task-detail API (SSE has no output events for
+    // runner tasks) BEFORE firing the turn boundary: the boundary flushes queued
+    // follow-ups → currentTaskId flips to the next task → the stale guard would
+    // (correctly) drop THIS task's only report.
+    if (status === 'completed' || status === 'failed') {
+      void this.fetchAndEmitOutput(taskId)
+        .catch(() => { /* logged inside */ })
+        .finally(() => { this.taskDoneCb?.(); });
+    } else {
+      this.taskDoneCb?.();
+    }
+  }
+
   private handleSseEvent(block: string, taskId: string): void {
     // Task isolation: once a newer task is current, EVERY event from an older
     // task's stream (output/log/init/session_info/done alike) is inert — a
     // stale stream must never write into the new task's log or replace its
     // sandbox URL.
     if (taskId !== this.currentTaskId) return;
+    // Any event from the current task's live stream is proof the sandbox is warm
+    // and talking — refresh the cold/hot clock so a follow-up right after gets the
+    // hot budget.
+    this.markActivity();
     // Standard SSE parsing: event type from `event:` line, data from `data:` lines
     // Also handle SSE comments (lines starting with `:`) — ignore them (heartbeats)
     let eventType = 'message';
@@ -944,44 +2288,27 @@ export class RiffBackend implements SessionBackend {
           if (changed && !this.accessUrlIsDirect) {
             void this.fetchDirectAccessUrl(taskId);
           }
+          // init REPLAYS the full accumulated task state, including a terminal
+          // `status` when the task finished while our previous connection was
+          // dead (the ~183s cap closes mid-flight and the `done` event is lost
+          // with it). Consume that replay: a terminal status here IS the missed
+          // completion — route it through the same completion path so the turn
+          // ends cleanly instead of the budget eventually exhausting into a
+          // false "重连失败". Non-terminal (running/pending/…) just means the
+          // reconnect resumed a still-live task — no completion, keep streaming.
+          if (eventType === 'init') {
+            const initStatus = data['status'] as string | undefined;
+            if (initStatus && TERMINAL_RIFF_STATUSES.has(initStatus)) {
+              const exitCode = data['exitCode'] as number | undefined;
+              this.completeTask(taskId, initStatus, exitCode);
+            }
+          }
           break;
         }
         case 'done': {
-          // Idempotency & staleness — per TASK, not per backend: streams can
-          // deliver done more than once (observed ~500ms apart live), and by
-          // the time the duplicate arrives a queued follow-up may already be
-          // running as the NEXT task (write() reset the global taskDone). A
-          // plain boolean guard would re-fire the turn-boundary callback mid-
-          // way through that next task and falsely mark it done, so gate on:
-          //   1) the done must belong to the CURRENT task (stale streams no-op)
-          //   2) each task fires the boundary at most once (completedTaskIds)
-          if (taskId !== this.currentTaskId) break;
-          if (this.completedTaskIds.has(taskId)) break;
-          this.completedTaskIds.add(taskId);
-          // Bounded FIFO eviction — never a blanket clear(), which would drop
-          // the id just added and let its ~500ms duplicate done re-fire.
-          while (this.completedTaskIds.size > 64) {
-            const oldest = this.completedTaskIds.values().next().value!;
-            if (oldest === taskId) break;
-            this.completedTaskIds.delete(oldest);
-          }
-          this.taskDone = true;
           const status = data['status'] as string | undefined;
           const exitCode = data['exitCode'] as number | undefined;
-          if (this.config.injectStatusLines !== false) {
-            this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
-          }
-          // Fetch final output from task-detail API (SSE has no output events
-          // for runner tasks) BEFORE firing the turn boundary: the boundary
-          // flushes queued follow-ups → currentTaskId flips to the next task →
-          // the stale guard would (correctly) drop THIS task's only report.
-          if (status === 'completed' || status === 'failed') {
-            void this.fetchAndEmitOutput(taskId)
-              .catch(() => { /* logged inside */ })
-              .finally(() => { this.taskDoneCb?.(); });
-          } else {
-            this.taskDoneCb?.();
-          }
+          this.completeTask(taskId, status, exitCode);
           // NOTE: task done does NOT trigger onExit — session stays alive
           // for follow-up messages. Only /close or unrecoverable errors exit.
           break;
@@ -991,9 +2318,34 @@ export class RiffBackend implements SessionBackend {
           const kind = data['kind'] as string | undefined;
           const group = (data['group'] as string | undefined)
             ?? (data['payload'] as Record<string, unknown> | undefined)?.['group'] as string | undefined;
-          // stdout logs are the real output stream — emit as data regardless of logLevel
+          // riff's route-B projection (feat/riff-agent-log-display): stdout log
+          // events may carry a `display: TaskLogDisplay` — a per-line, human-readable
+          // projection of a codex app-server event (回答 / 思路 / 命令 … ). When present,
+          // render the timeline row from it instead of the raw JSON line.
+          const display = data['display'] as RiffLogDisplay | undefined;
+          if (group === 'stdout' && display && typeof display.kind === 'string') {
+            this.emitDisplay(display);
+            break;
+          }
+          // stdout logs are the real output stream — emit as data regardless of logLevel.
+          // riff stores each stdout log line BARE (no trailing newline): the runner's
+          // logger persists `message` verbatim (Logger.createRootLog) and the SSE `log`
+          // event carries it as `text` unchanged (taskLog.ts runnerLog*→text: log.message).
+          // For codex_app_server that message is one `JSON.stringify(event)` per line. Since
+          // emitText only NORMALIZES existing newlines and never adds a separator, emitting
+          // the bare text would butt consecutive events together into one unreadable wall.
+          // Re-add the per-line separator here (safe & non-duplicating precisely because the
+          // stored line has no trailing newline). NOTE: the `output`/chunk path stays raw —
+          // those chunks may be partial lines, so they must NOT get a synthetic newline.
           if (group === 'stdout' && text) {
-            this.emitText(text);
+            // Defensive backstop: riff downgrades codex lifecycle "noise" lines
+            // (thread.started / item.started / usage-only turns) to channel:'raw',
+            // so a default subscription never receives them. But if an un-projected
+            // bare codex event ever slips through, suppress it rather than re-wall.
+            if (isBareCodexNoiseLine(text)) {
+              break;
+            }
+            this.emitText(`${text}\n`);
           } else if (this.config.logLevel === 'verbose' && text) {
             this.emitLine(`[riff:${kind ?? 'log'}] ${text}`);
           }
@@ -1046,8 +2398,9 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
+      this.applyExtraHeaders(headers);
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) return;
       const result = (await resp.json()) as {
@@ -1078,8 +2431,9 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
+      this.applyExtraHeaders(headers);
 
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) {

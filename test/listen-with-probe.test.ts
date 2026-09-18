@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, get, type Server } from 'node:http';
+import { connect, type Socket } from 'node:net';
 import { listenWithProbe } from '../src/utils/listen-with-probe.js';
 
 const open: Server[] = [];
@@ -23,6 +24,45 @@ function rawListen(s: Server, port: number, host = '127.0.0.1'): Promise<number>
 }
 afterEach(async () => { for (const s of open.splice(0)) await new Promise<void>(r => s.close(() => r())); });
 
+/**
+ * Reserve a port `p` such that `p + 1` is ALSO free right now, and return `p`
+ * with nothing bound.
+ *
+ * WHY: every case here exercises "requested port busy → step to port+1", so it
+ * needs a base port whose successor is available. Asking the OS for an ephemeral
+ * port (`listen(0)`) only guarantees the port itself — on a shared runner the
+ * neighbour can already be held by an unrelated process, and then
+ * `rawListen(mk(), busy + 1)` rejects with EADDRINUSE and the case fails on its
+ * own fixture. MEASURED on CI: `Failed to start server. Is port 33638 in use?`
+ * raised from rawListen, reported as "rejects once maxProbe is exhausted"
+ * failing — a fixture collision wearing the assertion's name.
+ *
+ * Probing both and retrying removes the assumption instead of widening a
+ * tolerance: we only proceed once the OS has told us both are bindable.
+ */
+async function reserveAdjacentPair(attempts = 40): Promise<number> {
+  for (let i = 0; i < attempts; i++) {
+    const probe = createServer();
+    const base = await new Promise<number>((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const a = probe.address();
+        resolve(typeof a === 'object' && a ? a.port : 0);
+      });
+    });
+    // Hold `base` while testing the neighbour, so nothing can slip into `base`
+    // between the two checks.
+    const neighbourFree = await new Promise<boolean>((resolve) => {
+      const nb = createServer();
+      nb.once('error', () => resolve(false));
+      nb.listen(base + 1, '127.0.0.1', () => nb.close(() => resolve(true)));
+    });
+    await new Promise<void>(r => probe.close(() => r()));
+    if (neighbourFree) return base;
+  }
+  throw new Error('could not reserve a free adjacent port pair');
+}
+
 describe('listenWithProbe', () => {
   it('binds the requested port when it is free', async () => {
     const port = await listenWithProbe({ server: mk(), port: 0, host: '127.0.0.1' });
@@ -30,10 +70,7 @@ describe('listenWithProbe', () => {
   });
 
   it('skips ports rejected by caller-specific availability checks', async () => {
-    const tmp = mk();
-    const start = await rawListen(tmp, 0);
-    await new Promise<void>(r => tmp.close(() => r()));
-    open.splice(open.indexOf(tmp), 1);
+    const start = await reserveAdjacentPair();
     const logs: string[] = [];
     const bound = await listenWithProbe({
       server: mk(),
@@ -47,7 +84,7 @@ describe('listenWithProbe', () => {
   });
 
   it('probes to the next port without crashing when the requested port is busy', async () => {
-    const busy = await rawListen(mk(), 0);
+    const busy = await rawListen(mk(), await reserveAdjacentPair());
     const logs: string[] = [];
     const bound = await listenWithProbe({ server: mk(), port: busy, host: '127.0.0.1', log: m => logs.push(m) });
     expect(bound).toBe(busy + 1);
@@ -55,7 +92,7 @@ describe('listenWithProbe', () => {
   });
 
   it('rejects (does not loop forever) once maxProbe is exhausted', async () => {
-    const busy = await rawListen(mk(), 0);
+    const busy = await rawListen(mk(), await reserveAdjacentPair());
     await rawListen(mk(), busy + 1);            // occupy the single probe target too
     let err: NodeJS.ErrnoException | null = null;
     await listenWithProbe({ server: mk(), port: busy, host: '127.0.0.1', maxProbe: 1 })
@@ -68,10 +105,7 @@ describe('listenWithProbe', () => {
     // A wildcard bind can succeed at the OS level yet be shadowed on loopback
     // (someone else holds 127.0.0.1:port and wins loopback routing). verifyBound
     // runs AFTER listen; returning false must close that binding and re-probe.
-    const tmp = mk();
-    const start = await rawListen(tmp, 0);
-    await new Promise<void>(r => tmp.close(() => r()));
-    open.splice(open.indexOf(tmp), 1);
+    const start = await reserveAdjacentPair();
 
     const verified: number[] = [];
     const logs: string[] = [];
@@ -117,4 +151,51 @@ describe('listenWithProbe', () => {
     expect(bound).not.toBe(sport);                 // did not settle on the shadowed port
     expect(await selfCheck(bound)).toBe(true);     // loopback to the bound port reaches US
   });
+
+  it('steps up even when a client is still parked on the rejected port', async () => {
+    // Regression, 2026-09: the dashboard silently stopped binding 7891 — no
+    // LISTEN, no step to 7892, not one log line. Cause: a stale process from an
+    // older checkout kept dialing 127.0.0.1:7891; our listen() accepted it and
+    // it then sat there without reading. server.close() only stops ACCEPTING —
+    // it waits for every already-accepted socket to drain — and the probe's
+    // tryNext() (the only thing that logs or steps) runs inside that callback.
+    // One parked socket therefore wedged the entire probe, invisibly.
+    //
+    // MEASURED on this shape: close() alone never fires its callback on either
+    // runtime (node 22 and bun both still pending at 10s); with
+    // closeAllConnections() it fires in 0-1ms. Hence the 4s budget below —
+    // generous for the fix, unreachable for the bug.
+    const start = await reserveAdjacentPair();
+    const parked: Socket[] = [];
+
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      maxProbe: 3,
+      verifyBound: async (p) => {
+        verified.push(p);
+        if (verified.length > 1) return true;
+        // Land a real connection on the port we are about to reject, and leave
+        // it open with an unanswered request — exactly what the stale process did.
+        await new Promise<void>((resolve) => {
+          const sock = connect(p, '127.0.0.1', () => {
+            sock.write('GET /__selfcheck HTTP/1.1\r\nHost: x\r\n\r\n');
+            parked.push(sock);
+            resolve();
+          });
+          sock.on('error', () => resolve());
+        });
+        return false;
+      },
+    });
+
+    try {
+      expect(verified[0]).toBe(start);        // it really bound and rejected `start`
+      expect(bound).toBeGreaterThan(start);   // …and still got past it
+    } finally {
+      for (const sock of parked) sock.destroy();
+    }
+  }, 4000);
 });

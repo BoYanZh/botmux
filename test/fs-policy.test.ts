@@ -14,11 +14,18 @@ import {
   compileToBwrap,
   migrateLegacySandboxFields,
   computeNoTransportAuthorityRoots,
+  larkCliLinuxStorePath,
+  larkCliChildDataRoot,
+  resolveLarkCliLinuxStoreDir,
+  cleanPosixAbsPath,
   FsPolicyConfigError,
   type FsPolicyContext,
   type FsRule,
 } from '../src/adapters/cli/fs-policy.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -103,6 +110,133 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it('keeps daemon host-only roots denied even under broad or nested allows', () => {
+    const root = '/Users/u/.botmux/data/schedule-preconditions';
+    const externalServiceCredential = '/Users/u/.service/credential.json';
+    const p = buildFsPolicy(ctx({
+      workingDir: '/Users/u',
+      hostOnlyDenyPaths: [root],
+      userPaths: {
+        readWrite: [`${root}/nested`],
+        readOnly: [`${root}/inspect`],
+      },
+      readonlyRoots: [`${root}/adapter-view`],
+      serviceCredentialReadOnlyPaths: [
+        `${root}/service-credential.json`,
+        externalServiceCredential,
+      ],
+      mandatoryReadOnlyPaths: [`${root}/late-readonly-carveout`],
+    }));
+
+    expect(accessForPath(p.rules, `${root}/record.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${root}/nested/file`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${root}/service-credential.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, externalServiceCredential).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(externalServiceCredential);
+    expect(p.finalReadOnlyPaths).not.toContain(`${root}/service-credential.json`);
+    expect(p.finalReadOnlyPaths).not.toContain(`${root}/late-readonly-carveout`);
+    expect(p.suppressedHostOnlyPaths).toEqual([
+      `${root}/adapter-view`,
+      `${root}/inspect`,
+      `${root}/late-readonly-carveout`,
+      `${root}/nested`,
+      `${root}/service-credential.json`,
+    ]);
+  });
+
+  it('rejects a sandbox workingDir inside a daemon host-only root', () => {
+    const root = '/Users/u/.botmux/data/schedule-preconditions';
+    expect(() => buildFsPolicy(ctx({
+      workingDir: `${root}/nested`,
+      hostOnlyDenyPaths: [root],
+    }))).toThrow(/workingDir .* daemon-owned host-only root/);
+  });
+
+  it('isolates OMP transcripts while keeping shared agent state and only the current sid writable', () => {
+    const adapter = createOhMyPiAdapter('/usr/bin/omp');
+    const sessionsRoot = '/home/u/.omp/agent/sessions';
+    const ownSessionDir = `${sessionsRoot}/botmux/self`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+
+    for (const path of [
+      '/home/u/.omp/agent/agent.db',
+      '/home/u/.omp/agent/agent.db-wal',
+      '/home/u/.omp/agent/config.yml',
+      '/home/u/.omp/agent/terminal-sessions/pane',
+      `${ownSessionDir}/turn.jsonl`,
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    expect(accessForPath(p.rules, sessionsRoot).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/secret.jsonl`).access).toBe('deny');
+
+    const { args } = compileToBwrap(p, {
+      emptyDir: '/sbx/empty',
+      emptiesDir: '/sbx/empties',
+      chdir: '/home/u/proj',
+    });
+    const mask = args.indexOf(sessionsRoot);
+    const carve = args.indexOf(ownSessionDir);
+    expect(args[mask - 1]).toBe('--tmpfs');
+    expect(carve).toBeGreaterThan(mask);
+    expect(args[carve - 1]).toBe('--bind');
+    expect(args.lastIndexOf(sessionsRoot)).toBeGreaterThan(carve);
+    expect(args[args.lastIndexOf(sessionsRoot) - 1]).toBe('--remount-ro');
+  });
+
+  it('isolates ebsd sibling transcripts while retaining service state', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const sessionsRoot = '/home/u/.ebsd/agent/sessions';
+    const ownSessionDir = `${sessionsRoot}/botmux/self`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+    expect(accessForPath(p.rules, '/home/u/.ebsd/agent/agent.db').access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${ownSessionDir}/turn.jsonl`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/secret.jsonl`).access).toBe('deny');
+  });
+
+  it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
+    const adapter = createReasonixAdapter('/usr/bin/reasonix');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+    }));
+    for (const path of [
+      '/home/u/.reasonix/machine-id.key',
+      '/home/u/.reasonix/projects/-home-u-proj/sessions/s.jsonl.lease.json',
+      '/home/u/.reasonix/skills/botmux-send/SKILL.md',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+  });
+
   it('darwin baseline: system ro, scratch rw, crown jewels denied, lark-cli store denied', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/System/Library/Frameworks/x').access).toBe('readOnly');
@@ -156,6 +290,21 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/home/u/.cargo/registry/x').access).toBe('readOnly');
   });
 
+  it.each(['darwin', 'linux'] as const)('keeps shared reply-card records and lock files inaccessible on %s', platform => {
+    const homeDir = platform === 'darwin' ? '/Users/u' : '/home/u';
+    const botmuxHome = `${homeDir}/.botmux`;
+    const sessionDataDir = `${botmuxHome}/data`;
+    const p = buildFsPolicy(ctx({ platform, homeDir, botmuxHome, sessionDataDir,
+      botHome: `${botmuxHome}/bots/cli_self`, workingDir: `${homeDir}/proj` }));
+    for (const suffix of ['', '/record.json', '/record.json.lock', '/record-reply.md',
+      '/.file-lock-stale-claim-test/owner.candidate-123-uuid']) {
+      expect(accessForPath(p.rules, `${sessionDataDir}/turn-reply-cards${suffix}`).access).toBe('none');
+    }
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/s.jsonl`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/other.jsonl`).access).toBe('none');
+    expect(accessForPath(p.rules, `${sessionDataDir}/bots-info.json`).access).toBe('readOnly');
+  });
+
   it('botmux CLI runtime surface is an ALLOW-LIST (deny-by-default): install dir + a small ~/.botmux set readable, everything else — incl. creds + cross-bot — inaccessible', () => {
     const p = buildFsPolicy(ctx({ botmuxInstallRoot: '/opt/botmux' }));
     // install dir readable (hooks exec node <install>/dist/cli.js — verified live: without this, EPERM)
@@ -168,7 +317,15 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons/cli_x.json').access).toBe('readOnly'); // daemon IPC discovery
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own
+    // own session store = the per-bot SQLite DIRECTORY (dir grant, not file binds:
+    // SQLite recreates -wal/-shm, so a pinned inode would read a dead WAL forever)
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-wal').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
+    // …and the bot's OWN pre-SQLite `sessions-<self>.json` is NOT granted any more:
+    // it is a one-shot import source the store never reads at runtime, so the
+    // allow-list stops covering it (narrower surface, not a weakened assertion).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');        // OWN session marker only
     // blocker #4: turn-sends is granted per-session-FILE, not the whole dir —
     // another session's marker is NOT writable (can't corrupt its send-dedup).
@@ -189,6 +346,12 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
+    // sibling session stores stay deny-by-default: neither the store DIR nor any
+    // file in it is covered (the grant is scoped to `session-stores/<self>`).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
+    // the shared parent is not granted either — no umbrella over every bot's store
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_other.json').access).toBe('none'); // sibling
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
@@ -196,6 +359,7 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m/f.pdf').access).toBe('none');
     // a file created AFTER spawn (codex #3 fail-open) is ALSO denied — allow-list, not enumeration
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_futureBot.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_futureBot/sessions.db').access).toBe('none');
   });
 
   it('lark-cli key store: OWN appsecret + master.key readable, siblings denied (verified live: without this `lark-cli auth` fails EPERM)', () => {
@@ -207,18 +371,158 @@ describe('buildFsPolicy', () => {
     // siblings' ciphertext + tokens stay denied → master key alone can't decrypt them
     expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
     expect(accessForPath(p.rules, `${store}/cli_other_ou_x.enc`).access).toBe('deny');
-    // linux keeps lark keys in ~/.lark-cli-bots/<self> → no darwin carve-out there
+    // linux never emits the macOS `Library/…` keystore rule (it has its OWN store
+    // carve-out under ~/.local/share/lark-cli — asserted in the next test)
     const lin = buildFsPolicy(ctx({ platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self', botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj' }));
     expect(lin.rules.some(r => r.path.includes('Library/Application Support/lark-cli'))).toBe(false);
+  });
+
+  it('LINUX lark-cli key store: OWN appsecret + master.key readable, siblings/token/future-file denied, toolchain not clobbered (cross-bot leak fix)', () => {
+    // lark-cli on Linux writes keys to `$HOME/.local/share/lark-cli` (or `<LARKSUITE_CLI_DATA_DIR>/lark-cli`)
+    // (verified live: appsecret_<appId>.enc + master.key, NOT master.key.file), which
+    // the baseline `ro(~/.local/share)` grant otherwise exposed read-only to every
+    // sandboxed bot — the cross-bot impersonation hole macOS already closed. This is
+    // the Linux mirror of the darwin carve-out test above.
+    const linCtx = { platform: 'linux' as const, homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self', botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj' };
+    const p = buildFsPolicy(ctx(linCtx)); // currentAppId = cli_self, default store
+    const store = '/home/u/.local/share/lark-cli';
+    // own material re-allowed (deeper than the store deny → longest-prefix-wins)
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    // the store DIR itself is denied — the pre-fix `ro(~/.local/share)` exposure
+    expect(accessForPath(p.rules, store).access).toBe('deny');
+    // siblings' ciphertext + user tokens stay denied → master key can't decrypt them
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/cli_other_ou_x.enc`).access).toBe('deny');
+    // future files under the store are denied-by-default (deny of the whole dir)
+    expect(accessForPath(p.rules, `${store}/future_new_secret.enc`).access).toBe('deny');
+    // darwin's master.key.file NAME does NOT get a Linux carve-out (Linux uses master.key)
+    expect(accessForPath(p.rules, `${store}/master.key.file`).access).toBe('deny');
+    // the REST of ~/.local/share (toolchains: pipx, bytedcli SSO, etc.) stays readable
+    // — the deny is scoped to the lark-cli subdir, not the whole default data root.
+    expect(accessForPath(p.rules, '/home/u/.local/share/some-toolchain/bin').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/home/u/.local/share/bytedcli/data/sso.json').access).toBe('readOnly');
+  });
+
+  it('LINUX lark-cli key store: BOTH the custom store AND the default are locked (no dependence on the lark-cli env-value validator); darwin unaffected', () => {
+    // A custom LARKSUITE_CLI_DATA_DIR moves the store OUT of ~/.local/share. lark-cli
+    // opens EITHER the custom store (value accepted) OR the default (value rejected by its
+    // control-char/bidi validator, which we do NOT replicate). So the policy locks BOTH:
+    // deny both dirs + carve own keys in both. Whichever lark-cli picks, siblings + master
+    // stay denied (no leak) and own keys are readable (auth works).
+    const store = '/data00/cli-data/lark-cli';
+    const dflt = '/home/u/.local/share/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: store,
+    }));
+    // custom store: own keys RO, siblings + dir denied
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, store).access).toBe('deny');
+    // DEFAULT store ALSO locked (the fix): own keys RO there too, siblings denied — so if
+    // lark-cli rejected the custom value and fell back here, the shared keystore is NOT
+    // left exposed read-only under baseline ro(~/.local/share).
+    expect(accessForPath(p.rules, dflt).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dflt}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dflt}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dflt}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    // darwin never emits a Linux store rule even when larkCliLinuxStore is set
+    const dar = buildFsPolicy(ctx({ larkCliLinuxStore: store }));
+    expect(dar.rules.some(r => r.path === store)).toBe(false);
+  });
+
+  it('LINUX lark-cli key store: default-only case (no custom store) dedupes to ONE store, unchanged behavior', () => {
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      // larkCliLinuxStore omitted → resolver default == /home/u/.local/share/lark-cli
+    }));
+    const dflt = '/home/u/.local/share/lark-cli';
+    expect(accessForPath(p.rules, `${dflt}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dflt}/appsecret_cli_other.enc`).access).toBe('deny');
+    // exactly ONE deny rule for the store path (resolved == default, deduped)
+    expect(p.rules.filter(r => r.path === dflt && r.access === 'deny')).toHaveLength(1);
+  });
+
+  it('LINUX symlinked-leaf degrade precondition: when the canonical custom store basename != lark-cli (child falls back to default), BOTH the custom AND default stores are locked (no leak on fallback)', () => {
+    // The symlinked-leaf case: worker resolved larkCliLinuxStore to a canonical dir whose
+    // basename is NOT `lark-cli` (e.g. `data/lark-cli` → `elsewhere/keys`), so
+    // larkCliChildDataRoot returns null and the child degrades to the DEFAULT store. That
+    // degrade is only SAFE if the policy locks BOTH the canonical custom store AND the
+    // default (the safety precondition) — else the store the child actually opens on
+    // fallback would be exposed. Assert both are deny+own-carve, siblings denied in both.
+    const customCanon = '/data00/elsewhere/keys';   // canonical custom (basename 'keys')
+    const dflt = '/home/u/.local/share/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: customCanon,
+    }));
+    for (const s of [customCanon, dflt]) {
+      expect(accessForPath(p.rules, s).access).toBe('deny');
+      expect(accessForPath(p.rules, `${s}/appsecret_cli_other.enc`).access).toBe('deny');     // sibling — no leak
+      expect(accessForPath(p.rules, `${s}/master.key`).access).toBe('readOnly');              // own auth works on either
+      expect(accessForPath(p.rules, `${s}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    }
+  });
+
+  it('LINUX lark-cli key store NESTED INSIDE BOT_HOME (LARKSUITE_CLI_DATA_DIR=<BOT_HOME>): own keys RO, siblings deny — transport', () => {
+    // nested-authority surface: a deployment may set LARKSUITE_CLI_DATA_DIR into BOT_HOME so
+    // the store resolves to `<BOT_HOME>/lark-cli`. The transport carve-out must STILL
+    // isolate — the store deny + own-key carve-out ride on top of the BOT_HOME rw grant
+    // (deeper prefix wins), so siblings/master stay isolated even though the whole
+    // BOT_HOME is otherwise writable.
+    const botHome = '/home/u/.botmux/bots/cli_self';
+    const store = `${botHome}/lark-cli`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome,
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: store,
+    }));
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    // BOT_HOME scratch OUTSIDE the store stays writable (the carve-out is scoped)
+    expect(accessForPath(p.rules, `${botHome}/scratch.txt`).access).toBe('readWrite');
+  });
+
+  it('LINUX lark-cli key store EXACTLY ON BOT_HOME (store===botHome): store deny outranks the BOT_HOME rw grant — transport', () => {
+    // Equality edge of the nested-authority fix: a deployment can wire the store ONTO
+    // BOT_HOME itself (appId 'lark-cli' — assertSafeAppId is charset-only, no `cli_`
+    // prefix enforcement — plus LARKSUITE_CLI_DATA_DIR=<botmuxHome>/bots). The internal
+    // BOT_HOME readWrite grant then lands on the SAME path as the store deny; the deny
+    // must be tagged `mandatory` (rank 4 > internal 2) or the whole keystore — siblings
+    // included — goes readWrite by same-path source rank. Own-key carve-outs still win by depth.
+    const botHome = '/home/u/.botmux/bots/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome, currentAppId: 'lark-cli',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: botHome,
+    }));
+    expect(accessForPath(p.rules, botHome).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_lark-cli.enc`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_cli_other.enc`).access).toBe('deny');
   });
 
   it('internal injections: workingDir + BOT_HOME rw, own session store + attachments ro; siblings uncovered', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/Users/u/proj/src/x.ts').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x.jsonl').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
+    // own session store: the per-bot SQLite dir (and everything inside it) is ro
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-shm').access).toBe('readOnly');
+    // the legacy `sessions-<self>.json` is a one-shot import source, never read at
+    // runtime → deliberately NOT granted (was readOnly before the SQLite-only cut)
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
     // siblings simply not covered under the allow-list → inaccessible
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m1/f.pdf').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m1/f.pdf').access).toBe('none');
   });
@@ -449,6 +753,33 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     // (the #605 P1 namespace bug — canonical vs lexical divergence under symlinked $HOME).
     expect(src).not.toMatch(/declaredAuthPaths:\s*\[\.\.\.\(cliAdapter\.authPaths[\s\S]*?\)\]\.map\(expandTilde\)(?!Lexical)/);
     expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+  });
+
+  it('WIRING GUARD: worker routes exact service credentials through their dedicated policy channel', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain("import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';");
+    expect(src).toMatch(/const serviceCredentialReadOnlyPaths\s*=\s*resolveServiceSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
+    expect(src).toMatch(/const fsPolicyCtx[\s\S]*?serviceCredentialReadOnlyPaths,/);
+    expect(src).not.toContain('mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles');
+    expect(src).toContain("if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);");
+  });
+
+  it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
+    expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
+    // ebsd shares the same exact-session carve-out shape through its own
+    // adapter-owned session dir; both feed the generalized managed dir.
+    expect(src).toMatch(/import \{[^}]*ebsdBotmuxSessionDir[^}]*\} from '\.\/adapters\/cli\/ebsd\.js';/);
+    expect(src).toMatch(/ebsdCurrentSessionDir\s*=\s*cliAdapter\.id === 'ebsd'[\s\S]*?ebsdBotmuxSessionDir\(effectiveAdapterSessionId\)/);
+    expect(src).toContain('const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;');
+    const precreate = src.indexOf('if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir');
+    const policyAssembly = src.indexOf('const fsPolicyCtx =', precreate);
+    expect(precreate).toBeGreaterThan(-1);
+    expect(policyAssembly).toBeGreaterThan(precreate);
+    expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
+    expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
+    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
@@ -833,6 +1164,161 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/sibling/send-cred.json').access).toBe('deny');
   });
 
+  it('suppresses service credentials inside authority roots without filtering other mandatory read-only grants', () => {
+    const serviceSecret = '/Users/u/.botmux/.dashboard-secret';
+    const capability = '/Users/u/.botmux/data/origin-capability';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      mandatoryReadOnlyPaths: [capability],
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+    expect(accessForPath(p.rules, capability).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(capability);
+  });
+
+  it('suppresses service credentials inside Linux authority roots too', () => {
+    const serviceSecret = '/home/u/.botmux/.dashboard-secret';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      larkTransportEnabled: false,
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+    }));
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+  });
+
+  it('keeps external service credentials mandatory read-only under no-transport', () => {
+    const serviceSecret = '/run/secrets/ebsd-diag-token';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      userPaths: { readWrite: [serviceSecret] },
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths ?? []).not.toContain(serviceSecret);
+  });
+
+  it('LINUX no-transport: the lark-cli keystore is frozen with NO own-key carve-out (unlike transport-enabled)', () => {
+    // A no-transport (apiOnly / HTTP-virtual) turn has no Feishu sender identity, so
+    // it gets NO lark-cli credential at all — not even its OWN master.key. The store
+    // is an authority root: denied wholesale, and the transport-only own-key carve-out
+    // is gated OFF. This closes the no-transport path that previously left the shared
+    // Linux keystore readable. workingDir=~ is worst case.
+    const store = '/home/u/.local/share/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome: '/home/u/.botmux/bots/cli_self', redirectedCliData: false, authPaths: ['/home/u/.codex'],
+    }));
+    expect(accessForPath(p.rules, store).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('deny');        // OWN key too — no carve-out
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    // model CLI's own auth still works (not a Feishu cred)
+    expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
+  it('LINUX no-transport: store EXACTLY ON BOT_HOME (store===botHome) — hostile user RW at master.key is STILL dropped', () => {
+    // Equality edge of the per-root BOT_HOME exception: when the store root IS botHome,
+    // the exception must NOT fire (it is meant only for STRICT ancestors like the botmux
+    // root), or a hostile userPaths.readWrite straight at master.key escapes dropAuthority
+    // and wins by depth — the exact escape the nested-root fix closed, re-opened at equality.
+    const botHome = '/home/u/.botmux/bots/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u/proj',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome, currentAppId: 'lark-cli', redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      larkCliLinuxStore: botHome,
+      userPaths: { readWrite: [`${botHome}/master.key`, `${botHome}/appsecret_lark-cli.enc`] },
+    }));
+    expect(accessForPath(p.rules, `${botHome}/master.key`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_lark-cli.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_cli_other.enc`).access).toBe('deny');
+  });
+
+  it('LINUX no-transport: BOTH candidate stores frozen when a custom LARKSUITE_CLI_DATA_DIR is set (both-candidate lock)', () => {
+    // no-transport must deny whichever store lark-cli opens — custom OR default — without
+    // depending on lark-cli's env-value validator. Both are authority roots, zero carve-out.
+    const custom = '/data00/cli-data/lark-cli';
+    const dflt = '/home/u/.local/share/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome: '/home/u/.botmux/bots/cli_self', redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      larkCliLinuxStore: custom,
+    }));
+    for (const s of [custom, dflt]) {
+      expect(accessForPath(p.rules, s).access).toBe('deny');
+      expect(accessForPath(p.rules, `${s}/master.key`).access).toBe('deny');            // no carve-out
+      expect(accessForPath(p.rules, `${s}/appsecret_cli_self.enc`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${s}/appsecret_cli_other.enc`).access).toBe('deny');
+    }
+    expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
+  it('LINUX no-transport: a HOSTILE deeper user sandboxPaths.readWrite cannot re-open the keystore', () => {
+    // deepest-prefix-wins: dropAuthority must strip a nested user grant that targets
+    // the frozen store BEFORE merge, else it would beat the shallow authority deny.
+    const store = '/home/u/.local/share/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome: '/home/u/.botmux/bots/cli_self', redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      userPaths: { readWrite: [`${store}/appsecret_cli_other.enc`, store] },
+    }));
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('deny');
+  });
+
+  it('LINUX no-transport: keystore NESTED INSIDE BOT_HOME still denies — BOT_HOME carve-out must not shadow a nested authority', () => {
+    // The reproduced escape: LARKSUITE_CLI_DATA_DIR=<BOT_HOME> → store=<BOT_HOME>/lark-cli.
+    // The old `insideAuthority = under(anyRoot) && !under(botHome)` exempted EVERYTHING
+    // under BOT_HOME, so a deeper hostile user RW under the nested store escaped
+    // dropAuthority and `master.key` resolved readWrite. The per-root BOT_HOME exception
+    // (only exempts a root that is an ANCESTOR of BOT_HOME) must keep the nested store
+    // restricting. Exercise ALL hostile channels: user RW/RO, readonlyRoots, extraWrite.
+    const botHome = '/home/u/.botmux/bots/cli_self';
+    const store = `${botHome}/lark-cli`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome, redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      larkCliLinuxStore: store,
+      userPaths: {
+        readWrite: [`${store}/master.key`, `${store}/appsecret_cli_other.enc`, store],
+        readOnly: [`${store}/appsecret_cli_sneaky.enc`],
+      },
+      readonlyRoots: [`${store}/via-readonly.enc`],
+      extraWritePaths: [`${store}/via-extrawrite.enc`],
+    }));
+    // NO channel may re-open any keystore file — all must resolve deny
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('deny');            // the reproduced leak
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_sneaky.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/via-readonly.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/via-extrawrite.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, store).access).toBe('deny');
+    // own appsecret ALSO denied under no-transport (no carve-out at all), and the
+    // dropped hostile paths are recorded for diagnosability.
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('deny');
+    expect(p.suppressedAuthorityPaths?.some(s => s.startsWith(store))).toBe(true);
+    // BOT_HOME scratch OUTSIDE the nested store stays writable (exception still valid there)
+    expect(accessForPath(p.rules, `${botHome}/scratch.txt`).access).toBe('readWrite');
+    // ~/.codex (CLI's own auth, outside every authority root) still works
+    expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
   it('KEEPS the model CLI own auth (~/.codex) readWrite under no-transport — core functionality intact', () => {
     // The regression codex caught: authPaths are the CLI's OWN login (not Feishu),
     // so a core-only turn must still authenticate its CLI. ~/.codex stays RW even
@@ -867,6 +1353,28 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.codex/auth.json').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
     // bots.json (sibling secrets) is baseline-denied for normal bots too.
+  });
+
+  it('DARWIN no-transport is byte-identical to pre-refactor: the Linux keystore paths are NOT frozen (cross-platform gate)', () => {
+    // The Linux-store additions to computeNoTransportAuthorityRoots must be platform-gated,
+    // or macOS no-transport behavior changes: a workingDir under ~/.local/share/lark-cli
+    // (a normal macOS dir — macOS lark-cli uses the Library/… store) would newly fail
+    // `working-dir-is-authority`, and that dir would be spuriously denied. Assert neither.
+    // (1) workingDir under ~/.local/share/lark-cli must NOT throw on darwin
+    expect(() => buildFsPolicy(ctx({
+      platform: 'darwin', larkTransportEnabled: false, workingDir: '/Users/u/.local/share/lark-cli',
+      redirectedCliData: false, authPaths: ['/Users/u/.codex'],
+      larkCliLinuxStore: '/Users/u/.local/share/lark-cli',  // worker computes this on darwin too; must be ignored
+    }))).not.toThrow();
+    // (2) ~/.local/share/lark-cli is NOT specially frozen on darwin (workingDir=~ worst case)
+    const p = buildFsPolicy(ctx({
+      platform: 'darwin', larkTransportEnabled: false, workingDir: '/Users/u',
+      redirectedCliData: false, authPaths: ['/Users/u/.codex'],
+      larkCliLinuxStore: '/Users/u/.local/share/lark-cli',
+    }));
+    // the macOS keystore is still frozen (darwin's real store); the Linux path is not.
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
+    expect(p.rules.some(r => r.path === '/Users/u/.local/share/lark-cli')).toBe(false);
   });
 
   it('denies the trusted-host HMAC + port table (escalation vector) even with workingDir=~', () => {
@@ -1043,7 +1551,7 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
   it('computeNoTransportAuthorityRoots dedupes when configured === default and includes lark-cli stores', () => {
     // Pure-helper unit lock: the provenance logic the worker's real assembly uses.
     const roots = computeNoTransportAuthorityRoots({
-      homeDir: '/home/u', botmuxHome: '/home/u/.botmux', defaultBotmuxHome: '/home/u/.botmux',
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux', defaultBotmuxHome: '/home/u/.botmux',
     });
     expect(roots).toEqual(expect.arrayContaining([
       '/home/u/.botmux', '/home/u/.lark-cli', '/home/u/.lark-cli-bots',
@@ -1052,9 +1560,100 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(roots.filter(r => r === '/home/u/.botmux')).toHaveLength(1);
     // distinct configured root is added too
     const dual = computeNoTransportAuthorityRoots({
-      homeDir: '/home/u', botmuxHome: '/srv/botmux', defaultBotmuxHome: '/home/u/.botmux',
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/srv/botmux', defaultBotmuxHome: '/home/u/.botmux',
     });
     expect(dual).toEqual(expect.arrayContaining(['/srv/botmux', '/home/u/.botmux']));
+  });
+
+  it('computeNoTransportAuthorityRoots freezes the Linux keystore ONLY on linux (default + custom); darwin gets NEITHER', () => {
+    // linux default: LARKSUITE_CLI_DATA_DIR unset → store under ~/.local/share
+    const def = computeNoTransportAuthorityRoots({ platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux' });
+    expect(def).toEqual(expect.arrayContaining(['/home/u/.local/share/lark-cli']));
+    // linux custom store (worker resolved an absolute LARKSUITE_CLI_DATA_DIR) is frozen too
+    const custom = computeNoTransportAuthorityRoots({
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux', larkCliLinuxStore: '/data00/cli-data/lark-cli',
+    });
+    expect(custom).toEqual(expect.arrayContaining(['/data00/cli-data/lark-cli', '/home/u/.local/share/lark-cli']));
+    // DARWIN: the Linux store paths must NOT be added (macOS uses the Library/… store, which
+    // IS present). Freezing ~/.local/share/lark-cli on darwin would change darwin behavior
+    // (cross-platform regression) — assert it's absent even if larkCliLinuxStore is passed.
+    const dar = computeNoTransportAuthorityRoots({
+      platform: 'darwin', homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux', larkCliLinuxStore: '/Users/u/.local/share/lark-cli',
+    });
+    expect(dar).toEqual(expect.arrayContaining(['/Users/u/Library/Application Support/lark-cli'])); // macOS store still frozen
+    expect(dar).not.toContain('/Users/u/.local/share/lark-cli');   // Linux default NOT added
+    expect(dar.some(r => r === '/Users/u/.local/share/lark-cli')).toBe(false);
+  });
+
+  it('resolveLarkCliLinuxStoreDir mirrors lark-cli SafeEnvDirPath (absolute Cleaned; relative/tilde/empty/control-char → $HOME; XDG ignored)', () => {
+    // strace-verified against lark-cli v1.0.76 keychain_other.go::StorageDir + SafeEnvDirPath:
+    // absolute LARKSUITE_CLI_DATA_DIR → <clean(value)>/lark-cli
+    expect(resolveLarkCliLinuxStoreDir('/data00/cli-data', '/home/u')).toBe('/data00/cli-data/lark-cli');
+    // a `..`-bearing absolute value is CLEANED (lark-cli does filepath.Clean),
+    // NOT rejected+fallback — else policy anchors the default while lark-cli opens the real dir.
+    expect(resolveLarkCliLinuxStoreDir('/srv/review/data/../actual', '/home/u')).toBe('/srv/review/actual/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/a/b/../../etc', '/home/u')).toBe('/etc/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/srv/review/actual//', '/home/u')).toBe('/srv/review/actual/lark-cli'); // // collapsed
+    expect(resolveLarkCliLinuxStoreDir('/srv/../..', '/home/u')).toBe('/lark-cli');                             // .. clamped at root
+    // unset / empty → $HOME/.local/share/lark-cli
+    expect(resolveLarkCliLinuxStoreDir(undefined, '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    // RELATIVE / tilde values are spec-invalid → lark-cli IGNORES them, falls back to
+    // $HOME (verified by strace: `relseg/x` and `~/t` both opened ~/.local/share).
+    expect(resolveLarkCliLinuxStoreDir('relseg/x', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('~/tildetest', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('.', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    // CONTROL CHARS are rejected by lark-cli's validator → fallback to $HOME (strace-verified)
+    expect(resolveLarkCliLinuxStoreDir('/srv/\x01bad', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/srv/\x00nul', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+  });
+
+  it('cleanPosixAbsPath: Go filepath.Clean semantics + control-char rejection (mirrors lark-cli SafeEnvDirPath)', () => {
+    expect(cleanPosixAbsPath('/a/b/../c')).toBe('/a/c');
+    expect(cleanPosixAbsPath('/a/./b//c/')).toBe('/a/b/c');
+    expect(cleanPosixAbsPath('/a/../../b')).toBe('/b');   // .. clamps at root
+    expect(cleanPosixAbsPath('/')).toBe('/');
+    expect(cleanPosixAbsPath('/srv/../..')).toBe('/');
+    // non-absolute → null
+    expect(cleanPosixAbsPath('rel/x')).toBeNull();
+    expect(cleanPosixAbsPath('~/x')).toBeNull();
+    expect(cleanPosixAbsPath('')).toBeNull();
+    // control chars → null (lark-cli treats as invalid)
+    expect(cleanPosixAbsPath('/a/\x01b')).toBeNull();
+    expect(cleanPosixAbsPath('/a/\x7f')).toBeNull();
+    expect(cleanPosixAbsPath('/a/\nb')).toBeNull();
+  });
+
+  it('larkCliLinuxStorePath: override wins; unnormalizable override → NULL (no carve-out), never silent default fallback', () => {
+    // a clean absolute override is used verbatim
+    expect(larkCliLinuxStorePath('/home/u', '/data00/cli-data/lark-cli')).toBe('/data00/cli-data/lark-cli');
+    // no override → default under homeDir
+    expect(larkCliLinuxStorePath('/home/u')).toBe('/home/u/.local/share/lark-cli');
+    // a `..`-bearing override must NOT silently fall back to the default
+    // store (that leaves the real store exposed). It returns NULL → buildFsPolicy emits
+    // NO Linux carve-out and the store stays denied-by-default. (In practice the worker
+    // Cleans first via resolveLarkCliLinuxStoreDir, so a `..` never reaches here.)
+    expect(larkCliLinuxStorePath('/home/u', '/a/../b')).toBeNull();
+    expect(larkCliLinuxStorePath('/home/u', 'relative')).toBeNull();
+  });
+
+  it('larkCliChildDataRoot: same-source pin when basename is lark-cli; null (safe degrade) for a symlinked leaf to a different name', () => {
+    // common / symlink-to-same-name: canonical store basename is `lark-cli` →
+    // pin = dirname, so child opens <pin>/lark-cli == the policy-protected store.
+    expect(larkCliChildDataRoot('/home/u/.local/share/lark-cli')).toBe('/home/u/.local/share');
+    expect(larkCliChildDataRoot('/data00/cli-data/lark-cli')).toBe('/data00/cli-data');
+    expect(larkCliChildDataRoot('/other/lark-cli')).toBe('/other');       // symlink resolved to another lark-cli dir
+    // symlinked `lark-cli` leaf → canonical basename differs → NULL (worker pins nothing;
+    // child falls back to the default store, which is ALSO locked → no leak, auth degrades).
+    expect(larkCliChildDataRoot('/tmp/elsewhere/keys')).toBeNull();
+    expect(larkCliChildDataRoot('/store')).toBeNull();                    // basename 'store' != lark-cli
+    // unusable inputs
+    expect(larkCliChildDataRoot(null)).toBeNull();
+    expect(larkCliChildDataRoot(undefined)).toBeNull();
+    expect(larkCliChildDataRoot('/')).toBeNull();
+    expect(larkCliChildDataRoot('relative/lark-cli')).toBeNull();         // not absolute
+    // a store directly at root: /lark-cli → pin '/'
+    expect(larkCliChildDataRoot('/lark-cli')).toBe('/');
   });
 
   it('CLI runtime still works under no-transport (.data-dir / bin / bots-info / own session)', () => {
@@ -1062,6 +1661,13 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/.data-dir').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    // the legacy `sessions-<self>.json` is no longer allow-listed, so under
+    // no-transport it falls back to the frozen ~/.botmux authority deny.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
+    // sibling store dirs get no carve-out out of that authority deny either
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('deny');
     expect(accessForPath(p.rules, '/opt/botmux/dist/cli.js').access).toBe('readOnly');
   });
 
@@ -1105,5 +1711,62 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     // and the Feishu authority is still denied in both cases
     expect(accessForPath(p.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
     expect(accessForPath(cold.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
+  });
+});
+
+// Trigger-user CLI identity: the wrapper on PATH sources the per-session
+// identity file on every invocation, so a sandboxed session must be able to READ
+// exactly its own — and nothing else. The grant is per file, never the shared
+// `cli-identity/` parent, because that parent holds every concurrent session's
+// file and each one carries a live token belonging to a different person.
+describe('buildFsPolicy — trigger-user CLI identity', () => {
+  const dataDir = '/Users/u/.botmux/data';
+
+  it('grants this session\'s identity files read-only', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    for (const tool of ['lark-cli', 'bytedcli']) {
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.${tool}.env`).access)
+        .toBe('readOnly');
+    }
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('readOnly');
+    // The wrapper also reads the turn the CLI is currently executing, to refuse
+    // credentials that belong to a different turn. Without this grant a
+    // sandboxed session reads nothing and every governed command is refused.
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.turn`).access).toBe('readOnly');
+  });
+
+  // The one that matters: session A must not be able to read session B's token.
+  it('leaves another session\'s identity denied', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.lark-cli.env`).access)
+      .not.toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.turn`).access)
+      .not.toBe('readOnly');
+    // Same for bytedcli: each person's login state lives in a private HOME, and
+    // the daemon (not the sandboxed CLI) mints their JWTs, so the agent has no
+    // business reading these — its own included.
+    expect(accessForPath(p.rules, `${dataDir}/bytedcli-home/ou_alice/.local/share/bytedcli/data/bytecloud_session.json`).access)
+      .not.toBe('readOnly');
+    // And the shared parent is never granted, so a future session's file cannot
+    // be reached either (the allow-list must not fail open for files created
+    // after spawn).
+    expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
+  });
+
+  // Writable would let an agent publish its own identity and act as anyone whose
+  // token it could name. The daemon writes; the CLI only reads.
+  it('never grants write access to an identity file', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+      .not.toBe('readWrite');
+  });
+
+  // A no-transport (core-only / apiOnly) turn has no Feishu credential surface at
+  // all; handing it a user token would re-open the very boundary that mode exists
+  // to close.
+  it('withholds the identity from a no-transport turn', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+      .not.toBe('readOnly');
   });
 });

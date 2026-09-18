@@ -18,6 +18,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
+  getMessageDetail: vi.fn(async () => ({
+    items: [{ chat_id: 'oc_chat', thread_id: 'omt_adopt_picker' }],
+  })),
   getChatInfo: vi.fn(),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
@@ -55,10 +58,12 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -70,6 +75,8 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(),
+  getOwnedSession: vi.fn(),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -90,6 +97,31 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     forkAdoptWorker: vi.fn(),
     killWorker: vi.fn(),
     initWorkerPool: vi.fn(),
+    // The disconnect card action delegates to the authoritative closeSession.
+    // The real one awaits a worker close-fence (never resolves under a mock
+    // worker) and persistent-backing teardown, so model its observable
+    // contract instead: kill the worker, persist the close (owner-scoped),
+    // and evict from the shared registry.
+    closeSession: vi.fn(async (sessionId: string) => {
+      const store = await import('../src/services/session-store.js');
+      const reg = orig.getActiveSessionsRegistry?.();
+      let hadLiveWorker = false;
+      if (reg) {
+        for (const [k, v] of reg as Map<string, any>) {
+          if (v?.session?.sessionId === sessionId) {
+            hadLiveWorker = !!v.worker && !v.worker.killed;
+            try { v.worker?.send?.({ type: 'close' }); } catch { /* mock */ }
+            (reg as Map<string, any>).delete(k);
+            break;
+          }
+        }
+      }
+      const stored = store.getOwnedSession(sessionId);
+      if (stored && stored.status !== 'closed') {
+        store.closeSession(sessionId, { cleanupBridgeMarkers: !hadLiveWorker });
+      }
+      return { ok: true, outcome: 'closed', alreadyClosed: false, known: !!stored };
+    }),
   };
 });
 
@@ -105,6 +137,7 @@ vi.mock('../src/core/session-manager.js', () => ({
     ds.lastUserPrompt = userPrompt;
     ds.lastCliInput = cliInput;
   }),
+  persistStreamCardState: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -122,9 +155,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { killWorker, forkWorker } from '../src/core/worker-pool.js';
+import { closeSession, killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
-import { deleteMessage } from '../src/im/lark/client.js';
+import { deleteMessage, getMessageDetail } from '../src/im/lark/client.js';
 import { getBot } from '../src/bot-registry.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { sessionKey } from '../src/core/types.js';
@@ -148,7 +181,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       pid: null,
       chatType: 'group',
     },
-    worker: { killed: false, send: vi.fn() } as any,
+    worker: { killed: false, send: vi.fn(), once: vi.fn() } as any,
     workerPort: 8080,
     workerToken: 'tok_secret',
     larkAppId: APP_ID,
@@ -219,9 +252,13 @@ describe('Adopt card actions', () => {
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
       botOpenId: 'ou_bot',
     } as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
+    vi.mocked(getMessageDetail).mockResolvedValue({
+      items: [{ chat_id: 'oc_chat', thread_id: 'omt_adopt_picker' }],
+    });
   });
 
   // ── Disconnect ──────────────────────────────────────────────────────────
@@ -239,18 +276,29 @@ describe('Adopt card actions', () => {
       const sKey = sessionKey(ROOT_ID, APP_ID);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
+      const worker = ds.worker as any;
+      vi.mocked(sessionStore.getSession).mockReturnValue(ds.session);
+      // The authoritative worker-pool closeSession consults getOwnedSession
+      // (owner-scoped) to decide whether to persist the close.
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValue(ds.session);
+      setActiveSessionsRegistry(sessions);
 
-      await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
+      try {
+        await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('uuid-adopt-test');
-      expect(sessions.has(sKey)).toBe(false);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('断开'),
-        undefined,
-        APP_ID,
-      );
+        expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+        // A live adopt worker → closeSession persists with cleanupBridgeMarkers:false.
+        expect(sessionStore.closeSession).toHaveBeenCalledWith('uuid-adopt-test', { cleanupBridgeMarkers: false });
+        expect(sessions.has(sKey)).toBe(false);
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('断开'),
+          undefined,
+          APP_ID,
+        );
+      } finally {
+        setActiveSessionsRegistry(new Map());
+      }
     });
 
     it('should be a no-op when session does not exist', async () => {
@@ -261,6 +309,33 @@ describe('Adopt card actions', () => {
 
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    });
+
+    it('does not report disconnect success when the close result carries a residual', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: {
+          tmuxTarget: '0:1.0',
+          originalCliPid: 12345,
+          cwd: '/home/user/project',
+        },
+      });
+      const sessions = new Map<string, DaemonSession>([
+        [sessionKey(ROOT_ID, APP_ID), ds],
+      ]);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('未能确认完全断开');
+      expect(reply).not.toContain('已断开');
     });
   });
 
@@ -368,13 +443,62 @@ describe('Adopt card actions', () => {
       await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
       await flush();
 
+      expect(getMessageDetail).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('已退出'),
         undefined,
         APP_ID,
+        undefined,
+        { replyTarget: { mode: 'thread', rootMessageId: 'om_card_msg' } },
       );
       expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+
+      vi.doUnmock('../src/core/session-discovery.js');
+    });
+
+    it('falls back to the legacy route when the picker placement probe fails', async () => {
+      vi.doMock('../src/core/session-discovery.js', () => ({
+        discoverAdoptableSessions: vi.fn(() => []),
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
+        excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
+        adoptTargetKey: vi.fn((s: any) => `tmux:${s.tmuxTarget}:${s.cliPid}`),
+        adoptTargetLabel: vi.fn(() => ''),
+      }));
+      vi.mocked(getMessageDetail).mockRejectedValueOnce(new Error('placement unavailable'));
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), makeDaemonSession());
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
+      await flush();
+
+      expect(deps.sessionReply).toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[5]).toBeUndefined();
+      expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+
+      vi.doUnmock('../src/core/session-discovery.js');
+    });
+
+    it('freezes a top-level picker confirmation to its trusted chat', async () => {
+      vi.doMock('../src/core/session-discovery.js', () => ({
+        discoverAdoptableSessions: vi.fn(() => []),
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
+        excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
+        adoptTargetKey: vi.fn((s: any) => `tmux:${s.tmuxTarget}:${s.cliPid}`),
+        adoptTargetLabel: vi.fn(() => ''),
+      }));
+      vi.mocked(getMessageDetail).mockResolvedValueOnce({ items: [{ chat_id: 'oc_chat' }] });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), makeDaemonSession());
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
+      await flush();
+
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[5]).toEqual({
+        replyTarget: { mode: 'plain', chatId: 'oc_chat' },
+      });
 
       vi.doUnmock('../src/core/session-discovery.js');
     });
@@ -408,6 +532,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -447,6 +572,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -494,7 +620,7 @@ describe('Adopt card actions', () => {
     it('sandbox:true bot → replies the sandbox-blocked notice, never persists adoptedFrom', async () => {
       vi.mocked(getBot).mockReturnValue({
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
-        resolvedAllowedUsers: [], botOpenId: 'ou_bot',
+        resolvedAllowedUsers: [], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
       } as any);
       const { startAdoptSession } = await import('../src/core/command-handler.js');
       const ds = makeDaemonSession();

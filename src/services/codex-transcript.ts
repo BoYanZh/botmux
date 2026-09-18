@@ -51,6 +51,10 @@ import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
+import type { CodexThreadSettings } from './codex-service-tier.js';
+// cot-subject 只用语言内建，等价于内联，不违反本模块 dependency-free 口径。
+import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
 
 const IS_LINUX = platform() === 'linux';
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
@@ -66,30 +70,31 @@ export function codexSessionIdFromRolloutPath(path: string): string | undefined 
   return m ? m[1] : undefined;
 }
 
-/** Find the rollout file an externally-running Codex process has open. The
- *  Codex process keeps fd open on its current rollout for the entire
- *  lifetime of the session, so this is the authoritative way to bind a
- *  Codex pid to its sessionId — far more reliable than scanning
- *  `~/.codex/sessions` by mtime (which would race with sibling Codex panes
- *  in the same project).
+type CodexRolloutRef = { path: string; cliSessionId: string };
+
+/** Enumerate the filesystem paths a process currently has open, normalised to
+ *  a plain string[] regardless of platform. Returns undefined only when the
+ *  enumeration itself is unavailable (unreadable /proc, lsof failed); an empty
+ *  array means "readable, but no matching fds". Both `findCodexRolloutByPid`
+ *  and `findCodexRolloutSetByPid` derive from THIS single source so their
+ *  Linux `/proc` and macOS/BSD `lsof` normalisation can never drift apart.
  *
  *  Linux: `/proc/<pid>/fd/*` fast path.
- *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。
- *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
-export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
+ *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。 */
+function codexProcessOpenTargets(pid: number): string[] | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
     if (existsSync(fdDir)) {
       let entries: string[];
       try { entries = readdirSync(fdDir); } catch { return undefined; }
+      const targets: string[] = [];
       for (const fd of entries) {
         let target: string;
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchCodexRolloutPath(target);
-        if (hit) return hit;
+        targets.push(target);
       }
-      return undefined;
+      return targets;
     }
     // /proc 不可读时落到下面的 lsof 兜底（极少见，但兜一下）
   }
@@ -104,18 +109,87 @@ export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId
   } catch {
     return undefined;
   }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
-    const hit = matchCodexRolloutPath(target);
-    if (hit) return hit;
-  }
-  return undefined;
+  return out.split('\n').flatMap(line =>
+    line.startsWith('n/') ? [line.slice(1)] : [],
+  );
 }
 
-function matchCodexRolloutPath(target: string): { path: string; cliSessionId: string } | undefined {
+/** Find the rollout file an externally-running Codex process has open. A
+ *  single open rollout is authoritative for that pid. Multiple open rollouts
+ *  are ambiguous: current Codex versions can keep parent and sibling-agent
+ *  transcripts open in the same process, so choosing the first fd can bind
+ *  an adopted pane to the wrong conversation.
+ *
+ *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
+export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
+  const targets = codexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  return findSingleCodexRollout(targets);
+}
+
+/** Enumerate ALL rollouts a Codex pid currently has open, keyed by lowercased
+ *  sessionId. Unlike `findCodexRolloutByPid`, this does NOT collapse the
+ *  parent+sibling multi-rollout case to `undefined` — it returns every match so
+ *  a caller can test membership (`historySid ∈ set`).
+ *
+ *  This is the ownership gate for post-submit rollout re-attach: `history.jsonl`
+ *  is a single global file shared by every Codex pane under one CODEX_HOME, so a
+ *  concurrent sibling pane submitting identical text can make writeInput return
+ *  the WRONG session id. Only a sid this exact pid actually holds open is safe to
+ *  re-attach to; a foreign sid (another pane's) is rejected, leaving the current
+ *  binding untouched. Returns an empty Set when the pid holds no rollout, and
+ *  undefined only when the fd enumeration itself is unavailable — callers must
+ *  treat undefined as "cannot prove ownership" (fail closed: do not re-attach). */
+export function findCodexRolloutSetByPid(pid: number): Set<string> | undefined {
+  const targets = codexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  const set = new Set<string>();
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  }
+  return set;
+}
+
+/** Pure ownership decision: is `cliSessionId` one of the rollouts the observed
+ *  pid holds open? `ownedRollouts` is the lowercased sid set from
+ *  findCodexRolloutSetByPid (undefined when fd enumeration was unavailable).
+ *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
+ *  never binds the bridge to a session it can't prove the pid owns. Extracted so
+ *  the exact predicate the worker's attach entry points use is unit-testable
+ *  without a live pid. */
+export function codexHistorySidIsOwned(
+  cliSessionId: string,
+  ownedRollouts: Set<string> | undefined,
+): boolean {
+  if (!ownedRollouts) return false;
+  return ownedRollouts.has(cliSessionId.toLowerCase());
+}
+
+function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
+  let found: CodexRolloutRef | undefined;
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (!hit) continue;
+    if (found && found.path !== hit.path) return undefined;
+    found = hit;
+  }
+  return found;
+}
+
+function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   if (!target.endsWith('.jsonl')) return undefined;
-  if (!target.includes('/.codex/sessions/')) return undefined;
+  // The rollout lives under `<CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/`. CODEX_HOME
+  // defaults to ~/.codex but can be a custom / per-bot-isolated root, and an
+  // ADOPTED external Codex may have started under a CODEX_HOME the worker never
+  // inherited — so anchoring on the literal `/.codex/sessions/` (or on the
+  // worker's own codexSessionsRoot()) would make that rollout invisible. Once fd
+  // ownership is a hard gate for bridge attach, an invisible rollout means the
+  // legitimate session can never pass the gate. The path already came from the
+  // target PID's open fds (that IS the ownership proof), so anchor only on the
+  // env-independent structural shape: a `sessions/` path segment plus the
+  // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
+  if (!/(^|\/)sessions\//.test(target)) return undefined;
   const sid = codexSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
@@ -131,22 +205,376 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
-   *   - 'assistant_final' closes the currently-collecting turn */
-  kind: 'user' | 'assistant_final';
+   *   - 'assistant_final' closes the currently-collecting turn with output
+   *   - 'turn_aborted' closes it without producing fallback output
+   *   - 'turn_bind' adds a provider turn id to an already-started turn
+   *     without starting, closing, or otherwise advancing the queue
+   *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
+   *     output) attributed to the collecting turn for the CoT message; it
+   *     never starts or closes a turn */
+  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
-   *  user, output_text for assistant). */
+   *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
+  cotEntries?: CodexCotEntry[];
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
    *  default. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
+  /** Safe, bounded user-facing detail extracted from a structured failure.
+   *  Raw provider payloads stay in the rollout/Web terminal. */
+  terminalErrorSummary?: string;
   sourceSessionId?: string;
+  /** Native provider turn id when the transcript format exposes one. Bridges
+   *  can use it to bind cosmetic/terminal events to the exact started turn
+   *  instead of relying solely on whichever turn is currently collecting. */
+  sourceTurnId?: string;
+  /** The transcript parser has positive evidence that this user record starts
+   * a distinct native turn while an older id-less turn remains open. */
+  preserveCollecting?: boolean;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+}
+
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts /
+ *  `TranscriptCotEntry` in claude-transcript.ts — redeclared structurally to
+ *  keep this module dependency-free. */
+export type CodexCotEntry =
+  | { kind: 'thinking'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从原始 arguments / input / action 提取的单行主题（≤1000）；
+     *  无可用字段时不带此键。 */
+    subject?: string;
+  }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Per-entry truncation caps for the CoT tool timeline (same rationale and
+ *  values as claude-transcript's): args/outputs can be hundreds of KB, the
+ *  bubble only needs a recognisable preview. */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** 组装 tool_call 节点：args 截断、subject 传输层截断，主题为空时不带键。 */
+function toolCallEntry(id: string, name: string, args: string, rawSubject: string): CodexCotEntry {
+  const subject = boundSubjectForTransport(rawSubject);
+  return {
+    kind: 'tool_call', id, name,
+    args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+    ...(subject ? { subject } : {}),
+  };
+}
+
+/** Codex shell outputs are usually a JSON string `{"output":"…","metadata":…}`;
+ *  unwrap to the inner output when that shape parses, otherwise show the raw
+ *  string (custom tools / newer formats). */
+function stringifyCodexToolOutput(output: unknown): string {
+  if (typeof output !== 'string') {
+    try { return output === undefined ? '' : JSON.stringify(output); } catch { return ''; }
+  }
+  if (output.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed && typeof parsed === 'object' && typeof parsed.output === 'string') return parsed.output;
+    } catch { /* not the wrapped shape — fall through to raw */ }
+  }
+  return output;
+}
+
+/**
+ * Extract CoT (thinking process) entries from one Codex rollout
+ * `response_item` payload. Returns [] for payload types that don't belong in
+ * the thinking timeline (user/assistant messages, ghost snapshots, …).
+ *
+ *   - `reasoning` → thinking text. Codex records the display summary in
+ *     `summary[]` (`summary_text` blocks — what the TUI shows) and, for some
+ *     providers, raw CoT in `content[]` (`reasoning_text`); prefer the
+ *     summary, fall back to raw.
+ *   - `function_call` / `custom_tool_call` / `local_shell_call` /
+ *     `web_search_call` → tool_call (name + truncated args).
+ *   - `function_call_output` / `custom_tool_call_output` → tool_result
+ *     (unwrapped + truncated output).
+ */
+export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
+  if (!p || typeof p !== 'object') return [];
+  if (p.type === 'reasoning') {
+    const texts: string[] = [];
+    for (const b of Array.isArray(p.summary) ? p.summary : []) {
+      if (b?.type === 'summary_text' && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+    }
+    if (texts.length === 0) {
+      for (const b of Array.isArray(p.content) ? p.content : []) {
+        if ((b?.type === 'reasoning_text' || b?.type === 'text') && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+      }
+    }
+    return texts.length > 0 ? [{ kind: 'thinking', text: texts.join('\n\n') }] : [];
+  }
+  // 四种 tool_call 形态的主题都在截断**之前**从原始字符串 / 对象上取：
+  // function_call 的 arguments 是 JSON 字符串，custom_tool_call 的 input 是裸
+  // 字符串（apply_patch / 脚本），local_shell_call / web_search_call 的 action
+  // 是对象——截断后的 JSON 解析不出主题。
+  if (p.type === 'function_call' && typeof p.name === 'string') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    const args = typeof p.arguments === 'string' ? p.arguments : '';
+    return [toolCallEntry(id, p.name, args, subjectFromArgsString(args))];
+  }
+  if (p.type === 'custom_tool_call' && typeof p.name === 'string' && typeof p.call_id === 'string' && p.call_id) {
+    const args = typeof p.input === 'string' ? p.input : '';
+    return [toolCallEntry(p.call_id, p.name, args, subjectFromArgsString(args))];
+  }
+  if (p.type === 'local_shell_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [toolCallEntry(id, 'shell', args, subjectFromInputObject(p.action))];
+  }
+  if (p.type === 'web_search_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [toolCallEntry(id, 'web_search', args, subjectFromInputObject(p.action))];
+  }
+  if ((p.type === 'function_call_output' || p.type === 'custom_tool_call_output') && typeof p.call_id === 'string' && p.call_id) {
+    const result = stringifyCodexToolOutput(p.output);
+    return result.length > 0 ? [{ kind: 'tool_result', id: p.call_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) }] : [];
+  }
+  return [];
+}
+
+export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
+export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
+export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
+export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
+/** Model gateway / upstream service failure (5xx, gRPC stream cancel, …):
+ *  the request reached the model service but the SERVER side failed. Distinct
+ *  from `codex_connection_failed` (client could not reach the service at all)
+ *  so the user-facing card can say "server-side transient, just retry later"
+ *  instead of pointing at the local network. */
+export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
+export const CODEX_OUTPUT_LIMIT_ERROR_CODE = 'codex_output_limit_exceeded';
+export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
+export const CODEX_OUTPUT_LIMIT_ERROR_MESSAGE = 'model output limit exceeded: max_output_tokens';
+
+const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
+/** Pre-scan bound applied BEFORE the redaction regexes run. Well above the
+ *  displayed max so it never truncates a shown reason, but small enough to keep
+ *  the (super-linear-on-adversarial-input) patterns cheap. */
+const CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS = 2_000;
+
+/** Credential key names redacted from user-facing failure summaries. */
+const CODEX_SECRET_KEY_ALTERNATION =
+  'api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie';
+// Escape-safe quoted-value bodies. The two branches are mutually exclusive —
+// `\\.` consumes an escaped pair, `[^\\<q>]` consumes any other non-quote char —
+// so they never overlap and a missing close quote can NOT trigger exponential
+// backtracking. Spanning `\\.` also means an embedded `\"` (or `\'`) does not
+// prematurely end the value, so the WHOLE secret is covered, not just its head.
+const CODEX_DQ_VALUE_BODY = '"(?:\\\\.|[^\\\\"])*"';
+const CODEX_SQ_VALUE_BODY = "'(?:\\\\.|[^\\\\'])*'";
+/** Quoted-JSON credential, double-quoted value: `"api_key":"..."`. */
+const CODEX_QUOTED_SECRET_DQ = new RegExp(
+  `(("(?:${CODEX_SECRET_KEY_ALTERNATION})")\\s*:\\s*)${CODEX_DQ_VALUE_BODY}`, 'gi');
+/** Same, single-quoted value: `'secret':'...'`. */
+const CODEX_QUOTED_SECRET_SQ = new RegExp(
+  `(('(?:${CODEX_SECRET_KEY_ALTERNATION})')\\s*:\\s*)${CODEX_SQ_VALUE_BODY}`, 'gi');
+/** Bare `key = value` — value is a quoted string (escape-safe, same as above so
+ *  an embedded `\"` does not leak the tail) or a bare word. `\b` keeps
+ *  `notpassword=` from matching `password`. */
+const CODEX_BARE_SECRET = new RegExp(
+  `(\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*)(?:${CODEX_DQ_VALUE_BODY}|${CODEX_SQ_VALUE_BODY}|[^\\s,;}]+)`, 'gi');
+/** An UNCLOSED quoted credential value running to end-of-input — created when a
+ *  real secret is cut mid-value by the pre-scan bound (or arrives truncated).
+ *  Its prefix would otherwise slip past the closed-value redactors into the
+ *  shown summary, so we fail closed instead. The trailing `\\?` absorbs a lone
+ *  dangling backslash left when the pre-scan cut lands mid-escape — without it
+ *  the exclusive value body rejects that final char and the whole probe misses,
+ *  re-opening the leak. Same exclusive branches, so the probes stay linear. */
+const CODEX_UNCLOSED_SECRET_DQ = new RegExp(
+  `"(?:${CODEX_SECRET_KEY_ALTERNATION})"\\s*:\\s*"(?:\\\\.|[^\\\\"])*\\\\?$`, 'i');
+const CODEX_UNCLOSED_SECRET_SQ = new RegExp(
+  `'(?:${CODEX_SECRET_KEY_ALTERNATION})'\\s*:\\s*'(?:\\\\.|[^\\\\'])*\\\\?$`, 'i');
+const CODEX_UNCLOSED_SECRET_BARE = new RegExp(
+  `\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*(?:"(?:\\\\.|[^\\\\"])*|'(?:\\\\.|[^\\\\'])*)\\\\?$`, 'i');
+
+function parseEmbeddedJson(value: unknown): unknown {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || trimmed.length > 20_000) return undefined;
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
+  try { return JSON.parse(trimmed); } catch { return undefined; }
+}
+
+/** Peel provider wrappers such as `{ message: "{\"error\":{...}}" }`. */
+function codexFailureLeaf(error: unknown): unknown {
+  let current = error;
+  for (let depth = 0; depth < 6; depth++) {
+    const parsed = parseEmbeddedJson(current);
+    if (parsed !== undefined) {
+      current = parsed;
+      continue;
+    }
+    if (!current || typeof current !== 'object') break;
+    const value = current as Record<string, unknown>;
+    if (value.error !== undefined) {
+      current = value.error;
+      continue;
+    }
+    const parsedMessage = parseEmbeddedJson(value.message);
+    if (parsedMessage !== undefined) {
+      current = parsedMessage;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+/** Bounded, redacted user-facing summary of a structured task_complete error.
+ *  Exported for the TRAE drainer, which mirrors the Codex error→failed
+ *  terminal mapping on the same payload shape. */
+export function safeFailureSummary(error: unknown): string | undefined {
+  const leaf = codexFailureLeaf(error);
+  let message = '';
+  let code = '';
+  let type = '';
+  if (typeof leaf === 'string') {
+    message = leaf;
+  } else if (leaf && typeof leaf === 'object') {
+    const value = leaf as Record<string, unknown>;
+    message = typeof value.message === 'string' ? value.message : '';
+    code = typeof value.code === 'string' || typeof value.code === 'number'
+      ? String(value.code)
+      : '';
+    type = typeof value.type === 'string' ? value.type : '';
+  }
+  let summary = [code, type].filter(Boolean).join(' ');
+  if (message) summary = summary ? `${summary}: ${message}` : message;
+  if (!summary) return undefined;
+
+  // Fail closed on unpeeled deep nesting. codexFailureLeaf bounds unwrapping to
+  // 6 levels; a provider that wraps `message: JSON.stringify(...)` more deeply
+  // leaves `message` as a still-nested JSON literal. Its escaped quotes (`\"`)
+  // defeat the quote-paired redaction below and would leak the embedded secret
+  // verbatim. When the reason we are about to show is itself a bare JSON
+  // object/array literal, treat it as unsafe and surface no summary — the raw
+  // error still lives in the rollout / web terminal / daemon logs.
+  const messageTrimmed = message.trim();
+  if (messageTrimmed.length >= 2
+    && (messageTrimmed.startsWith('{') || messageTrimmed.startsWith('['))) {
+    return undefined;
+  }
+
+  // Bound the input before running the redaction regexes. Only the first
+  // CODEX_FAILURE_SUMMARY_MAX_CHARS survive to the user anyway, so trimming a
+  // long tail loses no displayed content — but it caps the worst-case work of
+  // the patterns below. The JWT-shaped pattern in particular backtracks
+  // super-linearly on long `-`-rich runs (its char class includes `-` and `\b`
+  // restarts after each one); an unbounded provider blob could otherwise spend
+  // seconds in a single replace. Cutting to a few KB keeps that flat.
+  if (summary.length > CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS) {
+    summary = summary.slice(0, CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS);
+  }
+
+  // Fail closed on an UNCLOSED quoted/bare credential value. The pre-scan cut
+  // above can slice a long real secret mid-value, leaving `password":"SEKR…`
+  // with no closing quote — which the closed-value redactors below would NOT
+  // match, leaking the prefix into the shown summary. Run this AFTER the cut so
+  // it sees the same string the redactors will. (A genuinely truncated provider
+  // error hits the same guard, which is the safe outcome.)
+  if (CODEX_UNCLOSED_SECRET_DQ.test(summary)
+    || CODEX_UNCLOSED_SECRET_SQ.test(summary)
+    || CODEX_UNCLOSED_SECRET_BARE.test(summary)) {
+    return undefined;
+  }
+
+  // Provider errors are untrusted. Keep the useful reason while removing
+  // common credentials, signed URLs, mention/HTML syntax and control chars.
+  summary = summary
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
+    .replace(/\b([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
+    // Quoted-JSON credential (`"api_key":"..."` / `'secret':'...'`). Both key
+    // and value are quoted here — a quoted key with a bare-word value does NOT
+    // match, so no trailing word is swallowed — and the value branches are
+    // mutually exclusive so a pathological value cannot backtrack. See the
+    // CODEX_QUOTED_SECRET_* definitions.
+    .replace(CODEX_QUOTED_SECRET_DQ, '$1[REDACTED]')
+    .replace(CODEX_QUOTED_SECRET_SQ, '$1[REDACTED]')
+    // Bare `key = value`.
+    .replace(CODEX_BARE_SECRET, '$1[REDACTED]')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/`/g, "'")
+    .replace(/@/g, '＠');
+  if (!summary) return undefined;
+  return summary.length > CODEX_FAILURE_SUMMARY_MAX_CHARS
+    ? `${summary.slice(0, CODEX_FAILURE_SUMMARY_MAX_CHARS - 1)}…`
+    : summary;
+}
+
+/** Classify a structured task_complete error into a stable failure code.
+ *  Shared with the TRAE drainer (traex-transcript.ts), whose task_complete
+ *  error payloads use the same Codex-family shape — keep one classifier so
+ *  both bridges map e.g. connection failures to the same code. */
+export function codexTaskFailureCode(error: unknown): string {
+  let serialized = '';
+  try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
+  const normalized = serialized.toLowerCase();
+  if (/\b429\b|too many requests|rate[_ -]?limit/.test(normalized)) return CODEX_RATE_LIMIT_ERROR_CODE;
+  if (/\b401\b|\b403\b|unauthorized|forbidden|authentication|invalid[_ -]?(?:api[_ -]?)?key/.test(normalized)) {
+    return CODEX_AUTH_ERROR_CODE;
+  }
+  if (/invalid_request|invalid request|validation|empty_string|\b400\b|\b-4003\b/.test(normalized)) {
+    return CODEX_INVALID_REQUEST_ERROR_CODE;
+  }
+  // Model gateway / upstream failures: the service answered but failed
+  // server-side (proxy 5xx, gRPC stream cancel, overloaded backend). Checked
+  // BEFORE the connection branch so e.g. "gateway timeout" classifies as
+  // upstream rather than a local connectivity problem. Observed live:
+  // "upstream stream error: rpc error: code = 1 desc = Cancelled by backend
+  // [biz error]" (model gateway cancelling the stream mid-turn).
+  if (/upstream|rpc error|cancell?ed by backend|gateway|\b50[0234]\b|service unavailable|internal server error|overloaded/.test(normalized)) {
+    return CODEX_UPSTREAM_ERROR_CODE;
+  }
+  if (/econn|connection|network|socket|timed?\s*out|timeout|dns|enotfound/.test(normalized)) {
+    return CODEX_CONNECTION_ERROR_CODE;
+  }
+  return CODEX_TASK_FAILED_ERROR_CODE;
+}
+
+/** Exact opt-in classifier used only by the TraeX read-only continuation
+ * path. Keeping it out of codexTaskFailureCode preserves every other CLI's
+ * existing public error taxonomy. */
+export function isExactCodexOutputLimitError(error: unknown): boolean {
+  const leaf = codexFailureLeaf(error);
+  const leafMessage = typeof leaf === 'string'
+    ? leaf
+    : leaf && typeof leaf === 'object' && typeof (leaf as Record<string, unknown>).message === 'string'
+      ? String((leaf as Record<string, unknown>).message)
+      : '';
+  return leafMessage.trim().toLowerCase() === CODEX_OUTPUT_LIMIT_ERROR_MESSAGE;
+}
+
+export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
+  return event.kind === 'assistant_final'
+    && event.terminalStatus === 'failed'
+    && event.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -160,7 +588,7 @@ export interface CodexBridgeEvent {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  events: readonly Pick<CodexBridgeEvent, 'kind' | 'text'>[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -207,6 +635,47 @@ export interface CodexDrainResult {
   /** A line that was written without its terminating \n yet. Currently
    *  informational — only complete lines produce events. */
   pendingTail: string;
+  /** Latest complete settings record in this byte range, if any. */
+  latestThreadSettings?: CodexThreadSettings;
+  /** Newest executor model observed in this byte range (from `turn_context`),
+   *  latest-wins. Undefined when no `turn_context` appeared in the range. */
+  latestModel?: string;
+  /** Newest executor reasoning effort observed in this byte range (from
+   *  `turn_context`), latest-wins. Undefined when none appeared. */
+  latestReasoningEffort?: string;
+}
+
+/** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
+ *  identity is advisory and must never synchronously parse a multi-GB rollout
+ *  on attach (same guard rationale as usage-side MAX_USAGE_TRANSCRIPT_BYTES).
+ *  Mirrors traex-transcript's TRAEX_RUNTIME_SCAN_MAX_BYTES. */
+const CODEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Executor-confirmed model / reasoning-effort as recorded in a Codex
+ *  `turn_context` event. Codex writes this on every turn (top-level `model`
+ *  and `effort`, with a `collaboration_mode.settings` mirror), so it — not the
+ *  optional `thread_settings_applied` record — is the reliable in-session
+ *  model/effort source. Mirrors traex-transcript's runtimeFromTraexEntry. */
+function runtimeFromCodexEntry(obj: any): { model?: string; reasoningEffort?: string } | undefined {
+  if (obj?.type !== 'turn_context') return undefined;
+  const payload = obj.payload;
+  if (!payload || typeof payload !== 'object') return undefined;
+  const settings = payload.collaboration_mode?.settings;
+  const model = payload.model ?? settings?.model;
+  const reasoningEffort = payload.reasoning_effort
+    ?? payload.effort
+    ?? settings?.reasoning_effort;
+  const normalizedModel = typeof model === 'string' && model.trim()
+    ? model.trim()
+    : undefined;
+  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
+    ? reasoningEffort.trim()
+    : undefined;
+  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
+  return {
+    ...(normalizedModel ? { model: normalizedModel } : {}),
+    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
+  };
 }
 
 /** Locate the rollout file for a given Codex sessionId. Codex names files
@@ -409,6 +878,9 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   const newOffset = start + Buffer.byteLength(completeText, 'utf8');
 
   const events: CodexBridgeEvent[] = [];
+  let latestThreadSettings: CodexThreadSettings | undefined;
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -422,6 +894,20 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const settings = codexThreadSettingsFromEvent(obj);
+    if (settings) {
+      latestThreadSettings = settings;
+      continue;
+    }
+    // turn_context carries the executor model/effort on every turn (latest-wins,
+    // since Codex can change them independently). Published via the same
+    // active_runtime channel TRAE uses.
+    const runtime = runtimeFromCodexEntry(obj);
+    if (runtime) {
+      if (runtime.model) latestModel = runtime.model;
+      if (runtime.reasoningEffort) latestReasoningEffort = runtime.reasoningEffort;
+      continue;
+    }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
@@ -435,6 +921,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
+    }
+    // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
+    // become cosmetic 'cot' events. The queue attributes them to the
+    // collecting turn for the native CoT message; they never start or close
+    // a turn (the boundaries above/below stay authoritative).
+    if (obj.type === 'response_item') {
+      const cotEntries = codexCotEntriesFromResponseItem(p);
+      if (cotEntries.length > 0) {
+        events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+        continue;
+      }
     }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
@@ -450,11 +947,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && p.type === 'task_complete'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      const failed = p.error !== null && p.error !== undefined;
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+        ...(failed ? {
+          terminalStatus: 'failed' as const,
+          terminalErrorCode: codexTaskFailureCode(p.error),
+          terminalErrorSummary: safeFailureSummary(p.error),
+        } : {}),
       });
       continue;
     }
@@ -475,9 +978,160 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       });
       continue;
     }
-    // Everything else is skipped: role=developer/system instructions,
-    // reasoning, function_call*, and every assistant `response_item` message
-    // (mid-turn OR final) — the turn boundary comes only from task_complete.
+    // Everything else is skipped: role=developer/system instructions and
+    // every assistant `response_item` message (mid-turn OR final) — the turn
+    // boundary comes only from task_complete. Reasoning / tool calls surface
+    // as cosmetic 'cot' events above, never as boundaries.
   }
-  return { events, newOffset, pendingTail };
+  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
+}
+
+function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
+  if (obj?.type !== 'event_msg' || obj.payload?.type !== 'thread_settings_applied') return undefined;
+  const raw = obj.payload.thread_settings;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  // Codex omits service_tier when /fast is disabled; that is an applied
+  // default-tier snapshot, not a malformed settings record.
+  const rawServiceTier = raw.service_tier;
+  const serviceTier = rawServiceTier === undefined || rawServiceTier === ''
+    ? 'default'
+    : rawServiceTier;
+  if (typeof serviceTier !== 'string') return undefined;
+  const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
+  // Effort follows in-session changes made through Codex's own model controls.
+  // Codex records it both at the top level and under collaboration_mode.settings;
+  // take the top-level value first, matching the model precedence above.
+  const rawEffort = raw?.reasoning_effort
+    ?? raw?.collaboration_mode?.settings?.reasoning_effort;
+  const reasoningEffort = typeof rawEffort === 'string' && rawEffort.trim()
+    ? rawEffort.trim()
+    : undefined;
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    serviceTier,
+  };
+}
+
+/**
+ * One-shot bootstrap for an existing rollout. Reads backwards in fixed-size
+ * chunks and stops at the newest settings record, keeping memory bounded even
+ * for long sessions. Live changes use `drainCodexRollout`'s byte offset and do
+ * not call this function.
+ */
+export function scanCodexThreadSettings(
+  path: string,
+  opts: { chunkBytes?: number } = {},
+): CodexThreadSettings | undefined {
+  if (!existsSync(path)) return undefined;
+  const chunkBytes = Math.max(1024, opts.chunkBytes ?? 64 * 1024);
+  let fd: number | undefined;
+  try {
+    const size = statSync(path).size;
+    if (size === 0) return undefined;
+    fd = openSync(path, 'r');
+    let end = size;
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (!line.includes('thread_settings_applied')) continue;
+        let obj: any;
+        try { obj = JSON.parse(line); } catch { continue; }
+        const settings = codexThreadSettingsFromEvent(obj);
+        if (settings) return settings;
+      }
+      carry = block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) {
+      let obj: any;
+      try { obj = JSON.parse(carry.toString('utf8')); } catch { return undefined; }
+      return codexThreadSettingsFromEvent(obj);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return undefined;
+}
+
+/** One-shot bootstrap of the current Codex runtime (model / reasoning effort)
+ *  from `turn_context` records, for attach/restore paths that cursor straight
+ *  to the tail without draining history. Scans BACKWARD in fixed-size chunks
+ *  and stops once both fields resolve — the newest `turn_context` sits near the
+ *  tail. A hard byte cap bounds the pathological missing-field case. A
+ *  non-newline-terminated trailing partial is excluded via baselineJsonlCursor
+ *  so a crash mid-write cannot surface a half-written record. Mirrors
+ *  traex-transcript's readLatestTraexRuntime. */
+export function readLatestCodexRuntime(
+  path: string,
+): { model?: string; reasoningEffort?: string } {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
+  const emit = (): { model?: string; reasoningEffort?: string } => ({
+    ...(latestModel ? { model: latestModel } : {}),
+    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
+  });
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let runtime: { model?: string; reasoningEffort?: string } | undefined;
+    try { runtime = runtimeFromCodexEntry(JSON.parse(line)); } catch { return false; }
+    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
+    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
+      latestReasoningEffort = runtime.reasoningEffort;
+    }
+    return latestModel !== undefined && latestReasoningEffort !== undefined;
+  };
+
+  const floor = Math.max(0, completeEnd - CODEX_RUNTIME_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      carry = start === floor && floor > 0
+        ? Buffer.alloc(0)
+        : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
 }

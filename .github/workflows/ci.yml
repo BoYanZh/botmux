@@ -14,9 +14,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Compile + workflow-core only. The unit suite used to live here and dominated
+  # the wall (~10.5 min of a 12 min job on a 4-core runner). Tests now run as
+  # three independent shards; this job stays a compile gate.
+  #
+  # Ruleset "Require CI green on master" still lists only `build`. The suite
+  # now reports as the aggregator job named `test` (not `test (1/3)` — those
+  # names change with the shard count). Adding `test` to that ruleset is a
+  # repo-settings change, not a workflow step. Until an admin does that, a
+  # red shard does not block merge.
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v6
@@ -25,7 +34,468 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm install -g pnpm@9.5.0
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm test
+      # Bun is the package manager (packageManager: bun@1.4.2). node-pty's native
+      # build runs only because it is in `trustedDependencies` — bun skips
+      # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
+      # need a real build/Release/pty.node.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run workflow-core:test
+
+  # Same unit project as `bun run test`, split across runners with vitest
+  # `--shard=i/N`. Each shard still file-parallel internally (forks). They do
+  # NOT `needs: build` — waiting on tsc would serialize the start; a few files
+  # spawn `dist/cli.js`, so each shard rebuilds (~45s) and starts immediately.
+  # fail-fast is off so a red shard still lets the others report their wall.
+  test:
+    name: test (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # dsh 沙盒集成用例要在 runner 上真跑 bwrap:ubuntu-24.04 默认
+      # kernel.apparmor_restrict_unprivileged_userns=1 且 bubblewrap 包不带
+      # AppArmor profile,bwrap 一起 userns 就秒退("setting up uid map:
+      # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
+      # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
+      # 有 bwrap 运行时探测 gate,跑不了会 loud skip 而不是超时挂掉。
+      - name: Enable bwrap sandbox for integration tests (best-effort)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+            echo "bwrap userns OK — sandbox integration tests will run for real"
+          else
+            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Wrapper retries once only when every file already passed and vitest's
+      # fork pool then reports "Worker exited unexpectedly" (teardown flake;
+      # measured on this PR's first shard-3 run). A real failed file is not retried.
+      - name: Unit tests (shard ${{ matrix.shard }}/3)
+        run: node scripts/run-unit-shard.mjs ${{ matrix.shard }}/3
+
+  # One stable check name for the ruleset. Matrix names (`test (1/3)` …)
+  # must not be required — they change if the shard count changes. This
+  # job is AND-of-shards (`if: always()` + fail on any non-success).
+  # Ruleset "Require CI green on master" must list context `test`.
+  test-ok:
+    name: test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every shard
+        run: |
+          case "${{ needs.test.result }}" in
+            success) exit 0 ;;
+            *) echo "shards: ${{ needs.test.result }}"; exit 1 ;;
+          esac
+
+  # Second runner leg: the SAME unit files executed on Bun instead of Node.
+  #
+  # WHY THIS IS NOT REDUNDANT WITH THE `test` SHARDS ABOVE: vitest forks Node
+  # workers even when launched through bun (measured — `bun x vitest` still
+  # reports process.versions.node), so every test BODY in the jobs above runs on
+  # Node. Bun-specific behaviour is therefore structurally invisible there: its
+  # `fetch` error taxonomy (which cannot distinguish a sent from an unsent
+  # request), its startup-frozen `os.homedir()`, `Bun.file`, compiled-binary
+  # paths. Bun is what ships the single-file executable, so those paths need a
+  # leg that actually runs on it.
+  #
+  # STILL ADVISORY, but the reason has narrowed. Three of the four flakes that
+  # kept this leg off a green baseline are now fixed at their cause rather than
+  # retried:
+  #   • a port-pair assumption (`base+1` was presumed free) → reserve both,
+  #   • a torn read of a marker file → write tmp + `renameSync`, plus a poll
+  #     predicate that THREW on a partial read, aborting the loop and reporting a
+  #     parse error instead of the timeout → fail soft,
+  #   • an env-leak guard whose transport was node-pty, which cannot fork/exec
+  #     reliably under Bun (see that file's comment for the measurements) → the
+  #     guard now runs over `child_process.spawn` on both legs, with the pty form
+  #     kept for Node only.
+  #
+  # The fourth is NOT fixed: test/tmux-startup-storm-recovery.test.ts wedged in
+  # run 34570428914 — one `(pass)` line, then 180s of silence and a SIGKILL, i.e.
+  # the second case never completed. Observed once in 28 completed master runs
+  # (~4%); not reproduced locally across ~50 attempts spanning core starvation,
+  # piped stdio, the runner's exact spawn shape and args, and its 4-way file
+  # concurrency. Since the test times out per-case at 15s and the file still went
+  # quiet for 180s, whatever blocks it is synchronous.
+  #
+  # A gate that is red for environmental reasons trains people to ignore it, so
+  # this flips to blocking when that cause is named and reproduced — not on a
+  # rerun, and not on the other three being green.
+  #
+  # The generous timeout is inherent to the design: the runner spawns ONE bun
+  # process PER FILE, because `bun test` otherwise runs every file in a single
+  # process and cross-file interference cascades (measured: 933 failures batched
+  # vs ~2% one-per-process). Startup cost therefore dominates the wall clock.
+  bun-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # Same step as the `test` job above (it moved there with the 3-way unit
+      # shard, #1288), repeated because jobs share no filesystem. WITHOUT IT this
+      # leg is a runner lottery: `prepareDirectSandbox()`
+      # returns null when bwrap is missing, so `overlayTargets()` in
+      # test/sandbox-shim-compiled-form.test.ts yields [] and 4 cases fail on an
+      # image that happens not to ship bubblewrap — MEASURED on two runs of the
+      # same commit range, one printing `bwrap missing` 5 times and failing, the
+      # other printing it 0 times and passing. The failures look like a code
+      # regression and are not one, which is the expensive part.
+      #
+      # ⚠️ Unlike vitest, `bun test` has no host-level skip gate here: the suite
+      # under `describe.skipIf(process.platform !== 'linux')` DOES run on this
+      # linux runner and can only fail once bwrap is absent. Keep this step in
+      # sync with the `test` job's copy.
+      - name: Enable bwrap sandbox for integration tests (best-effort)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+            echo "bwrap userns OK — sandbox integration tests will run for real"
+          else
+            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Exercise the runner itself before the 20-minute suite. `node --check` cannot
+      # catch a missing binding (a ReferenceError is a RUNTIME error, verified), so a
+      # commit that deleted two constants still printed `994 files` and then ran ZERO
+      # — the whole leg's cost with none of its value. This runs one file in ~6s and
+      # also asserts that no `bun` spawn escaped the home fence.
+      #
+      # NOT under continue-on-error semantics by accident: the job as a whole is
+      # advisory for now, but if this step fails the suite result below is meaningless,
+      # so it runs first and its failure is the one worth reading.
+      - run: bun run test:bun:self-check
+      - run: bun run test:bun
+
+  # The Bun single-file executable is a SHIPPED artifact (attached to every
+  # GitHub Release), but until this job existed nothing built or ran it before a
+  # tag push — so `bun build --compile` breakage was only discovered at release
+  # time, after npm had already published. Two real defects reached that far:
+  #   • the compiled dashboard crashlooped on a deep `require()` the bundler
+  #     never embedded (qrcode-terminal/vendor), and
+  #   • the dashboard had no supervisor launcher at all.
+  # Neither is visible to `bun run test` (vitest runs the Node path) nor to a
+  # `capabilities --json` canary. This job compiles the host-arch binary and runs
+  # scripts/smoke-bun-binary.mjs, which exercises the layers that actually carry
+  # Bun-migration risk: the hidden self-spawn entries, the supervised dashboard
+  # member booting with its embedded modules, and its HTTP listener.
+  #
+  # Kept a separate job (not steps appended to `build`) so a Bun-only failure is
+  # legible at a glance and does not mask unit-test results.
+  bun-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and smoke on the supported glibc 2.28 floor
+        # node-pty is compiled on the build host. ubuntu-latest raised the embedded
+        # native to GLIBC_2.34, even though Node 22 and Bun still run on 2.28.
+        # Build inside manylinux_2_28 and execute the full smoke there so the PR
+        # gate is byte-for-byte the same compatibility boundary as release.
+        run: |
+          scripts/build-linux-glibc-baseline.sh \
+            bun-linux-x64 dist-bin/botmux-linux-x64 \
+            "0.0.0-ci.${{ github.run_number }}"
+
+  # The musl (Alpine) binary, gated on PRs — not only at release time.
+  #
+  # WHY THIS JOB EXISTS SEPARATELY FROM `bun-binary`: the musl binary is a shipped
+  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time and
+  # node-pty ships no linux prebuild, so it is compiled against whatever libc the
+  # builder runs on (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine →
+  # `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
+  # cleanly and fails only when the native is dlopen'd, on the user's machine.
+  #
+  # This job previously lived ONLY in release.yml, which runs on tag push. That
+  # meant a PR could change the build script, the embed plugin, or node-pty's
+  # version and the musl leg was first exercised during a release — after npm had
+  # published. This mirrors the release leg so the PR gate is not weaker.
+  #
+  # Only linux-x64-musl is built: GitHub offers no Alpine runner, so musl requires
+  # a container, and arm64 would need the (slower, separately-queued) arm64 runner.
+  # The release workflow still builds BOTH musl arches; this is the PR canary.
+  #
+  # ⚠️ THE COST OF THAT x64-ONLY CHOICE, MEASURED: it was made for runner time, and
+  # arm64-musl turned out to be the one cell with a PLATFORM-level obstacle — a
+  # job-level `container: node:22-alpine` cannot run JS actions (actions/checkout)
+  # on an arm64 runner at all. So this gate was green while the release failed. The
+  # structure below (JS actions on the host, build inside `docker run`) is the fix,
+  # and it is used here too so both workflows stay on ONE shape: if this leg ever
+  # gains an arch, it will not re-learn the same lesson.
+  bun-binary-musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      # Runs on the HOST (glibc), which is what keeps this arch-portable.
+      - uses: actions/checkout@v6
+
+      - name: Build and smoke the musl binary inside Alpine
+        # Every musl-side step in one container invocation. `--platform` is
+        # deliberately NOT passed: the image must resolve to the runner's own
+        # architecture, since the native has to be built for the arch it ships on.
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e CI_RUN_NUMBER="${{ github.run_number }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty has no linux
+              # prebuild and must compile here. binutils supplies readelf.
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+
+              npm i -g bun@1.4.2 --loglevel=error
+              echo "bun $(bun --version) on $(uname -m)"
+
+              # Compiles node-pty against MUSL — the entire point of this job.
+              bun install --frozen-lockfile
+
+              # Fail closed rather than compiling a musl binary around a glibc
+              # native: that mistake survives the build and surfaces only when the
+              # native is loaded.
+              f=node_modules/node-pty/build/Release/pty.node
+              test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+              if ! readelf -d "$f" | grep -q "libc\.musl"; then
+                echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+              fi
+              echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s " ")"
+
+              # Same reason and same ORDER as the glibc job above: the compiled
+              # binary has no package.json on disk, so the version is baked at
+              # compile time, and the repo'"'"'s 0.0.0 placeholder is deliberately
+              # treated as "nothing baked" — compiling from it yields
+              # `--version: unknown`, which the smoke gate fails. Must also come
+              # AFTER install, so --frozen-lockfile sees the committed manifest.
+              npm version "0.0.0-ci.${CI_RUN_NUMBER}" --no-git-tag-version --allow-same-version
+
+              bun run build
+              bun scripts/build-bun-binary.mjs --target bun-linux-x64-musl \
+                --out dist-bin/botmux-linux-x64-musl
+
+              # Same shared script as the glibc leg, so this gate can never be the
+              # weaker one. This is also where an unloadable native is caught:
+              # dist/cli.js statically imports node-pty (via the backends), and
+              # node-pty dlopens the native at MODULE scope — verified by mutation,
+              # corrupting the embedded pty.node makes check 1 die with
+              # ERR_DLOPEN_FAILED. So running the binary at all proves the musl
+              # native loads; no separate PTY step is needed.
+              node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64-musl
+
+              # The legacy-pm2 reaper identifies processes and sockets before it
+              # signals or deletes anything, and BusyBox answers those questions
+              # DIFFERENTLY than procps/lsof: `ps -p` is rejected outright, and
+              # `lsof <path>` ignores the path and exits 0. Both differences
+              # silently DISABLED a guard — the reap found nothing to stop, and an
+              # orphaned rpc.sock read as a live God so the "legacy pm2 still
+              # running" warning could never clear.
+              #
+              # `bun run test` cannot see any of this: vitest runs on the glibc
+              # host, where reverting either probe leaves the suite fully green
+              # (MEASURED). This is the only gate that exercises the BusyBox shapes,
+              # which is why it runs here rather than as a unit test. Verified to
+              # have teeth: reverting either probe makes it exit 1 (1 and 8 failed
+              # checks respectively).
+              node scripts/smoke-musl-reaper-probes.mjs dist/core/legacy-pm2-reaper.js
+
+              # Hand dist-bin back to the HOST user, exactly as the release leg does.
+              #
+              # This job needs it less (nothing after this step touches dist-bin), and
+              # that asymmetry is precisely how the bug shipped: the release leg has a
+              # `Checksums` step that WRITES into dist-bin, and root-owned files made
+              # it fail with `Permission denied` after both musl builds had succeeded.
+              # Keeping the two legs isomorphic means the PR gate exercises the same
+              # ownership handoff the release depends on.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - name: Prove the host can WRITE into dist-bin (canary.5's actual failure)
+        # Not cosmetic — this is the only place CI can catch the ownership bug.
+        #
+        # v3.18.0-canary.5 failed AFTER both musl builds and all smoke checks passed:
+        # the release leg's `Checksums` step writes .sha256 files INTO dist-bin, and
+        # the container had left it owned by root, so the runner's non-root user got
+        # `Permission denied`. This PR job has no such step, so without the check
+        # below it would stay green while the release breaks — exactly the asymmetry
+        # that let the bug ship.
+        #
+        # Deliberately mirrors what `Checksums` does (create a file in the directory)
+        # rather than merely reading a file: read access was never the problem.
+        run: |
+          echo "dist-bin owner: $(stat -c '%u:%g' dist-bin) (runner is $(id -u):$(id -g))"
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+          echo "✅ host user wrote checksums into a container-produced directory"
+
+  # The darwin binaries are shipped artifacts that NO pre-release gate touched
+  # until this job existed: `darwin`/`macos` appeared zero times in this file, so
+  # every macOS-only failure mode was first observed during a release — after the
+  # tag had been pushed. Two reached that point:
+  #   • 3.18.14's darwin-arm64 shipped an INVALID ad-hoc Mach-O signature (bun
+  #     1.4.0, oven-sh/bun#39764). Recent macOS SIGKILLs such a binary before
+  #     main(), so all `botmux upgrade` saw was a dead process (exit 137).
+  #   • v3.19.0 was stopped by release.yml's codesign gate on darwin-x64: bun
+  #     1.4.1 fixed the HOST arch only, and the cross-compiled x64 output still
+  #     left ~25 MB outside its signed range (CodeDirectory codeLimit 68776432
+  #     vs signature start 94548464). The tag is now permanently burned with no
+  #     Release behind it, and the fix had to ship as v3.19.1.
+  # Neither was visible to any other leg: vitest runs on Linux, and the
+  # linux/musl binary jobs cannot invoke `codesign` because it is an Apple tool
+  # that does not exist there. The signature path was reachable ONLY in a
+  # release run, which is precisely why it kept escaping to users.
+  #
+  # WHY macos-14 SPECIFICALLY, and not "some macOS runner": it is arm64, which
+  # is what makes darwin-x64 a CROSS-COMPILE — and cross-compiling is the only
+  # configuration that reproduces the v3.19.0 defect at all (the native arm64
+  # output was valid on the very same run). On an x64 macOS runner the broken
+  # output would be darwin-arm64 instead; the loop below verifies BOTH, so the
+  # gate stays correct either way, but the runner must track release.yml's or
+  # this stops exercising the cell the release actually ships from.
+  #
+  # Free for this repo: macOS runners bill 10× minutes on private repos, but
+  # public repos consume no included minutes at all.
+  bun-binary-darwin:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
+      # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
+      # both arches — unlike linux, where the native is node-gyp'd for the host
+      # arch only. This install is also the only place in CI where the darwin
+      # branch of scripts/build-bun-binary.mjs (`resolveNodePtyNative` picking a
+      # prebuild, and the spawn-helper embed) is exercised at all.
+      - run: bun install --frozen-lockfile
+
+      # Same reason and same ORDER as the linux/musl legs: the compiled binary
+      # has no package.json on disk, so the version is baked at compile time,
+      # and the repo's 0.0.0 placeholder is deliberately read as "nothing baked"
+      # — compiling from it yields `--version: unknown`, which the smoke gate
+      # fails. Must come AFTER install so --frozen-lockfile sees the committed
+      # manifest, and BEFORE the compile that bakes the value in.
+      - run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
+
+      - run: bun run build
+
+      - name: Compile both darwin binaries
+        # BOTH arches, because the shipped set is both and the defect lives in
+        # the cross-built one. Mirrors release.yml's `bun-binaries` macOS leg
+        # (same script, same --out naming) so this gate cannot drift into
+        # testing a different artifact than the one that ships.
+        run: |
+          mkdir -p dist-bin
+          for t in bun-darwin-x64 bun-darwin-arm64; do
+            bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+          done
+
+      - name: Prove each binary really is the arch it is named after
+        # Without this the signature verdict below can be VACUOUS. If `--target`
+        # were ignored, or the native resolution fell back to the host prebuild,
+        # both outputs would be native arm64 — `codesign` would validate them
+        # happily (native signing was never the broken case) and this job would
+        # be green while darwin-x64 users received an arm64 binary that cannot
+        # execute. The defect this job exists for lives ONLY in the cross-built
+        # output, so "the cross-built output is genuinely cross-built" is
+        # load-bearing, not decoration.
+        #
+        # Also fails closed when only ONE of the two was produced: the verify
+        # loop's own `found=0` guard cannot see a half-empty dist-bin.
+        run: |
+          set -e
+          for pair in "x64:x86_64" "arm64:arm64"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            f="dist-bin/botmux-darwin-$name"
+            test -f "$f" || { echo "REFUSING: $f was not produced"; exit 1; }
+            # Whitespace-stripped rather than compared raw: `lipo -archs` prints
+            # arch names space-separated, so this also rejects a FAT binary that
+            # merely contains the wanted arch (we ship thin, one arch per file).
+            got="$(lipo -archs "$f" | tr -d '[:space:]')"
+            echo "$f: lipo -archs → $got (want $want)"
+            [ "$got" = "$want" ] || { echo "REFUSING: $f is $got, not $want"; exit 1; }
+          done
+
+      - name: Verify Mach-O signatures on every darwin binary
+        # The gate this whole job exists for. Byte-for-byte the same check
+        # release.yml runs after its darwin compile, so the PR gate can never be
+        # the weaker one — including the `*.map|*.sha256` skip (`sourcemap:
+        # 'linked'` drops a .map next to each binary, and codesign would reject
+        # it as "not a Mach-O file") and the fail-closed `found=0`, which stops a
+        # glob that matches nothing from reading as a pass.
+        #
+        # `--strict` is the parameter that matters: it is what newer macOS
+        # loaders effectively enforce, and it is what separates "rejects
+        # v3.19.0's darwin-x64" from "lets it through".
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            echo "verifying signature: $f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
+      - name: Smoke-test the host-arch binary
+        # A runner can only execute its own arch, so this runs the arm64 output;
+        # the cross-built x64 one is covered by the signature + arch checks
+        # above. Shares scripts/smoke-bun-binary.mjs with the release leg and the
+        # linux/musl jobs, so no platform gets a weaker smoke — and on darwin
+        # that script ALSO re-verifies the signature as its check 0, before
+        # anything else runs.
+        #
+        # What only this platform can prove: the embedded darwin native actually
+        # loads. node-pty dlopens pty.node at module scope and needs its
+        # spawn-helper sidecar on macOS (linux uses forkpty() and has none), so
+        # a mis-embedded darwin native surfaces here and nowhere else.
+        run: |
+          BIN="dist-bin/botmux-darwin-$(node -e 'process.stdout.write(process.arch)')"
+          test -x "$BIN" || { echo "host-arch binary $BIN not built on this runner"; exit 1; }
+          node scripts/smoke-bun-binary.mjs "$BIN"

@@ -1,11 +1,6 @@
 /**
- * codex-effort-wiring.test.ts
- *
- * Guards the per-turn model/reasoningEffort CONSUMPTION chain — the wiring that
- * the first PR-A pass shipped untested (adapter → args / thread config), which
- * is where codex review caught real gaps (RPC effort never reached the engine;
- * xhigh silently downgraded). These assert the args/params a real codex actually
- * receives, using existing fixtures — no live process needed.
+ * Guards the per-turn model/reasoningEffort consumption chain (adapter args /
+ * thread config) with source-level checks where worker.ts has no public seam.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -33,7 +28,7 @@ describe('codex adapter buildArgs — reasoningEffort injection', () => {
   });
 
   it('passes each effort level through unchanged', () => {
-    for (const e of ['low', 'medium', 'high', 'xhigh'] as const) {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
       const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
       expect(args.join(' ')).toContain(`model_reasoning_effort="${e}"`);
     }
@@ -60,6 +55,14 @@ describe('codex-app adapter buildArgs — runner flags', () => {
     expect(args[ei + 1]).toBe('xhigh');
   });
 
+  it('passes each effort level to the runner unchanged', () => {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
+      const i = args.indexOf('--reasoning-effort');
+      expect(args[i + 1]).toBe(e);
+    }
+  });
+
   it('omits both flags when neither is given', () => {
     const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE });
     expect(args).not.toContain('--model');
@@ -81,5 +84,21 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     const body = source.slice(ctor, end);
     expect(body).toContain('model: cfg.model');
     expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
+  });
+
+  it('freezes the per-Bot default onto a newly created session for supported CLIs', () => {
+    const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+    expect(source).toContain('ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)');
+    expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');
+    expect(source).toContain(': undefined;');
+    const frozenBranch = source.indexOf('if (!ds.session.agentFrozen)');
+    // The capability guard is checked against the model THIS spawn resolves
+    // (`model`, from resolveSessionLaunchModel), not the session's recorded one:
+    // the model is no longer frozen, and a per-trigger override never lands in
+    // the record — judging support by the record would use the wrong model.
+    const compatibilityGuard = source.indexOf('cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)');
+    const returnConfig = source.indexOf('return {', frozenBranch);
+    expect(compatibilityGuard).toBeGreaterThan(frozenBranch);
+    expect(compatibilityGuard).toBeLessThan(returnConfig);
   });
 });

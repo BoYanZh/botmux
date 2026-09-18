@@ -36,6 +36,8 @@ import {
   type GroupsActionDeps,
   type HandlerResult,
 } from './groups-action-helpers.js';
+import { roleWriteShouldInvalidate } from './groups-matrix-snapshot.js';
+import { stripAllSchedulePreconditionMaterial } from './public-redact.js';
 import {
   applySettingsWrite,
   type ResolvedDashboardSettingsView,
@@ -174,6 +176,23 @@ function scopeByCaller(
 }
 
 /**
+ * Keep the bot-facing Route B schedule projection narrower than the
+ * authenticated management projection held by the aggregator. Scope first so
+ * another bot's row is never processed into the caller's result, then clone
+ * each retained row while removing every executable/protected precondition
+ * representation. `prompt`, `workingDir`, and summary flags remain available
+ * to the bot dashboard; the input rows are never mutated.
+ */
+function scopeAndRedactSchedules(
+  rows: ReadonlyArray<unknown>,
+  callerAppId: string | undefined,
+  isGlobal: boolean,
+): unknown[] {
+  const scoped = isGlobal ? rows : scopeByCaller(rows, callerAppId);
+  return scoped.map(row => stripAllSchedulePreconditionMaterial(row));
+}
+
+/**
  * Per-bot scoping for the `groups-matrix` endpoint.
  *
  * The groups matrix returns `{ chats, bots }` where neither container has a
@@ -255,6 +274,19 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/sessions-list$/,
     handle: async (_m, ctx, deps) => {
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      const wantsFresh = ctx.url.searchParams.get('fresh') === '1';
+      // Interactive `/sessions` refreshes need the daemon's live projection:
+      // the dashboard aggregator is event-driven and may briefly retain the
+      // previous idle status before a working-edge SSE patch arrives.
+      if (wantsFresh && !isGlobal && ctx.callerAppId !== undefined) {
+        const upstream = await deps.proxyToDaemon(ctx.callerAppId, '/api/sessions', { method: 'GET' });
+        const body = await readUpstream(upstream);
+        if (upstream.status !== 200) return { status: upstream.status, body };
+        const rows = Array.isArray((body as { sessions?: unknown[] } | null)?.sessions)
+          ? (body as { sessions: unknown[] }).sessions
+          : [];
+        return { status: 200, body: { sessions: scopeByCaller(rows, ctx.callerAppId) } };
+      }
       const sessions = isGlobal
         ? deps.getSessions()
         : scopeByCaller(deps.getSessions(), ctx.callerAppId);
@@ -268,9 +300,11 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/schedules-list$/,
     handle: async (_m, ctx, deps) => {
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
-      const schedules = isGlobal
-        ? deps.getSchedules()
-        : scopeByCaller(deps.getSchedules(), ctx.callerAppId);
+      const schedules = scopeAndRedactSchedules(
+        deps.getSchedules(),
+        ctx.callerAppId,
+        isGlobal,
+      );
       return { status: 200, body: { schedules } };
     },
   },
@@ -310,15 +344,18 @@ const ROUTES: RouteDef[] = [
       // remains per-calling-bot until it has an explicit global write model.
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       const groups = await deps.buildGroupsMatrix();
+      const schedules = scopeAndRedactSchedules(
+        deps.getSchedules(),
+        ctx.callerAppId,
+        isGlobal,
+      );
       return {
         status: 200,
         body: {
           sessions: isGlobal
             ? deps.getSessions()
             : scopeByCaller(deps.getSessions(), ctx.callerAppId),
-          schedules: isGlobal
-            ? deps.getSchedules()
-            : scopeByCaller(deps.getSchedules(), ctx.callerAppId),
+          schedules,
           settings: deps.resolveDashboardSettings(),
           groups,
         },
@@ -458,7 +495,10 @@ const ROUTES: RouteDef[] = [
           body: ctx.bodyRaw.length > 0 ? ctx.bodyRaw : '{}',
         },
       );
-      return { status: upstream.status, body: await readUpstream(upstream) };
+      const body = await readUpstream(upstream);
+      // 写角色翻转 hasRole → 失效群矩阵快照（对齐同文件的 oncall bind/unbind）。
+      if (roleWriteShouldInvalidate(upstream.ok, body)) deps.groupsActionDeps.invalidateGroups?.();
+      return { status: upstream.status, body };
     },
   },
   {
@@ -472,7 +512,10 @@ const ROUTES: RouteDef[] = [
         `/api/roles/${encodeURIComponent(chatId)}`,
         { method: 'DELETE' },
       );
-      return { status: upstream.status, body: await readUpstream(upstream) };
+      const body = await readUpstream(upstream);
+      // 删角色把 hasRole 翻回 false → 同样失效快照。
+      if (roleWriteShouldInvalidate(upstream.ok, body)) deps.groupsActionDeps.invalidateGroups?.();
+      return { status: upstream.status, body };
     },
   },
 

@@ -258,6 +258,69 @@ describe('connector-api write routes', () => {
     expect(defaulted.connector.topicMessage).toEqual({ mode: 'default' });
   });
 
+  it('round-trips a trusted topic template and its allowlisted field extractors', async () => {
+    const topicMessage = {
+      mode: 'template',
+      text: 'Meego启动开发：{{title}} {{mention owners}}负责人 {{mention trigger}}触发人',
+      extractors: {
+        title: { path: '$.issue.title', kind: 'text' },
+        owners: { path: '$.meego.owners', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        trigger: { path: '$.meego.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+      },
+    };
+
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Meego development',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        topicMessage,
+      }),
+    }));
+
+    expect(created.connector.topicMessage).toEqual(topicMessage);
+  });
+
+  it('rejects unsafe or inconsistent trusted topic template definitions', async () => {
+    const invalidTopicMessages = [
+      {
+        mode: 'template',
+        text: '{{missing}}',
+        extractors: { title: { path: '$.issue.title', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{mention title}}',
+        extractors: { title: { path: '$.issue.title', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{title}}',
+        extractors: { title: { path: '$.issue.*', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{title}}',
+        extractors: { title: { path: '$.issue.title', kind: 'script' } },
+      },
+    ];
+
+    for (const topicMessage of invalidTopicMessages) {
+      const res = await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Invalid template',
+          target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+          topicMessage,
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toMatch(/^topic_message_template_/);
+    }
+  });
+
   it('round-trips the suppressFinalOutput toggle via POST and PUT', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
@@ -353,6 +416,57 @@ describe('connector-api write routes', () => {
     }));
     expect(created.connector.target.botIds).toEqual(['app1', 'app2']);
     expect(created.connector.lifecycleExtractors).toBeNull();
+  });
+
+  it('round-trips new-group lifecycle group names and drops them outside new-group mode', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Per-event rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'fixed', text: '  固定处理群  ' },
+      }),
+    }));
+    expect(created.connector.lifecycleGroupName).toEqual({ mode: 'fixed', text: '固定处理群' });
+
+    const templated = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.name}} {{dedupKey}}' },
+      }),
+    }));
+    expect(templated.connector.lifecycleGroupName).toEqual({
+      mode: 'template',
+      text: '告警 {{alert.name}} {{dedupKey}}',
+    });
+
+    const fixedTarget = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(fixedTarget.connector.lifecycleGroupName).toBeUndefined();
+  });
+
+  it('rejects invalid lifecycle group name templates', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Bad rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.*}}' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({
+      ok: false,
+      error: 'lifecycle_group_name_template_invalid',
+    });
   });
 
   it('stores a dedup-only lifecycleExtractors (status dropped) for new-group', async () => {

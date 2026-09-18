@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CreateActionButton, DropdownMenu, SectionHeader, dropdownLabel } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { confirm } from './confirm-modal.js';
 import {
   autoBindIdentity,
   botMatchesTeamFilters,
@@ -19,6 +20,7 @@ import {
   removeHostedTeamMember,
   teamCliOptions,
   updateLocalBotCapability,
+  updateHostedTeamFeedback,
   updateTeamBotCapability,
   type AutoBindCandidate,
   type HostedTeamsResponse,
@@ -26,6 +28,7 @@ import {
   type RosterDeployment,
   type Team,
   type TeamFilters,
+  type FeedbackPolicyLayer,
 } from './team-federation.js';
 
 type TeamTab = 'home' | 'manage';
@@ -215,7 +218,7 @@ function TeamHomePage() {
   }
 
   async function handleRemoveMember(teamId: string, deploymentId: string, name: string): Promise<void> {
-    if (!confirm(tr('team.removeMemberConfirm', { name }))) return;
+    if (!await confirm({ title: '移除成员', message: tr('team.removeMemberConfirm', { name }), danger: true })) return;
     await removeHostedTeamMember(teamId, deploymentId);
     if (!alive.current) return;
     void loadLocal();
@@ -726,7 +729,7 @@ function TeamManagePage() {
   }
 
   async function handleDelete(teamId: string, name: string): Promise<void> {
-    if (!confirm(tr('team.delConfirm', { name }))) return;
+    if (!await confirm({ title: '删除团队', message: tr('team.delConfirm', { name }), danger: true })) return;
     await deleteHostedTeam(teamId);
     if (!alive.current) return;
     void loadManageList();
@@ -826,11 +829,29 @@ function ManageTeamsList(props: {
             <div className="tm-inv-out team-inline-output" data-team={team.teamId} hidden={status.kind === 'none'}>
               <ManageInlineStatus status={status} tr={tr} suggestedHubUrl={props.suggestedHubUrl} />
             </div>
+            <HostedTeamFeedbackEditor teamId={team.teamId} initial={team.feedback ?? null} />
           </div>
         );
       })}
     </>
   );
+}
+
+function HostedTeamFeedbackEditor(props: { teamId: string; initial: FeedbackPolicyLayer | null }) {
+  const [draft, setDraft] = useState(JSON.stringify(props.initial ?? { enabled: false }, null, 2));
+  const [status, setStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function save(): Promise<void> {
+    setBusy(true); setStatus('');
+    try {
+      const parsed = JSON.parse(draft) as FeedbackPolicyLayer;
+      const result = await updateHostedTeamFeedback(props.teamId, parsed);
+      if (result.status < 200 || result.status >= 300 || (result.body as { ok?: boolean }).ok === false) throw new Error(String((result.body as any)?.error ?? result.status));
+      setDraft(JSON.stringify(result.body.feedback ?? null, null, 2)); setStatus('✓ 已保存');
+    } catch (error) { setStatus(`✗ ${error instanceof Error ? error.message : String(error)}`); }
+    finally { setBusy(false); }
+  }
+  return <div className="team-feedback-editor"><label><span>团队反馈策略</span><textarea rows={6} value={draft} disabled={busy} onChange={event => setDraft(event.target.value)} /></label><div className="actions"><button type="button" disabled={busy} onClick={() => void save()}>保存反馈策略</button><span>{status}</span></div></div>;
 }
 
 function ManageInlineStatus(props: { status: ManageStatus; tr: Translator; suggestedHubUrl?: string }) {

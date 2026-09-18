@@ -8,13 +8,14 @@
 
 ## Environment / Installation
 
-- **Node too old**: v18 and similar lack a built-in global `fetch`, so `botmux setup` throws `fetch is not defined` / `fetch failed` and won't write `bots.json`. → Upgrade to **Node ≥ 22**.
+- **`botmux: command not found` right after installing**: `~/.botmux/bin` isn't on PATH. Both install routes write your shell's startup file, but **you need a new terminal (or to source it) for it to take effect**. ⚠️ Known limitation: if `~/.botmux/bin` already happens to be on the *installing process's* PATH — **which is exactly the case when you install from inside a botmux CLI session**, since the daemon injects it into every session's PATH — `install.sh` concludes there is nothing to do and **writes no startup file**, so a new terminal still can't find it. → Install from an **ordinary terminal**, or add `export PATH="$HOME/.botmux/bin:$PATH"` to your startup file by hand.
+- **Node too old** (npm install path only): v18 and similar lack a built-in global `fetch`, so the `npm i -g botmux` postinstall or `botmux setup` throws `fetch is not defined` / `fetch failed`. → Upgrade to **Node ≥ 22**, or switch to the curl install (self-contained binary, no Node needed).
 - **First launch stuck on a manual confirmation**: On first run, a CLI (such as Claude Code) pops up a "trust this directory / bypass permissions" confirmation. If nobody has clicked through it, it hangs and reports a `tmux send-keys` error. → Confirm it manually once, and it won't appear again.
 
 ## Lost environment variables (high frequency)
 
-- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`). This is a common root cause of `API Error 403` / gateway token errors.
-- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
+- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`; fish users put them in `~/.config/fish/config.fish`). This is a common root cause of `API Error 403` / gateway token errors.
+- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`, fish in `~/.config/fish/config.fish`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
 
 ## Custom wrapper / gateway integration
 
@@ -47,7 +48,7 @@
 
 ## Dashboard / Security
 
-- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token is single-use; each run of `botmux dashboard` regenerates it and the old link becomes invalid immediately.
+- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token rotates rather than being consumed: the same URL remains reusable until rotation; only `botmux dashboard rotate` generates a new token and immediately invalidates the old link. The bare command and `botmux dashboard current` do not rotate it.
 - **Dashboard won't open**: First run `curl http://<host>:<port>/__health`; a `{"ok":true}` response means the service is healthy. The problem is usually a browser proxy / wrong host (a Mac's intranet IP can change) / opening a link with an old token.
 
 ## General troubleshooting approach

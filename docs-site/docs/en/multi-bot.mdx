@@ -12,7 +12,7 @@ Multiple Lark bots can run on the same machine, and each bot can be bound to a d
 
 ## Letting bots know each other
 
-The main path no longer requires a manual `/introduce`: botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
+botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
 
 For handoffs, have the model check:
 
@@ -21,7 +21,33 @@ For handoffs, have the model check:
 
 After that, a bot can explicitly @ the other from its own session with `botmux send --mention <the other's openId>`, triggering the relay.
 
-> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**. `/introduce` is still kept as a legacy / external-bot fallback: use `@botA @botB /introduce` only when the target is missing from `botmux bots list` or shows `mentionable=false`.
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**.
+
+## Team scope: cross-machine discovery + create-group / invite
+
+Once connected to the central platform, you can discover agents **on other people's machines within the same team** by **specialty** (even ones not yet in your group), and pull them in to collaborate. Three commands, each with a distinct job:
+
+```bash
+# Discover: list same-team, opted-in agents (use --team when this machine is in several teams)
+botmux bots list --scope team [--team <teamId>]
+
+# New group: pull discovered agents (by appId) + their owners into a platform-created focused group
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "Group name"]
+
+# Add to an existing group: add agents + their owners into a group you're already in (owners always included)
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+```
+
+Each agent from `bots list --scope team` carries: `appId` (use it to invite), `name`, `specialties` (an array of tags), `mentionable`, `online`, `owner`, `machineId/machineName`.
+
+Key points:
+
+- **Opt-in gate**: the discovery list **only contains agents that joined the team** — i.e. their owner explicitly added them via the platform's "Manage bots". If an agent doesn't show up, its owner most likely hasn't added it yet.
+- **`specialties` / `mentionable` / `online` are self-reported** by the agent — for selection only, not a trusted credential.
+- **appId only, no @ needed**: precisely because you can't @ someone else's bot before it's in your group, team discovery/create-group/invite all go by appId + platform auth, sidestepping "can't click what you can't see". Authorization (team membership, opt-in) lives entirely on the platform; the CLI makes no such judgment.
+- **`bots invite` target group** requires: **you are already in it** and **the platform bot is in it**. When the platform bot is absent, botmux **automatically uses a local bot already in the group to add it, then retries** — usually invisible; only when the group requires owner approval to add bots, or you have no local bot in that group, will it ask you to add it manually.
+
+**Don't confuse the three add paths**: `create-group --team` (cross-team new group) / `bots invite` (add same-team people into a group you're already in) / Lark `/invite` (add a same-tenant bot within the current group).
 
 ## Typical scenarios
 

@@ -35,6 +35,21 @@ describe('worker native session rename queue', () => {
     expect(flushRegion).toContain('syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
   });
 
+  it('keeps Codex native title sync codex-only', () => {
+    const syncStart = workerSource.indexOf('async function syncFreshCodexNativeSessionTitle(');
+    const syncEnd = workerSource.indexOf('/** 在 resume 首条输入前记录', syncStart);
+    const syncRegion = workerSource.slice(syncStart, syncEnd);
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flushRegion = workerSource.slice(flushStart, flushEnd);
+
+    expect(workerSource).not.toContain('function supportsCodexAppNativeSessionTitle(');
+    expect(syncRegion).toContain("cfg.cliId !== 'codex'");
+    expect(syncRegion).toContain("createCliAdapterSync('codex'");
+    expect(syncRegion).toContain('generateCodexAppThreadTitle({');
+    expect(flushRegion).toContain("lastInitConfig?.cliId === 'codex'");
+  });
+
   it('captures the resume metadata baseline without applying the title before the first append', () => {
     const region = caseRegion('init');
     expect(region).toContain('await prepareCodexNativeTitleGeneration(msg, codexRpcEngine)');
@@ -99,6 +114,34 @@ describe('worker native session rename queue', () => {
     expect(region).toContain('void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
   });
 
+  it('queues TraeX automatic titles only after the tagged user input submits', () => {
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flushRegion = workerSource.slice(flushStart, flushEnd);
+    const helperStart = workerSource.indexOf('function queuePostSubmitNativeSessionTitle(');
+    const helperEnd = workerSource.indexOf('\n/** 在 resume 首条输入前记录', helperStart);
+    const helperRegion = workerSource.slice(helperStart, helperEnd);
+
+    expect(helperRegion).toContain("supportsPostSubmitRenameSessionTitle(cfg.cliId)");
+    expect(helperRegion).toContain('pendingSessionRename = trimmed');
+    expect(flushRegion.indexOf('() => writeAdapter.writeInput('))
+      .toBeLessThan(flushRegion.indexOf('maybeQueuePostSubmitNativeSessionTitle(item)'));
+    expect(flushRegion).toContain('if (queuedPostSubmitNativeTitle) break');
+  });
+
+  it('keeps deferred submit recheck able to queue a TraeX automatic title', () => {
+    const helperStart = workerSource.indexOf('function scheduleSubmitFailureNotify(');
+    const helperEnd = workerSource.indexOf('\nfunction dropExactReceiptHandle', helperStart);
+    const helperRegion = workerSource.slice(helperStart, helperEnd);
+    const suppressIdx = helperRegion.indexOf("case 'suppress-confirmed':");
+    const queueIdx = helperRegion.indexOf('queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle)', suppressIdx);
+    const persistIdx = helperRegion.indexOf('persistCliSessionId(cliSessionId)', suppressIdx);
+
+    expect(suppressIdx).toBeGreaterThanOrEqual(0);
+    expect(queueIdx).toBeGreaterThan(suppressIdx);
+    expect(queueIdx).toBeLessThan(persistIdx);
+  });
+
   it('queues rename IPC without opening a renderer or usage turn', () => {
     const region = caseRegion('rename_session');
     expect(region).toContain('pendingSessionRename = msg.title');
@@ -115,14 +158,21 @@ describe('worker native session rename queue', () => {
     const promptLoopIdx = region.indexOf('while (pendingMessages.length > 0');
 
     expect(region).toContain('const sessionRenameReady = isPromptReady && pendingSessionRename !== null');
-    expect(region).toContain('if (sessionRenameInFlight) return');
+    expect(region).toContain('if (sessionRenameInFlight()) return');
     expect(region).toContain('if (commandLineWritesPending > 0) return');
     expect(region).toContain('const rawInputReady = isPromptReady');
-    expect(region).toContain('await sendRawCommandLineWithRecoveryFence(backend, buildRename(title))');
+    expect(region).toContain('await sendRawCommandLineWithRecoveryFence(renameBackend, buildRename(title))');
+    expect(region).toContain("sessionRenamePhase = 'reserved'");
+    expect(region).toContain("sessionRenamePhase = 'writing'");
+    expect(region).toContain("sessionRenamePhase = 'sent'");
     expect(region).toContain('armSessionRenameIdleTimeout()');
     expect(region).toContain("effectiveBackendType === 'riff'");
     expect(renameIdx).toBeGreaterThanOrEqual(0);
     expect(renameIdx).toBeLessThan(promptLoopIdx);
+    expect(region.indexOf("sessionRenamePhase = 'writing'"))
+      .toBeLessThan(region.indexOf('await sendRawCommandLineWithRecoveryFence(renameBackend'));
+    expect(region.indexOf('await sendRawCommandLineSerially(renameBackend'))
+      .toBeLessThan(region.indexOf("sessionRenamePhase = 'sent'"));
   });
 
   it('blocks type-ahead messages until the rename command returns to prompt', () => {
@@ -133,8 +183,10 @@ describe('worker native session rename queue', () => {
     const readyEnd = workerSource.indexOf('\nfunction persistCliSessionId', readyStart);
     const readyRegion = workerSource.slice(readyStart, readyEnd);
 
-    expect(sendToPtyRegion).toContain('!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow');
-    expect(readyRegion).toContain('clearSessionRenameInFlight()');
+    expect(sendToPtyRegion).toContain('!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow');
+    expect(readyRegion).toContain('settleSessionRenameOnPrompt()');
+    expect(workerSource).toContain("if (sessionRenamePhase === 'sent') forceClearSessionRenameInFlight()");
+    expect(workerSource).toContain("if (sessionRenamePhase === 'writing') sessionRenamePhase = 'sent'");
     expect(workerSource).toContain('Native session rename idle timeout');
   });
 
@@ -171,6 +223,6 @@ describe('worker native session rename queue', () => {
     expect(flushRegion).toContain('await deliverRawInput(raw)');
     expect(workerSource).toContain('await sendRawCommandLineWithRecoveryFence(');
     expect(flushRegion.indexOf('await deliverRawInput(raw)'))
-      .toBeLessThan(flushRegion.indexOf('await sendRawCommandLineWithRecoveryFence(backend, buildRename(title))'));
+      .toBeLessThan(flushRegion.indexOf('await runAdoptSessionRenameSequence({'));
   });
 });

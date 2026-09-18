@@ -5,6 +5,8 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  renameGroup,
+  setPinStreamingCardForGroup,
   unbindOncall,
   type DaemonHandle,
   type GroupsActionDeps,
@@ -32,6 +34,7 @@ function makeDeps(over: Partial<GroupsActionDeps> = {}): GroupsActionDeps {
     proxyToDaemon: vi.fn(async () => makeRes(200, { ok: true })),
     closeSessionsMatching: vi.fn(async () => []),
     fetch: vi.fn(async () => makeRes(200, { inChat: true })),
+    invalidateGroups: vi.fn(),
     ...over,
   };
 }
@@ -52,6 +55,7 @@ describe('addBotsToGroup', () => {
     expect(r.body).toEqual({ ok: true, added: ['cli_x'] });
     // membership probe + add-bots
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns no_proxy_bot when no online daemon is in chat', async () => {
@@ -63,6 +67,7 @@ describe('addBotsToGroup', () => {
     const r = await addBotsToGroup('oc_demo', '{}', deps);
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: false, error: 'no_proxy_bot' });
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 
   it('returns bad_json when body is not valid JSON', async () => {
@@ -101,6 +106,7 @@ describe('disbandGroup', () => {
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: true, closedSessions: closedReturn });
     expect(deps.closeSessionsMatching).toHaveBeenCalledOnce();
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns larkAppId_required when body lacks the field', async () => {
@@ -119,6 +125,7 @@ describe('disbandGroup', () => {
     expect(r.status).toBe(500);
     expect(r.body).toEqual({ ok: false, error: 'lark_denied', closedSessions: [] });
     expect(deps.closeSessionsMatching).not.toHaveBeenCalled();
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 });
 
@@ -174,6 +181,7 @@ describe('leaveGroup', () => {
 
     // Cascade close called only for cli_a (the only successful leave).
     expect(closedSpy).toHaveBeenCalledOnce();
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns larkAppIds_required when body lacks the array or it is empty', async () => {
@@ -230,6 +238,7 @@ describe('bindOncall', () => {
     expect(call[1]).toBe('/api/oncall/oc_demo');
     expect((call[2] as RequestInit).method).toBe('PUT');
     expect((call[2] as RequestInit).body).toBe('{"workingDir":"/repo/x"}');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('uses "{}" body when raw body is empty', async () => {
@@ -237,6 +246,51 @@ describe('bindOncall', () => {
     const deps = makeDeps({ proxyToDaemon: proxySpy });
     await bindOncall('oc_demo', 'cli_owner', '', deps);
     expect((proxySpy.mock.calls[0]![2] as RequestInit).body).toBe('{}');
+  });
+});
+
+describe('renameGroup', () => {
+  it('routes through the exact bot identity and invalidates snapshots on success', async () => {
+    const proxySpy = vi.fn(async () => makeRes(200, {
+      ok: true,
+      changed: true,
+      oldName: 'Old',
+      newName: 'New',
+    }));
+    const operationDeps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const result = await renameGroup(
+      'oc topic/one',
+      'cli/app one',
+      '{"name":"New"}',
+      operationDeps,
+    );
+
+    expect(result).toEqual({
+      status: 200,
+      body: { ok: true, changed: true, oldName: 'Old', newName: 'New' },
+    });
+    expect(proxySpy).toHaveBeenCalledWith(
+      'cli/app one',
+      '/api/groups/oc%20topic%2Fone/name',
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{"name":"New"}',
+      },
+    );
+    expect(operationDeps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+
+  it('preserves upstream failures without invalidating snapshots', async () => {
+    const operationDeps = makeDeps({
+      proxyToDaemon: vi.fn(async () => makeRes(403, { ok: false, error: 'bot_not_in_chat' })),
+    });
+
+    const result = await renameGroup('oc_demo', 'cli_owner', '{}', operationDeps);
+
+    expect(result).toEqual({ status: 403, body: { ok: false, error: 'bot_not_in_chat' } });
+    expect(operationDeps.invalidateGroups).not.toHaveBeenCalled();
   });
 });
 
@@ -251,5 +305,42 @@ describe('unbindOncall', () => {
     expect(call[0]).toBe('cli_owner');
     expect(call[1]).toBe('/api/oncall/oc_demo');
     expect((call[2] as RequestInit).method).toBe('DELETE');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+});
+
+describe('setPinStreamingCardForGroup', () => {
+  it('proxies exact decoded chat/app ids to the daemon route, forwards body verbatim, preserves upstream status, and invalidates groups on success', async () => {
+    const proxySpy = vi.fn(async (_appId, _daemonPath, _init) => makeRes(202, { ok: true, enabled: false, changed: true }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const r = await setPinStreamingCardForGroup(
+      'oc topic/with slash',
+      'cli/app with space',
+      '{"enabled":false}',
+      deps,
+    );
+
+    expect(r.status).toBe(202);
+    expect(r.body).toEqual({ ok: true, enabled: false, changed: true });
+    expect(proxySpy).toHaveBeenCalledOnce();
+    const call = proxySpy.mock.calls[0]!;
+    expect(call[0]).toBe('cli/app with space');
+    expect(call[1]).toBe('/api/chat-pin-streaming-card/oc%20topic%2Fwith%20slash');
+    expect((call[2] as RequestInit).method).toBe('PUT');
+    expect((call[2] as RequestInit).body).toBe('{"enabled":false}');
+    expect(((call[2] as RequestInit).headers as Record<string, string>)['content-type']).toBe('application/json');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+
+  it('does not invalidate the cache when upstream reports failure', async () => {
+    const proxySpy = vi.fn(async () => makeRes(409, { ok: false, error: 'already_disabled' }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const r = await setPinStreamingCardForGroup('oc_demo', 'cli_owner', '{"enabled":false}', deps);
+
+    expect(r.status).toBe(409);
+    expect(r.body).toEqual({ ok: false, error: 'already_disabled' });
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 });

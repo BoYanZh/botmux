@@ -11,13 +11,21 @@ vi.mock('../src/platform/binding.js', () => ({
   publicReverseProxyBaseUrl: vi.fn(() => null),
   readPlatformBinding: vi.fn(() => null),
 }));
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
 
 import {
   buildDashboardUrl,
   buildDashboardUrls,
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
+  buildV3TerminalUrl,
   formatUrlHost,
+  reportDashboardUrls,
+  stripDashboardToken,
+  workbenchEntryUrl,
+  workbenchSpaUrl,
 } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import {
@@ -25,6 +33,7 @@ import {
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../src/platform/binding.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
@@ -32,6 +41,7 @@ const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).
 const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
   vi.mocked(readPlatformBinding).mockReturnValue(binding)
 );
+const setDevbox = (base: string | null) => vi.mocked(devboxDashboardBaseUrl).mockReturnValue(base);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
@@ -39,6 +49,7 @@ describe('buildDashboardUrl', () => {
     setPlatform(null);
     setPublic(null);
     setBinding(null);
+    setDevbox(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -98,6 +109,33 @@ describe('buildDashboardUrl', () => {
       'https://m-deadbeef.botmux.example/?t=abc',
     );
   });
+
+  it('routes through a cached Merlin Devbox export when no explicit remote base exists', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+  });
+
+  // The Devbox lookup validates the cache against the port the dashboard
+  // actually bound (`.dashboard-port`), not against the port this link is for:
+  // v3 card callers pass config.dashboard.port, which goes stale after an
+  // EADDRINUSE probe, and would otherwise demote a working tunnel link.
+  it('asks the Devbox lookup about the bound port, not the caller port', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+    expect(devboxDashboardBaseUrl).toHaveBeenLastCalledWith();
+  });
+
+  it('lets BOTMUX_PUBLIC_URL win over a cached Merlin Devbox export', () => {
+    setPublic('https://botmux.example.com');
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://botmux.example.com/?t=abc',
+    );
+  });
 });
 
 describe('buildDashboardUrls', () => {
@@ -105,12 +143,15 @@ describe('buildDashboardUrls', () => {
     setRemote(false);
     setPlatform(null);
     setPublic(null);
+    setDevbox(null);
   });
 
   it('local-only: no localUrl fallback when the primary is already local', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'http://1.2.3.4:7891/?t=abc',
       localUrl: undefined,
+      // 纯本地 ⟹ 不是平台托管 ⟹ token 是唯一入口，不可摘。
+      platformHosted: false,
     });
   });
 
@@ -120,6 +161,8 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'http://1.2.3.4:7891/?t=abc',
       localUrl: undefined,
+      // 开关开着但没绑定 ⟹ 主链接仍是本地 ⟹ 不是平台托管。
+      platformHosted: false,
     });
   });
 
@@ -129,6 +172,8 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'https://m-deadbeef.botmux.example/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
+      // 远程访问开 + 已绑定 ⟹ 主链接就是平台子域 ⟹ 唯一可摘 token 的形态。
+      platformHosted: true,
     });
   });
 
@@ -138,6 +183,7 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891 })).toEqual({
       url: 'https://m-deadbeef.botmux.example/',
       localUrl: 'http://1.2.3.4:7891/',
+      platformHosted: true,
     });
   });
 
@@ -146,6 +192,9 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'https://botmux.example.com/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
+      // 🔴 关键回归：自建反代同样产生 localUrl，但**没有人注入身份** ⟹ 必须 false。
+      // 这一格是 `localUrl !== undefined` 那个错判据当初漏掉的场景。
+      platformHosted: false,
     });
   });
 
@@ -215,6 +264,18 @@ describe('buildPlatformDashboardLoginUrl', () => {
     setBinding({ platformUrl: 'https://platform.example/base', machineId: 'm/1', machineToken: 'secret' });
     expect(buildPlatformDashboardLoginUrl()).toContain('/open/m%2F1?');
   });
+
+  it('routes a `/s/<sessionId>` next so an owner logging in from the read-only terminal lands back on a writable terminal (#933)', () => {
+    setRemote(true);
+    setBinding({ platformUrl: 'https://platform.example', machineId: 'm-1', machineToken: 'secret' });
+    const url = buildPlatformDashboardLoginUrl('/s/sess-42');
+    // The platform routes a `/s/`-prefixed next to the terminal subdomain
+    // surface and mints the host-only proxy cookie there; the whole next is
+    // percent-encoded as one query value.
+    expect(url).toBe('https://platform.example/open/m-1?next=%2Fs%2Fsess-42');
+    // Default is unchanged — the existing SPA-401 caller must keep landing on /#/.
+    expect(buildPlatformDashboardLoginUrl()).toBe('https://platform.example/open/m-1?next=%2F%23%2F');
+  });
 });
 
 describe('buildV3RunDetailUrl', () => {
@@ -283,5 +344,184 @@ describe('buildV3RunDetailUrl', () => {
     expect(buildV3RunDetailUrl('run-1', { host: '::1', port: 7891 })).toBe(
       'http://[::1]:7891/#/v3/run-1',
     );
+  });
+});
+
+describe('buildV3TerminalUrl', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setDevbox(null);
+  });
+
+  it('builds a LAN worker link with the per-boot read capability', () => {
+    expect(buildV3TerminalUrl('sess/with space', {
+      host: '::1',
+      webPort: 8765,
+      viewToken: 'view token&1',
+    })).toBe('http://[::1]:8765/?viewToken=view%20token%261');
+  });
+
+  it('builds a central /s link carrying the same read capability', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3TerminalUrl('sess/with space', {
+      host: '10.0.0.8',
+      viewToken: 'view token&1',
+    })).toBe(
+      'https://m-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
+    );
+  });
+
+  it('refuses to render a terminal dead-link without a read capability', () => {
+    expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8', webPort: 8765 })).toBeNull();
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8' })).toBeNull();
+  });
+});
+
+describe('workbench entry URL shapes', () => {
+  // Both derive from an already-built dashboard URL, so they inherit whatever
+  // base buildDashboardUrls picked (local host:port / platform subdomain /
+  // BOTMUX_PUBLIC_URL) with no second copy of that precedence rule.
+  const dashboardUrl = 'http://1.2.3.4:7891/?t=abc';
+
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setBinding(null);
+  });
+
+  it('workbenchSpaUrl keeps the ?t= token and adds the SPA hash route', () => {
+    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
+  });
+
+  it('workbenchEntryUrl swaps the path and drops the fragment', () => {
+    expect(workbenchEntryUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/workbench?t=abc');
+    // Already-hashed input normalizes to the same fragment-free entry.
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/?t=abc#/agent-workbench'))
+      .toBe('http://1.2.3.4:7891/workbench?t=abc');
+  });
+
+  it('follows the platform base rather than re-deriving host:port', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const { url } = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
+    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
+    expect(workbenchEntryUrl(url)).toBe('https://m-deadbeef.botmux.example/workbench?t=abc');
+  });
+
+  it('tolerates a token-less dashboard URL (user logs in on arrival)', () => {
+    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench?botmuxWorkbenchShell=immersive');
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/workbench');
+  });
+
+  it('returns null for unparseable or non-http input instead of a half link', () => {
+    for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      expect(workbenchSpaUrl(bad)).toBeNull();
+      expect(workbenchEntryUrl(bad)).toBeNull();
+    }
+  });
+});
+
+describe('stripDashboardToken', () => {
+  it('removes ?t= while keeping origin and path', () => {
+    expect(stripDashboardToken('https://m-abc.example/?t=secret')).toBe('https://m-abc.example/');
+    expect(stripDashboardToken('http://1.2.3.4:7891/?t=secret')).toBe('http://1.2.3.4:7891/');
+    expect(stripDashboardToken('https://m-abc.example/workbench?t=secret'))
+      .toBe('https://m-abc.example/workbench');
+  });
+
+  it('never leaves the token anywhere in the result', () => {
+    for (const url of [
+      'https://m-abc.example/?t=secret',
+      'https://m-abc.example/?t=secret#/agent-workbench',
+      'https://m-abc.example/workbench?t=secret&x=1',
+    ]) {
+      expect(stripDashboardToken(url)).not.toContain('secret');
+    }
+  });
+
+  // 只摘凭证，不清空查询串：将来可能有 next / 诊断开关等无害参数。
+  it('keeps other query params and the hash', () => {
+    expect(stripDashboardToken('https://m-abc.example/?t=secret&next=%2Fx#/agent-workbench'))
+      .toBe('https://m-abc.example/?next=%2Fx#/agent-workbench');
+  });
+
+  it('is a no-op on an already token-free URL', () => {
+    expect(stripDashboardToken('https://m-abc.example/')).toBe('https://m-abc.example/');
+  });
+
+  it('returns null for unparseable or non-http input instead of a half link', () => {
+    for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      expect(stripDashboardToken(bad)).toBeNull();
+    }
+  });
+});
+
+// ─── 持久化载体（飞书卡片）比终端更严格 ──────────────────────────────────────
+// 回归背景：`daemon.ts:dashboardUrlForReport` 给「重启报告 DM 卡」和「CLI 运行时
+// 更新提醒卡」提供链接，第一版仍原样带 token —— 那是**永久聊天记录**，可转发/截图，
+// 正是本次要堵的泄漏面。我的「影响面」一开始漏掉了这条路径。
+describe('reportDashboardUrls (Feishu card carrier)', () => {
+  const tokenized = {
+    url: 'https://m-abc.platform.test/?t=tok-abc',
+    localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    platformHosted: true,
+  };
+
+  it('PLATFORM-HOSTED: strips the token AND withholds the local fallback entirely', () => {
+    const out = reportDashboardUrls(tokenized);
+    expect(out.url).toBe('https://m-abc.platform.test/');
+    // localUrl 恒定带 token ⟹ 卡片一律不给（终端才有显式参数可取）。
+    expect(out.localUrl).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('tok-abc');
+  });
+
+  it('NOT platform-hosted (reverse proxy / devbox / LAN): passes through untouched', () => {
+    // 这几条路没有人注入身份，token 仍是唯一凭证 —— 摘了就是死链。
+    const notPlatform = { ...tokenized, platformHosted: false };
+    const out = reportDashboardUrls(notPlatform);
+    expect(out).toEqual(notPlatform);
+  });
+
+  it('fail-safe: unparseable URL keeps the URL but still withholds localUrl', () => {
+    const out = reportDashboardUrls({
+      url: 'not-a-url', localUrl: 'http://10.0.0.7:7891/?t=tok', platformHosted: true,
+    });
+    expect(out.url).toBe('not-a-url');
+    expect(out.localUrl).toBeUndefined();
+  });
+
+  it('is a no-op on an already token-free platform URL', () => {
+    expect(reportDashboardUrls({ url: 'https://m-abc.platform.test/', platformHosted: true }))
+      .toEqual({ url: 'https://m-abc.platform.test/', platformHosted: true });
+  });
+});
+
+// ─── 协议加字段的版本混搭矩阵（两个方向都要成立）────────────────────────────
+// 新增 `platformHosted` 是加字段，所以升级不同步的两种组合都必须安全：
+//   · 新 CLI + 旧 dashboard：字段缺失 → 严格 true 判定为 false → 保留 token
+//     （由 dashboard-endpoint.test.ts 的解析用例覆盖）
+//   · 旧 CLI + 新 dashboard：旧 CLI 不认识该字段、也没有摘 token 的逻辑，
+//     它只会原样打印 `url` —— 所以 **`url` 必须始终带 token**。
+// 这条正是「协议层如实回原始 URL、由 CLI 决定摘不摘」这个设计的兑现点：
+// 如果当初让 dashboard 直接回摘好的 URL，旧 CLI 就会拿到一条进不去的链接。
+describe('buildDashboardUrls: the wire URL always keeps its token', () => {
+  beforeEach(() => {
+    setRemote(false); setPlatform(null); setPublic(null); setDevbox(null);
+  });
+
+  it('keeps ?t= in `url` even when platformHosted is true (old CLIs print it as-is)', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const urls = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
+    expect(urls.platformHosted).toBe(true);
+    // 摘 token 是消费端的决定，不是协议的决定。
+    expect(urls.url).toContain('?t=abc');
+    expect(urls.localUrl).toContain('?t=abc');
   });
 });

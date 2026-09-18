@@ -42,7 +42,8 @@ async function freshModules() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const store = await import('../src/services/bot-config-store.js');
-  return { registry, store };
+  const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
+  return { registry, store, pinStreamingCardChange };
 }
 
 describe('bot-config store', () => {
@@ -72,9 +73,9 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store } = await freshModules();
+    const { registry, store, pinStreamingCardChange } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store };
+    return { registry, store, pinStreamingCardChange };
   }
 
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
@@ -87,6 +88,42 @@ describe('bot-config store', () => {
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
+    expect(keys).toContain('feedback');
+    expect(keys).toContain('cardActionAckTimeoutMs');
+  });
+
+  it('strictly normalizes feedback JSON through the shared config field', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    expect(store.coerceConfigValue(spec, '{"enabled":true}')).toMatchObject({
+      ok: true,
+      value: { enabled: true, audience: 'requester' },
+    });
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists bot and per-chat feedback layers and updates the live registry', async () => {
+    const { registry, store } = await loaded();
+    expect(await store.setBotFeedbackPolicy('app_default', { enabled: true, allowReselect: true })).toMatchObject({ ok: true });
+    expect(readConfig().feedback).toMatchObject({ enabled: true, allowReselect: true });
+    expect(registry.getBot('app_default').config.feedback).toMatchObject({ enabled: true, allowReselect: true });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { enabled: false })).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies.oc_chat).toEqual({ enabled: false });
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies?.oc_chat).toEqual({ enabled: false });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', null)).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies).toBeUndefined();
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies).toBeUndefined();
+  });
+
+  it('rejects invalid feedback layers without changing disk or live memory', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const beforeDisk = readConfig();
+    const beforeMemory = structuredClone(registry.getBot('app_default').config);
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { buttons: {} } as any)).toMatchObject({ ok: false, reason: 'invalid_policy' });
+    expect(readConfig()).toEqual(beforeDisk);
+    expect(registry.getBot('app_default').config).toEqual(beforeMemory);
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -100,6 +137,8 @@ describe('bot-config store', () => {
     const { store } = await freshModules();
     expect(store.findConfigField('MODEL')?.configKey).toBe('model');
     expect(store.findConfigField('disablestreamingcard')?.configKey).toBe('disableStreamingCard');
+    expect(store.findConfigField('hiddenstreamingcardbuttons')?.configKey).toBe('hiddenStreamingCardButtons');
+    expect(store.findConfigField('PINSTREAMINGCARD')?.configKey).toBe('pinStreamingCard');
     expect(store.findConfigField('nope')).toBeUndefined();
   });
 
@@ -390,6 +429,79 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('hiddenStreamingCardButtons')!;
+    const parsed = store.coerceConfigValue(spec, 'close terminal close');
+    expect(parsed).toEqual({ ok: true, value: ['terminal', 'close'] });
+    expect(store.coerceConfigValue(spec, 'terminal unknown')).toEqual({ ok: false, reason: 'empty' });
+    if (!parsed.ok) return;
+
+    const set = await store.applyConfigField('app_default', spec, parsed.value);
+    expect(set.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toEqual(['terminal', 'close']);
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons)
+      .toEqual(['terminal', 'close']);
+
+    const unset = await store.applyConfigField('app_default', spec, null);
+    expect(unset.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toBeUndefined();
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
+  });
+
+  it('defaultOn boolean (thinkingCard): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('thinkingCard')!;
+    expect(spec.defaultOn).toBe(true);
+
+    // off → explicit false on disk and in memory. oldText 'on' proves the
+    // untouched (absent) value renders as on — the default-ON display path.
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().thinkingCard).toBe(false);
+    expect(registry.getBot('app_default').config.thinkingCard).toBe(false);
+
+    // on → key deleted (back to default), in-memory undefined (= on).
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.getBot('app_default').config.thinkingCard).toBeUndefined();
+
+    // unset (null) from an explicit-false state also restores the default.
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().thinkingCard).toBeUndefined();
+  });
+
+  it('defaultOn boolean (thinkingCardToolResult): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('thinkingCardToolResult')!;
+    expect(spec.defaultOn).toBe(true);
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().thinkingCardToolResult).toBe(false);
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;
@@ -415,6 +527,20 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, null);
     expect(readConfig().usageDisplay).toBeUndefined();
     expect(registry.getBot('app_default').config.usageDisplay).toBeUndefined();
+  });
+
+  it('offers only default and unified reply modes and preserves the retired status-card opt-out on writes', async () => {
+    const { registry, store } = await loaded({ replyCardMode: 'final-only' });
+    const spec = store.findConfigField('replyCardMode')!;
+    expect(spec.enumValues).toEqual(['legacy', 'unified']);
+    expect(store.coerceConfigValue(spec, 'final-only')).toEqual({ ok: false, reason: 'invalid_enum' });
+    expect(registry.getBot('app_default').config).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    expect((await store.applyConfigField('app_default', spec, 'unified')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    const offSwitch = store.findConfigField('disableStreamingCard')!;
+    expect((await store.applyConfigField('app_default', offSwitch, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].disableStreamingCard).toBeUndefined();
   });
 
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
@@ -446,6 +572,108 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
   });
 
+  it('pinStreamingCard is an immediate default-off boolean', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    expect(spec).toMatchObject({
+      configKey: 'pinStreamingCard',
+      kind: 'boolean',
+      effect: 'immediate',
+      clearable: false,
+    });
+
+    const on = await store.applyConfigField('app_default', spec, true);
+    expect(on).toMatchObject({ ok: true, oldText: 'off', newText: 'on' });
+    expect(readConfig().pinStreamingCard).toBe(true);
+    expect(registry.getBot('app_default').config.pinStreamingCard).toBe(true);
+
+    const off = await store.applyConfigField('app_default', spec, false);
+    expect(off).toMatchObject({ ok: true, oldText: 'on', newText: 'off' });
+    expect(readConfig().pinStreamingCard).toBeUndefined();
+    expect(registry.getBot('app_default').config.pinStreamingCard).toBeUndefined();
+  });
+
+  it('notifies pinStreamingCard changes only after disk and live memory are synchronized', async () => {
+    const { registry, store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const observed: Array<{ enabled: boolean; disk: unknown; memory: unknown }> = [];
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler((appId, enabled) => {
+      observed.push({
+        enabled,
+        disk: readConfig().pinStreamingCard,
+        memory: registry.getBot(appId).config.pinStreamingCard,
+      });
+    });
+
+    try {
+      const on = await store.applyConfigField('app_default', spec, true);
+      expect(on.ok).toBe(true);
+
+      const off = await store.applyConfigField('app_default', spec, false);
+      expect(off.ok).toBe(true);
+    } finally {
+      dispose();
+    }
+
+    expect(observed).toEqual([
+      { enabled: true, disk: true, memory: true },
+      { enabled: false, disk: undefined, memory: undefined },
+    ]);
+  });
+
+  it('does not notify pinStreamingCard no-op writes when the effective boolean is unchanged', async () => {
+    const { registry, store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const observed: Array<{ enabled: boolean; disk: unknown; memory: unknown }> = [];
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler((appId, enabled) => {
+      observed.push({
+        enabled,
+        disk: readConfig().pinStreamingCard,
+        memory: registry.getBot(appId).config.pinStreamingCard,
+      });
+    });
+
+    try {
+      const offNoop = await store.applyConfigField('app_default', spec, false);
+      expect(offNoop.ok).toBe(true);
+
+      const on = await store.applyConfigField('app_default', spec, true);
+      expect(on.ok).toBe(true);
+
+      const onNoop = await store.applyConfigField('app_default', spec, true);
+      expect(onNoop.ok).toBe(true);
+
+      const off = await store.applyConfigField('app_default', spec, false);
+      expect(off.ok).toBe(true);
+
+      const offNoopAgain = await store.applyConfigField('app_default', spec, false);
+      expect(offNoopAgain.ok).toBe(true);
+    } finally {
+      dispose();
+    }
+
+    expect(observed).toEqual([
+      { enabled: true, disk: true, memory: true },
+      { enabled: false, disk: undefined, memory: undefined },
+    ]);
+  });
+
+  it('does not notify pinStreamingCard changes when the write fails', async () => {
+    const { store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const seen = vi.fn();
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler(seen);
+
+    try {
+      const result = await store.applyConfigField('app_missing', spec, true);
+      expect(result).toMatchObject({ ok: false, reason: 'bot_not_registered' });
+    } finally {
+      dispose();
+    }
+
+    expect(seen).not.toHaveBeenCalled();
+  });
+
   it('number field (maxLiveWorkers) round-trips and clears on null', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('maxLiveWorkers')!;
@@ -462,6 +690,54 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().maxLiveWorkers).toBeUndefined();
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('cardActionAckTimeoutMs enforces its range and hot-updates the registered Bot', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('cardActionAckTimeoutMs')!;
+    expect(spec).toMatchObject({
+      kind: 'number',
+      effect: 'immediate',
+      clearable: true,
+      min: 500,
+      max: 2_500,
+    });
+    expect(store.coerceConfigValue(spec, 500)).toEqual({ ok: true, value: 500 });
+    expect(store.coerceConfigValue(spec, '2500')).toEqual({ ok: true, value: 2_500 });
+    expect(store.coerceConfigValue(spec, 499)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 2_501)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1_000.5)).toEqual({ ok: false, reason: 'invalid_number' });
+
+    const set = await store.applyConfigField('app_default', spec, 1_200);
+    expect(set).toMatchObject({ ok: true, oldText: '∅', newText: '1200', effect: 'immediate' });
+    expect(readConfig().cardActionAckTimeoutMs).toBe(1_200);
+    expect(registry.getBot('app_default').config.cardActionAckTimeoutMs).toBe(1_200);
+
+    const unset = await store.applyConfigField('app_default', spec, null);
+    expect(unset.ok).toBe(true);
+    expect(readConfig().cardActionAckTimeoutMs).toBeUndefined();
+    expect(registry.getBot('app_default').config.cardActionAckTimeoutMs).toBeUndefined();
+  });
+
+  it('session owner reminder config round-trips and hot-updates the registered Bot', async () => {
+    const { registry } = await loaded();
+    const reminderStore = await import('../src/services/session-owner-reminder-config-store.js');
+    const value = {
+      enabled: true,
+      intervalMinutes: 30,
+      text: '请继续处理。',
+      states: ['idle', 'tui_prompt'],
+    };
+    const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
+    expect(saved).toEqual({ ok: true, config: value });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
+    expect(registry.getBot('app_default').config.sessionOwnerReminder).toEqual(value);
+
+    expect(await reminderStore.updateSessionOwnerReminderConfig('app_default', {
+      ...value,
+      text: '<at user_id="ou_other"></at>',
+    })).toEqual({ ok: false, reason: 'invalid_session_owner_reminder' });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
   });
 
   it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
@@ -482,6 +758,63 @@ describe('bot-config store', () => {
     expect(r.ok).toBe(true);
     expect(readConfig().cliId).toBe('codex');
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
+  });
+
+  it('reasoningEffort is a next-session enum field', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(store.coerceConfigValue(spec, 'MEDIUM')).toEqual({ ok: true, value: 'medium' });
+    expect(store.coerceConfigValue(spec, 'extreme')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const r1 = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('allows TraeX common reasoning effort when model is unset', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    const r = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+  });
+
+  it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
+    const unsupportedCli = await loaded({ cliId: 'gemini' });
+    const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
+    const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.reason).toBe('reasoning_effort_not_supported');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedCli.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+
+    const unsupportedPair = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const r2 = await unsupportedPair.store.applyConfigField('app_default', spec, 'xhigh');
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedPair.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('rejects model writes that would make the stored reasoningEffort invalid', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' });
+    const spec = store.findConfigField('model')!;
+    const r = await store.applyConfigField('app_default', spec, 'DeepSeek-V4-Pro');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().model).toBe('GPT-5.5');
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.model).toBe('GPT-5.5');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
@@ -554,7 +887,7 @@ describe('bot-config store', () => {
   });
 
   it('getConfigSnapshot reports current values + info', async () => {
-    const { store } = await loaded({ model: 'sonnet', disableStreamingCard: true });
+    const { store } = await loaded({ model: 'sonnet', disableStreamingCard: true, pinStreamingCard: true });
     const snap = store.getConfigSnapshot('app_default');
     expect(snap.ok).toBe(true);
     if (snap.ok) {
@@ -564,6 +897,8 @@ describe('bot-config store', () => {
       expect(model?.value).toBe('sonnet');
       const card = snap.rows.find(r => r.key === 'disableStreamingCard');
       expect(card?.value).toBe('on');
+      const pin = snap.rows.find(r => r.key === 'pinStreamingCard');
+      expect(pin?.value).toBe('on');
     }
   });
 
@@ -596,6 +931,151 @@ describe('bot-config store', () => {
     if (!r.ok) expect(r.reason).toBe('empty_resolved');
   });
 
+  it('setBotBlockedUsers with [] clears disk entry and in-memory resolved list', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.setBotBlockedUsers('app_default', []);
+    expect(r.ok).toBe(true);
+    expect(r).toMatchObject({ ok: true, raw: [], resolved: [] });
+    expect(readConfig().blockedUsers).toBeUndefined();
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toBeUndefined();
+    expect(bot.resolvedBlockedUsers).toEqual([]);
+  });
+
+  it('setBotBlockedUsers refuses to block a resolved allowedUsers admin', async () => {
+    const { registry, store } = await loaded();
+    // 模拟 daemon 启动期把 email 形态的管理员解析成 ou_ 后的内存态。
+    registry.getBot('app_default').resolvedAllowedUsers = ['ou_owner', 'ou_alice'];
+
+    const r = await store.setBotBlockedUsers('app_default', ['alice@corp.com']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe('cannot_block_admin');
+      expect(r.conflicting).toEqual(['ou_alice']);
+    }
+    // 绝不落盘 / 不动内存。
+    expect(readConfig().blockedUsers).toBeUndefined();
+    expect(registry.getBot('app_default').resolvedBlockedUsers).toEqual([]);
+  });
+
+  it('setBotBlockedUsers refuses to block the current owner', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_default', ['ou_owner']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe('cannot_block_admin');
+      expect(r.conflicting).toEqual(['ou_owner']);
+    }
+  });
+
+  it('setBotBlockedUsers rejects an all-unresolvable list as empty', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_default', ['garbage']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('empty_resolved');
+  });
+
+  it('setBotBlockedUsers returns bot_not_registered for an unknown app', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_missing', ['carol@corp.com']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
+  it('setBotBlockedUsers persists raw entries, syncs memory, and keeps the shared sidecar union (allowed ∪ blocked)', async () => {
+    const { registry, store } = await loaded();
+    // 先让 sidecar 里有 allowedUsers 的映射（与运行时 set allowedUsers 同路径）。
+    const allow = await store.setBotAllowedUsers('app_default', ['ou_owner'], 'ou_owner');
+    expect(allow.ok).toBe(true);
+
+    const r = await store.setBotBlockedUsers('app_default', ['carol@corp.com', 'on_bob']);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.resolved).toEqual(['ou_carol', 'ou_bob']);
+
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    expect(bot.resolvedBlockedUsers).toEqual(['ou_carol', 'ou_bob']);
+
+    // 同一 sidecar：blocked 写入不得把 allowed 的缓存键 prune 掉（retainKeys 取并集）。
+    const sidecar = JSON.parse(readFileSync(join(process.env.SESSION_DATA_DIR!, 'allowed-users-cache-app_default.json'), 'utf-8'));
+    expect(sidecar.map).toMatchObject({
+      ou_owner: 'ou_owner',
+      'carol@corp.com': 'ou_carol',
+      on_bob: 'ou_bob',
+    });
+  });
+
+  it('removeBlockedUsers lifts email/on_ raw entries that resolve to the target open_id', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'on_bob', 'ou_dave'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol', 'ou_bob', 'ou_dave'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.raw).toEqual(['on_bob', 'ou_dave']);
+      expect(r.resolved).toEqual(['ou_bob', 'ou_dave']);
+    }
+    expect(readConfig().blockedUsers).toEqual(['on_bob', 'ou_dave']);
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toEqual(['on_bob', 'ou_dave']);
+    expect(bot.resolvedBlockedUsers).toEqual(['ou_bob', 'ou_dave']);
+  });
+
+  it('removeBlockedUsers keeps non-matching alias entries and is a no-op when nothing maps', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'on_bob'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol', 'ou_bob'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_someone_else']);
+    expect(r).toMatchObject({ ok: true });
+    if (r.ok) expect(r.raw).toEqual(['carol@corp.com', 'on_bob']);
+    // 无命中：磁盘与内存原样。
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    expect(registry.getBot('app_default').resolvedBlockedUsers).toEqual(['ou_carol', 'ou_bob']);
+  });
+
+  it('removeBlockedUsers still succeeds when the list carries a definitively unresolvable legacy entry', async () => {
+    // 脏态直写：一个不可能解析的垃圾条目与一个正常邮箱条目并存。全量
+    // setBotBlockedUsers 重解析会以 empty_resolved 拒绝；定向解除不得被它挡住。
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'garbage'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // 垃圾条目证据不足 → 保留；邮箱条目映射命中 → 剔除。
+      expect(r.raw).toEqual(['garbage']);
+      expect(r.resolved).toEqual([]);
+    }
+    expect(readConfig().blockedUsers).toEqual(['garbage']);
+  });
+
+  it('removeBlockedUsers clearing the last entry goes through the clear path', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r).toMatchObject({ ok: true, raw: [], resolved: [] });
+    expect(readConfig().blockedUsers).toBeUndefined();
+    expect(registry.getBot('app_default').config.blockedUsers).toBeUndefined();
+  });
+
+  it('removeBlockedUsers with no targets is an idempotent no-op', async () => {
+    const { store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    const r = await store.removeBlockedUsers('app_default', []);
+    expect(r).toMatchObject({ ok: true });
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com']);
+  });
+
+  it('removeBlockedUsers returns bot_not_registered for an unknown app', async () => {
+    const { store } = await loaded();
+    const r = await store.removeBlockedUsers('app_missing', ['ou_carol']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
   it('coerceConfigValue parses per kind (bool/enum/cli) and rejects junk', async () => {
     const { store } = await freshModules();
     const boolSpec = store.findConfigField('disableStreamingCard')!;
@@ -607,10 +1087,27 @@ describe('bot-config store', () => {
     const cliSpec = store.findConfigField('cli')!;
     expect(store.coerceConfigValue(cliSpec, 'codex')).toEqual({ ok: true, value: 'codex' });
     expect(store.coerceConfigValue(cliSpec, 'bogus-cli')).toEqual({ ok: false, reason: 'invalid_cli' });
+    const authSpec = store.findConfigField('codexAuthSync')!;
+    expect(store.coerceConfigValue(authSpec, 'ISOLATED')).toEqual({ ok: true, value: 'isolated' });
+    expect(store.coerceConfigValue(authSpec, 'global')).toEqual({ ok: false, reason: 'invalid_enum' });
+  });
+
+  it('persists codexAuthSync through the generic /config store path', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('codexAuthSync')!;
+    const set = await store.applyConfigField('app_default', spec, 'isolated');
+    expect(set.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBe('isolated');
+    expect(registry.getBot('app_default').config.codexAuthSync).toBe('isolated');
+
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAuthSync).toBeUndefined();
   });
 
   it('getConfigCardData returns the card view (booleans + cli options + model choices)', async () => {
-    const { store } = await loaded({ model: 'opus', disableStreamingCard: true });
+    const { store } = await loaded({ model: 'opus', disableStreamingCard: true, pinStreamingCard: true });
     const data = store.getConfigCardData('app_default', ['opus', 'sonnet']);
     expect(data).not.toBeNull();
     expect(data!.cliId).toBe('claude-code');
@@ -618,6 +1115,9 @@ describe('bot-config store', () => {
     expect(data!.modelChoices).toEqual(['opus', 'sonnet']);
     expect(data!.cliOptions.length).toBeGreaterThan(0);
     expect(data!.booleans.find(b => b.key === 'disableStreamingCard')?.on).toBe(true);
+    expect(data!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(true);
+    const { store: store2 } = await loaded({ model: 'opus' });
+    expect(store2.getConfigCardData('app_default', ['opus'])!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(false);
     expect(store.getConfigCardData('app_missing')).toBeNull();
   });
 

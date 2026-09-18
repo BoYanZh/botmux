@@ -1,3 +1,5 @@
+import { GroupDefaultModelsRow } from './group-default-models.js';
+import { describeCloseResidual } from '../../core/close-residual.js';
 import {
   memo,
   useCallback,
@@ -11,8 +13,23 @@ import {
 } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import {
+  defaultProjectProgressCardConfig,
+  saveGroupCollaborationMode,
+  setGroupPinStreamingCard,
+  type ProjectGroupRuntimeSummary,
+  type ProjectProgressCardConfig,
+  type ProjectProgressCardSectionId,
+  type ProjectProgressCardTemplateId,
+} from './groups-api.js';
+import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { MemberAccessSection } from './member-access-section.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -63,6 +80,7 @@ type DialogState =
   | { type: 'manage'; chat: GroupChat };
 
 type DialogErrorState = { title: string; reason: unknown };
+type FeedGroupOption = { groupId: string; name: string; type: string };
 
 function emptyRoleContext(): RoleProfileContext {
   return {
@@ -123,19 +141,25 @@ function DialogError(props: DialogErrorState) {
   );
 }
 
-function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string> }) {
+function BotCheckboxes(props: {
+  bots: GroupBot[];
+  excludeIds?: Set<string>;
+  tr: Translator;
+  selected: Set<string>;
+  onToggle(larkAppId: string, checked: boolean): void;
+}) {
+  const options = availableBotsForPicker(props.bots, props.excludeIds);
+  const tr = props.tr;
   return (
-    <>
-      {availableBotsForPicker(props.bots, props.excludeIds).map(bot => (
-        <label className="checkbox-row" key={bot.larkAppId}>
-          <input type="checkbox" name="bot" value={bot.larkAppId} />
-          <span className="checkbox-row-main">
-            <strong>{bot.botName ?? bot.larkAppId}</strong>
-            <small>({bot.larkAppId})</small>
-          </span>
-        </label>
-      ))}
-    </>
+    <BotMultiSelect
+      bots={options}
+      selected={props.selected}
+      onToggle={props.onToggle}
+      searchPlaceholder={tr('botPicker.searchPlaceholder')}
+      noMatchLabel={tr('botPicker.noMatch')}
+      emptyLabel={tr('botPicker.empty')}
+      selectedCountLabel={n => tr('botPicker.selectedCount', { n: String(n) })}
+    />
   );
 }
 
@@ -260,6 +284,9 @@ const GroupListRow = memo(function GroupListRow(props: {
         <div className="groups-row-head">
           <b>{chat.name ?? chat.chatId}</b>
           <span className="groups-row-meta">
+            {chat.collaborationMode === 'project' ? (
+              <span className="groups-row-tag groups-row-project-tag">{tr('groups.projectModeBadge')}</span>
+            ) : null}
             <span className="groups-row-tag"><code>{chat.chatId}</code></span>
             {chat.ownerId ? (
               <span className="groups-row-tag groups-row-owner-tag">
@@ -303,7 +330,88 @@ function CreateDialog(props: {
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
   const [copied, setCopied] = useState(false);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [roleProfileId, setRoleProfileId] = useState('');
+  const [feedGroups, setFeedGroups] = useState<FeedGroupOption[]>([]);
+  const [feedGroupAppId, setFeedGroupAppId] = useState('');
+  const [feedGroupId, setFeedGroupId] = useState('');
+  const [newFeedGroupName, setNewFeedGroupName] = useState('');
+  const [feedGroupsLoading, setFeedGroupsLoading] = useState(true);
+  const [feedGroupsError, setFeedGroupsError] = useState('');
+  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
+  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
+  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    void fetch('/api/feed-groups')
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+        if (!alive) return;
+        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+      })
+      .catch(error => { if (alive) setFeedGroupsError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (alive) setFeedGroupsLoading(false); });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!feedGroupAuthUrl) return;
+    let alive = true;
+    const timer = window.setInterval(() => {
+      void fetch('/api/feed-groups')
+        .then(async response => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || !body.ok || !alive) return;
+          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+          setFeedGroupsError('');
+          setFeedGroupAuthUrl('');
+          setFeedGroupCallbackUrl('');
+        })
+        .catch(() => { /* remote/manual fallback remains visible */ });
+    }, 1_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [feedGroupAuthUrl]);
+
+  async function openFeedGroupLogin(): Promise<void> {
+    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
+    const response = await fetch(`/api/feed-groups/auth-url${query}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.authUrl) {
+      setError({ title: '无法发起标签授权', reason: body.error ?? `HTTP ${response.status}` });
+      return;
+    }
+    setFeedGroupAuthUrl(String(body.authUrl));
+    setFeedGroupCallbackUrl('');
+  }
+
+  async function completeFeedGroupLogin(callbackUrl: string): Promise<void> {
+    setFeedGroupAuthSubmitting(true);
+    try {
+      const response = await fetch('/api/feed-groups/oauth-callback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+      const groupsResponse = await fetch('/api/feed-groups');
+      const groupsBody = await groupsResponse.json().catch(() => ({}));
+      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
+      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
+      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
+      setFeedGroupsError('');
+      setFeedGroupAuthUrl('');
+      setFeedGroupCallbackUrl('');
+    } catch (error) {
+      setError({ title: '标签授权失败', reason: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setFeedGroupAuthSubmitting(false);
+    }
+  }
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
@@ -311,7 +419,7 @@ function CreateDialog(props: {
     const name = String(fd.get('name') ?? '').trim();
     const bindWorkingDir = String(fd.get('bindWorkingDir') ?? '').trim();
     const roleProfileId = String(fd.get('roleProfileId') ?? '').trim();
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再创建群聊。' });
       return;
@@ -328,6 +436,9 @@ function CreateDialog(props: {
           larkAppIds: ids,
           bindWorkingDir: bindWorkingDir || undefined,
           roleProfileId: roleProfileId || undefined,
+          feedGroupId: feedGroupId || undefined,
+          newFeedGroupName: newFeedGroupName || undefined,
+          feedGroupAppId: (feedGroupId || newFeedGroupName) ? feedGroupAppId : undefined,
         }),
       });
       const respBody = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
@@ -380,6 +491,8 @@ function CreateDialog(props: {
           </button>
         </p>
         <p><b>创建者:</b> <code>{String(success.creator ?? '?')}</code></p>
+        {success.feedGroupId ? <p className="hint-ok">已加入飞书标签{success.feedGroupName ? `「${String(success.feedGroupName)}」` : ''}。</p> : null}
+        {success.feedGroupError ? <p className="hint-warn">群聊已创建，但标签设置失败：{String(success.feedGroupError)}</p> : null}
         <CreateInviteNote resp={success} />
         {binds.length > 0 ? (
           bindFailed.length === 0 ? (
@@ -420,7 +533,16 @@ function CreateDialog(props: {
         <fieldset className="g-modal-field g-create-bots">
           <legend>{tr('groups.botPicker')}</legend>
           <div className="g-bot-picker">
-            <BotCheckboxes bots={props.bots} />
+            <BotCheckboxes
+              bots={props.bots}
+              tr={tr}
+              selected={selectedBots}
+              onToggle={(id, checked) => setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id); else next.delete(id);
+                return next;
+              })}
+            />
           </div>
         </fieldset>
 
@@ -450,7 +572,50 @@ function CreateDialog(props: {
             />
             <small>{tr('groups.roleProfileHelp')}</small>
           </fieldset>
+          <fieldset className="g-modal-field g-feed-group-field">
+            <legend>飞书标签（可选）</legend>
+            <input type="hidden" name="feedGroupId" value={feedGroupId} />
+            <FeedGroupPicker
+              groups={feedGroups}
+              selectedId={feedGroupId}
+              newName={newFeedGroupName}
+              disabled={feedGroupsLoading || !!feedGroupsError}
+              onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+            />
+            <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
+            {feedGroupsLoading ? <small>正在读取飞书标签…</small> : null}
+            {feedGroupsError ? (
+              <div className="hint-warn-inline">
+                <small>{feedGroupsError}</small>{' '}
+                <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
+                </button>
+                <small> 授权后会弹窗提示你粘贴回调地址。</small>
+              </div>
+            ) : null}
+            {!feedGroupsLoading && !feedGroupsError && feedGroups.length === 0 ? <small>当前没有标签，可直接创建一个。</small> : null}
+          </fieldset>
         </div>
+
+        {feedGroupAuthUrl ? (
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="feed-group-auth-title">
+              <h3 id="feed-group-auth-title">授权飞书标签</h3>
+              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
+              <label>
+                <span>请把点击授权后的完整链接粘贴在这里</span>
+                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
+              </label>
+              <div className="actions">
+                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
+                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
 
         <div className="g-create-status" data-create-status aria-live="polite">{error ? <DialogError {...error} /> : null}</div>
         <div className="actions g-create-actions">
@@ -498,7 +663,7 @@ function CreateInviteNote(props: { resp: any }) {
   );
 }
 
-function AddBotsDialog(props: {
+export function AddBotsDialog(props: {
   chat: GroupChat;
   bots: GroupBot[];
   tr: Translator;
@@ -509,6 +674,7 @@ function AddBotsDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [summary, setSummary] = useState<{ result: AddBotsSummary; refreshError?: unknown } | null>(null);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const inChatSet = useMemo(
     () => new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId)),
     [chat],
@@ -516,8 +682,7 @@ function AddBotsDialog(props: {
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
-    const fd = new FormData(ev.currentTarget);
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再添加。' });
       setSummary(null);
@@ -562,7 +727,17 @@ function AddBotsDialog(props: {
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
-        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} />
+        <BotCheckboxes
+          bots={props.bots}
+          excludeIds={inChatSet}
+          tr={tr}
+          selected={selectedBots}
+          onToggle={(id, checked) => setSelectedBots(prev => {
+            const next = new Set(prev);
+            if (checked) next.add(id); else next.delete(id);
+            return next;
+          })}
+        />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
           {summary ? (
@@ -838,8 +1013,9 @@ function SaveProfileDialog(props: {
 function OncallRow(props: {
   chat: GroupChat;
   member: GroupBot & { oncallChat?: { workingDir?: string } | null };
+  disabled?: boolean;
   tr: Translator;
-  onSaved(): Promise<void>;
+  onSaved(): Promise<GroupsSnapshot>;
 }) {
   const { member, tr } = props;
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -847,8 +1023,19 @@ function OncallRow(props: {
   const [workingDir, setWorkingDir] = useState(member.oncallChat?.workingDir ?? '');
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ text: string; className?: string } | null>(null);
+  const dirtyRef = useRef(false);
+  const disabledRef = useRef(!!props.disabled);
+  const savingRef = useRef(false);
+  disabledRef.current = !!props.disabled;
+
+  useEffect(() => {
+    if (dirtyRef.current) return;
+    setEnabled(!!member.oncallChat);
+    setWorkingDir(member.oncallChat?.workingDir ?? '');
+  }, [member]);
 
   async function save(): Promise<void> {
+    if (disabledRef.current || savingRef.current) return;
     setStatus(null);
     const wd = workingDir.trim();
     if (enabled && !wd) {
@@ -856,6 +1043,7 @@ function OncallRow(props: {
       return;
     }
 
+    savingRef.current = true;
     setSaving(true);
     try {
       const url = `/api/groups/${encodeURIComponent(props.chat.chatId)}/oncall/${encodeURIComponent(member.larkAppId)}`;
@@ -872,13 +1060,32 @@ function OncallRow(props: {
           text: enabled ? `✓ 已绑定 → ${body.resolvedPath ?? wd}` : '✓ 已解绑',
           className: 'hint-ok',
         });
-        try { await props.onSaved(); } catch { /* tolerate */ }
+        try {
+          const snapshot = await props.onSaved();
+          const refreshedMember = snapshot.chats
+            .find(chat => chat.chatId === props.chat.chatId)
+            ?.memberBots
+            .find(member => member.larkAppId === props.member.larkAppId);
+          if (refreshedMember) {
+            dirtyRef.current = false;
+            setEnabled(!!refreshedMember.oncallChat);
+            setWorkingDir(refreshedMember.oncallChat?.workingDir ?? '');
+          }
+        } catch (error) {
+          dirtyRef.current = true;
+          const message = error instanceof Error ? error.message : String(error);
+          setStatus({
+            text: `${enabled ? `✓ 已绑定 → ${body.resolvedPath ?? wd}` : '✓ 已解绑'}；刷新失败：${message}`,
+            className: 'hint-warn-inline',
+          });
+        }
       } else {
         setStatus({ text: `✗ ${body.error ?? r.status}`, className: 'hint-warn-inline' });
       }
     } catch (err: any) {
       setStatus({ text: `✗ ${err?.message ?? err}`, className: 'hint-warn-inline' });
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
@@ -890,7 +1097,10 @@ function OncallRow(props: {
           type="checkbox"
           data-action="toggle"
           checked={enabled}
+          disabled={props.disabled || saving}
           onChange={ev => {
+            if (disabledRef.current || savingRef.current) return;
+            dirtyRef.current = true;
             setEnabled(ev.currentTarget.checked);
             if (ev.currentTarget.checked) window.setTimeout(() => inputRef.current?.focus(), 0);
           }}
@@ -905,28 +1115,489 @@ function OncallRow(props: {
           data-input="workingDir"
           placeholder="e.g. /root/iserver/botmux"
           value={workingDir}
-          disabled={!enabled}
-          onChange={ev => setWorkingDir(ev.currentTarget.value)}
+          disabled={props.disabled || saving || !enabled}
+          onChange={ev => {
+            if (disabledRef.current || savingRef.current) return;
+            dirtyRef.current = true;
+            setWorkingDir(ev.currentTarget.value);
+          }}
         />
-        <button type="button" data-action="save" disabled={saving} onClick={() => void save()}>{tr('groups.save')}</button>
+        <button type="button" data-action="save" disabled={props.disabled || saving} onClick={() => void save()}>{tr('groups.save')}</button>
         <span className={`oncall-status ${status?.className ?? ''}`} data-status>{status?.text ?? ''}</span>
       </div>
     </div>
   );
 }
 
-function ManageDialog(props: {
+function responseErrorText(res: { status: number; body: any }): string {
+  const reason = typeof res.body?.reason === 'string' ? res.body.reason : '';
+  return String(reason || res.body?.error || res.status);
+}
+
+function GroupPinStreamingCardRow(props: {
   chat: GroupChat;
+  member: GroupChat['memberBots'][number];
+  disabled?: boolean;
+  tr: Translator;
+  onSaved(): Promise<GroupsSnapshot>;
+}) {
+  const { chat, member, tr } = props;
+  const initialChecked = member.pinStreamingCardChatEnabled === true;
+  const [checked, setChecked] = useState(initialChecked);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState('');
+  const [statusTone, setStatusTone] = useState<'ok' | 'warn' | 'muted'>('muted');
+  const lastAppliedMemberRef = useRef(member);
+  const latestMemberRef = useRef(member);
+  const disabledRef = useRef(!!props.disabled);
+  const savingRef = useRef(false);
+  latestMemberRef.current = member;
+  disabledRef.current = !!props.disabled;
+
+  useEffect(() => {
+    if (saving || lastAppliedMemberRef.current === member) return;
+    lastAppliedMemberRef.current = member;
+    setChecked(member.pinStreamingCardChatEnabled === true);
+  }, [member, saving]);
+
+  const masterEnabled = member.pinStreamingCardMasterEnabled === true;
+  const effectiveEnabled = member.pinStreamingCardEffectiveEnabled === true;
+  const detail = !masterEnabled
+    ? tr('groups.pinStreamingCardMasterOff')
+    : effectiveEnabled
+      ? tr('groups.pinStreamingCardEnabled')
+      : tr('groups.pinStreamingCardDisabled');
+  const detailTone = !masterEnabled ? 'warn' : effectiveEnabled ? 'ok' : 'muted';
+
+  async function save(nextChecked: boolean): Promise<void> {
+    if (disabledRef.current || savingRef.current) return;
+    const previous = checked;
+    setChecked(nextChecked);
+    savingRef.current = true;
+    setSaving(true);
+    setStatus(tr('groups.pinStreamingCardSaving'));
+    setStatusTone('warn');
+    try {
+      const res = await setGroupPinStreamingCard(chat.chatId, member.larkAppId, nextChecked);
+      if (!res.ok) {
+        setChecked(previous);
+        setStatus(tr('groups.pinStreamingCardSaveFailed', { error: responseErrorText(res) }));
+        setStatusTone('warn');
+        return;
+      }
+      setStatus(tr('groups.pinStreamingCardSaved'));
+      setStatusTone('ok');
+      const memberBeforeReload = latestMemberRef.current;
+      try {
+        await props.onSaved();
+        const refreshedMember = latestMemberRef.current;
+        if (refreshedMember !== memberBeforeReload) {
+          setChecked(refreshedMember.pinStreamingCardChatEnabled === true);
+        }
+        lastAppliedMemberRef.current = refreshedMember;
+      } catch (error) {
+        lastAppliedMemberRef.current = latestMemberRef.current;
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(tr('groups.pinStreamingCardRefreshFailed', { error: message }));
+        setStatusTone('warn');
+      }
+    } catch (error) {
+      setChecked(previous);
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(tr('groups.pinStreamingCardSaveFailed', { error: message }));
+      setStatusTone('warn');
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="g-pin-row" data-bot={member.larkAppId}>
+      <div className="g-pin-row-head">
+        <strong>{member.botName ?? member.larkAppId}</strong>
+        <small>{member.larkAppId}</small>
+      </div>
+      <StreamingCardPinToggle
+        scope="group-manage"
+        checked={checked}
+        disabled={props.disabled || saving}
+        title={tr('groups.pinStreamingCard')}
+        description={tr('groups.pinStreamingCardDescription')}
+        help={tr('groups.pinStreamingCardHelp')}
+        detail={detail}
+        detailTone={detailTone}
+        detailAttrs={{ 'data-pin-master-state': masterEnabled ? 'on' : 'off' }}
+        status={status}
+        statusTone={statusTone}
+        statusAttrs={{ 'data-pin-status': member.larkAppId }}
+        dataAction="toggle-pin-streaming-card-group"
+        dataAppId={member.larkAppId}
+        onChange={nextChecked => void save(nextChecked)}
+      />
+    </div>
+  );
+}
+
+function collaborationModeSignature(
+  mode: 'standard' | 'project',
+  coordinatorAppId: string,
+  workerAppIds: Iterable<string>,
+  autoEnrollWorkers: boolean,
+  progressCard: ProjectProgressCardConfig,
+): string {
+  return JSON.stringify({
+    mode,
+    coordinatorAppId: mode === 'project' ? coordinatorAppId : '',
+    workerAppIds: mode === 'project' ? [...workerAppIds].sort() : [],
+    autoEnrollWorkers: mode === 'project' ? autoEnrollWorkers : false,
+    progressCard: mode === 'project' ? progressCard : null,
+  });
+}
+
+const PROJECT_CARD_SECTION_OPTIONS: Array<{
+  id: ProjectProgressCardSectionId;
+  labelKey: string;
+}> = [
+  { id: 'goal', labelKey: 'groups.projectCardSectionGoal' },
+  { id: 'blockers', labelKey: 'groups.projectCardSectionBlockers' },
+  { id: 'workstreams', labelKey: 'groups.projectCardSectionWorkstreams' },
+  { id: 'milestones', labelKey: 'groups.projectCardSectionMilestones' },
+];
+
+export function ProjectGroupModeSection(props: {
+  chat: GroupChat;
+  members: GroupChat['memberBots'];
+  disabled?: boolean;
+  tr: Translator;
+  onSaved(): Promise<GroupsSnapshot>;
+}) {
+  const { chat, members, tr } = props;
+  const memberIds = useMemo(() => members.map(member => member.larkAppId), [members]);
+  const initialCoordinator = chat.projectCoordinatorAppId ?? memberIds[0] ?? '';
+  const initialWorkers = chat.projectWorkerAppIds
+    ?? memberIds.filter(appId => appId !== initialCoordinator);
+  const [mode, setMode] = useState<'standard' | 'project'>(chat.collaborationMode ?? 'standard');
+  const [coordinatorAppId, setCoordinatorAppId] = useState(initialCoordinator);
+  const [workerAppIds, setWorkerAppIds] = useState<Set<string>>(() => new Set(initialWorkers));
+  const [autoEnrollWorkers, setAutoEnrollWorkers] = useState(
+    chat.collaborationMode === 'project' ? chat.projectAutoEnrollWorkers === true : true,
+  );
+  const [progressCard, setProgressCard] = useState<ProjectProgressCardConfig>(
+    () => chat.projectProgressCard ?? defaultProjectProgressCardConfig(),
+  );
+  const [runtime, setRuntime] = useState<ProjectGroupRuntimeSummary | null>(chat.projectRuntime ?? null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null);
+  const savedSignatureRef = useRef(collaborationModeSignature(
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard,
+  ));
+
+  const signature = collaborationModeSignature(mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard);
+  const dirty = signature !== savedSignatureRef.current;
+
+  function selectMode(nextMode: 'standard' | 'project'): void {
+    setMode(nextMode);
+    setStatus(null);
+    if (nextMode !== 'project') return;
+    const coordinator = coordinatorAppId || memberIds[0] || '';
+    setCoordinatorAppId(coordinator);
+    if (workerAppIds.size === 0) setWorkerAppIds(new Set(memberIds.filter(appId => appId !== coordinator)));
+  }
+
+  function selectCoordinator(nextCoordinator: string): void {
+    setCoordinatorAppId(nextCoordinator);
+    setWorkerAppIds(current => {
+      const next = new Set(current);
+      next.delete(nextCoordinator);
+      return next;
+    });
+    setStatus(null);
+  }
+
+  function selectCardTemplate(templateId: ProjectProgressCardTemplateId): void {
+    setProgressCard(current => ({ ...current, templateId }));
+    setStatus(null);
+  }
+
+  function toggleCardSection(section: ProjectProgressCardSectionId, enabled: boolean): void {
+    setProgressCard(current => ({
+      ...current,
+      sections: enabled
+        ? current.sections.includes(section) ? current.sections : [...current.sections, section]
+        : current.sections.filter(currentSection => currentSection !== section),
+    }));
+    setStatus(null);
+  }
+
+  async function save(): Promise<void> {
+    if (props.disabled || saving || !dirty) return;
+    if (mode === 'project' && !coordinatorAppId) {
+      setStatus({ text: tr('groups.projectModeNeedCoordinator'), tone: 'warn' });
+      return;
+    }
+    setSaving(true);
+    setStatus(null);
+    try {
+      const response = await saveGroupCollaborationMode(
+        chat.chatId,
+        mode === 'standard'
+          ? { mode }
+          : { mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers, progressCard },
+      );
+      const nextCoordinator = response.config.coordinatorAppId ?? coordinatorAppId;
+      const nextWorkers = response.config.workerAppIds ?? [];
+      const nextAutoEnrollWorkers = response.config.autoEnrollWorkers === true;
+      const nextProgressCard = response.config.progressCard ?? progressCard;
+      setAutoEnrollWorkers(nextAutoEnrollWorkers);
+      setProgressCard(nextProgressCard);
+      savedSignatureRef.current = collaborationModeSignature(
+        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextProgressCard,
+      );
+      setRuntime(response.project);
+      setStatus(response.cardRefresh === 'deferred'
+        ? { text: tr('groups.projectModeSavedCardDeferred'), tone: 'warn' }
+        : { text: tr('groups.projectModeSaved'), tone: 'ok' });
+      try {
+        await props.onSaved();
+      } catch (error) {
+        setStatus({ text: tr('groups.projectModeRefreshFailed', { error: error instanceof Error ? error.message : String(error) }), tone: 'warn' });
+      }
+    } catch (error) {
+      setStatus({ text: tr('groups.projectModeSaveFailed', { error: error instanceof Error ? error.message : String(error) }), tone: 'warn' });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <fieldset className="g-collaboration-mode">
+      <legend>{tr('groups.collaborationMode')}</legend>
+      <p><small>{tr('groups.collaborationModeHelp')}</small></p>
+      <div className="g-mode-rail" role="radiogroup" aria-label={tr('groups.collaborationMode')}>
+        <label className={`g-mode-option${mode === 'standard' ? ' selected' : ''}`}>
+          <input
+            type="radio"
+            name={`group-mode-${chat.chatId}`}
+            value="standard"
+            checked={mode === 'standard'}
+            disabled={props.disabled || saving}
+            onChange={() => selectMode('standard')}
+          />
+          <span><strong>{tr('groups.standardMode')}</strong><small>{tr('groups.standardModeHelp')}</small></span>
+        </label>
+        <label className={`g-mode-option project${mode === 'project' ? ' selected' : ''}`}>
+          <input
+            type="radio"
+            name={`group-mode-${chat.chatId}`}
+            value="project"
+            checked={mode === 'project'}
+            disabled={props.disabled || saving}
+            onChange={() => selectMode('project')}
+          />
+          <span><strong>{tr('groups.projectMode')}</strong><small>{tr('groups.projectModeHelp')}</small></span>
+        </label>
+      </div>
+
+      {mode === 'project' ? (
+        <div className="g-project-policy">
+          <label className="g-project-coordinator">
+            <span>{tr('groups.projectCoordinator')}</span>
+            <select
+              value={coordinatorAppId}
+              disabled={props.disabled || saving}
+              onChange={event => selectCoordinator(event.currentTarget.value)}
+            >
+              {members.map(member => (
+                <option key={member.larkAppId} value={member.larkAppId}>{member.botName ?? member.larkAppId}</option>
+              ))}
+            </select>
+          </label>
+          <div className="g-project-workers">
+            <span>{tr('groups.projectWorkers')}</span>
+            <div className="g-project-worker-grid">
+              {members.filter(member => member.larkAppId !== coordinatorAppId).map(member => (
+                <label className="checkbox-row" key={member.larkAppId}>
+                  <input
+                    type="checkbox"
+                    checked={workerAppIds.has(member.larkAppId)}
+                    disabled={props.disabled || saving}
+                    onChange={event => {
+                      const checked = event.currentTarget.checked;
+                      setWorkerAppIds(current => {
+                        const next = new Set(current);
+                        if (checked) next.add(member.larkAppId); else next.delete(member.larkAppId);
+                        return next;
+                      });
+                      setStatus(null);
+                    }}
+                  />
+                  <span className="checkbox-row-main"><strong>{member.botName ?? member.larkAppId}</strong></span>
+                </label>
+              ))}
+            </div>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                data-project-auto-enroll-workers={chat.chatId}
+                checked={autoEnrollWorkers}
+                disabled={props.disabled || saving}
+                onChange={event => {
+                  setAutoEnrollWorkers(event.currentTarget.checked);
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main">
+                <strong>{tr('groups.projectAutoEnrollWorkers')}</strong>
+                <small>{tr('groups.projectAutoEnrollWorkersHelp')}</small>
+              </span>
+            </label>
+          </div>
+          <section className="g-project-role-config" aria-labelledby={`project-role-config-${chat.chatId}`}>
+            <header>
+              <strong id={`project-role-config-${chat.chatId}`}>{tr('groups.projectRoleConfig')}</strong>
+              <small>{tr('groups.projectRoleConfigHelp')}</small>
+            </header>
+            <div className="g-project-role-grid">
+              {members
+                .filter(member => member.larkAppId === coordinatorAppId || workerAppIds.has(member.larkAppId))
+                .map(member => {
+                  const isCoordinator = member.larkAppId === coordinatorAppId;
+                  const href = `#/roles?chatId=${encodeURIComponent(chat.chatId)}&botId=${encodeURIComponent(member.larkAppId)}`;
+                  return (
+                    <a className="g-project-role-link" href={href} key={`project-role-${member.larkAppId}`}>
+                      <span>
+                        <strong>{member.botName ?? member.larkAppId}</strong>
+                        <small>{tr(isCoordinator ? 'groups.projectRoleCoordinator' : 'groups.projectRoleWorker')}</small>
+                      </span>
+                      <em className={member.hasRole ? 'configured' : ''}>
+                        {tr(member.hasRole ? 'groups.projectRoleConfigured' : 'groups.projectRoleInherited')}
+                      </em>
+                    </a>
+                  );
+                })}
+            </div>
+          </section>
+          <div className="g-project-protocol" aria-label={tr('groups.projectProtocol')}>
+            <span><b>01</b>{tr('groups.projectProtocolDispatch')}</span>
+            <span><b>02</b>{tr('groups.projectProtocolReport')}</span>
+            <span><b>03</b>{tr('groups.projectProtocolCard')}</span>
+          </div>
+          <section className="g-project-card-config" aria-labelledby={`project-card-config-${chat.chatId}`}>
+            <header>
+              <strong id={`project-card-config-${chat.chatId}`}>{tr('groups.projectCardConfig')}</strong>
+              <small>{tr('groups.projectCardConfigHelp')}</small>
+            </header>
+            <div className="g-card-template-rail" role="radiogroup" aria-label={tr('groups.projectCardTemplate')}>
+              {([
+                ['status-dashboard', 'groups.projectCardTemplateDashboard', 'groups.projectCardTemplateDashboardHelp'],
+                ['compact-list', 'groups.projectCardTemplateCompact', 'groups.projectCardTemplateCompactHelp'],
+              ] as Array<[ProjectProgressCardTemplateId, string, string]>).map(([templateId, labelKey, helpKey]) => (
+                <label className={`g-card-template-option${progressCard.templateId === templateId ? ' selected' : ''}`} key={templateId}>
+                  <input
+                    type="radio"
+                    name={`project-card-template-${chat.chatId}`}
+                    value={templateId}
+                    checked={progressCard.templateId === templateId}
+                    disabled={props.disabled || saving}
+                    onChange={() => selectCardTemplate(templateId)}
+                  />
+                  <span><strong>{tr(labelKey)}</strong><small>{tr(helpKey)}</small></span>
+                </label>
+              ))}
+            </div>
+            <div className="g-card-section-config">
+              <span>{tr('groups.projectCardSections')}</span>
+              <div className="g-card-section-grid">
+                {PROJECT_CARD_SECTION_OPTIONS.map(option => (
+                  <label className="checkbox-row" key={option.id}>
+                    <input
+                      type="checkbox"
+                      checked={progressCard.sections.includes(option.id)}
+                      disabled={props.disabled || saving}
+                      onChange={event => toggleCardSection(option.id, event.currentTarget.checked)}
+                    />
+                    <span className="checkbox-row-main"><strong>{tr(option.labelKey)}</strong></span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <label className="checkbox-row g-card-milestone-default">
+              <input
+                type="checkbox"
+                checked={progressCard.milestonesExpanded}
+                disabled={props.disabled || saving || !progressCard.sections.includes('milestones')}
+                onChange={event => {
+                  const checked = event.currentTarget.checked;
+                  setProgressCard(current => ({ ...current, milestonesExpanded: checked }));
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main"><strong>{tr('groups.projectCardMilestonesExpanded')}</strong></span>
+            </label>
+          </section>
+        </div>
+      ) : null}
+
+      <div className="g-project-runtime" data-project-runtime={runtime ? runtime.status : 'empty'}>
+        <div>
+          <strong>{tr('groups.projectRuntime')}</strong>
+          {runtime ? (
+            <small>{tr('groups.projectRuntimeSummary', {
+              status: runtime.status,
+              completed: runtime.completedWorkstreamCount,
+              total: runtime.workstreamCount,
+            })}</small>
+          ) : <small>{tr('groups.projectRuntimeEmpty')}</small>}
+        </div>
+        {runtime ? <span className={runtime.blockerCount > 0 ? 'warn' : ''}>{runtime.phase}</span> : null}
+      </div>
+
+      <div className="g-project-mode-actions">
+        <span className={status?.tone === 'ok' ? 'hint-ok' : status ? 'hint-warn-inline' : ''}>{status?.text ?? ''}</span>
+        <button
+          type="button"
+          className="primary"
+          disabled={props.disabled || saving || !dirty}
+          onClick={() => void save()}
+        >{saving ? tr('groups.projectModeSaving') : tr('groups.projectModeSave')}</button>
+      </div>
+    </fieldset>
+  );
+}
+
+export function ManageDialog(props: {
+  chat: GroupChat;
+  available?: boolean;
   tr: Translator;
   onClose(): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
 }) {
   const { chat, tr } = props;
+  const available = props.available !== false;
   const inChat = (chat.memberBots ?? []).filter(member => member.inChat);
   const ownerAppId = typeof chat.ownerId === 'string' ? chat.ownerId : '';
   const [leaveSelection, setLeaveSelection] = useState<Set<string>>(() => new Set());
+  const inChatIdsRef = useRef(new Set(inChat.map(member => member.larkAppId)));
+  inChatIdsRef.current = new Set(inChat.map(member => member.larkAppId));
+  const availableRef = useRef(available);
+  availableRef.current = available;
+  const mountedRef = useRef(true);
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
+  const isMounted = useCallback(() => mountedRef.current, []);
+  const isAlive = useCallback(() => mountedRef.current && availableRef.current, []);
+
+  useEffect(() => {
+    setLeaveSelection(current => {
+      const next = new Set([...current].filter(appId => inChatIdsRef.current.has(appId)));
+      return next.size === current.size ? current : next;
+    });
+  }, [chat.chatId, chat.memberBots]);
 
   function toggleLeave(appId: string, checked: boolean): void {
+    if (!availableRef.current) return;
     setLeaveSelection(cur => {
       const next = new Set(cur);
       if (checked) next.add(appId);
@@ -936,68 +1607,91 @@ function ManageDialog(props: {
   }
 
   async function leaveSelected(): Promise<void> {
-    const checked = [...leaveSelection];
-    if (checked.length === 0) { alert('至少选一个机器人'); return; }
-    if (!confirm(`确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`)) return;
+    if (!isAlive()) return;
+    const selected = [...leaveSelection];
+    if (selected.length === 0) { toast('至少选一个机器人', { kind: 'warning' }); return; }
+    const confirmed = await confirm({ title: '退出群聊', message: `确定让 ${selected.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`, danger: true });
+    if (!isAlive() || !confirmed) return;
+    const checked = selected.filter(appId => inChatIdsRef.current.has(appId));
+    if (checked.length === 0) return;
     try {
       const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/leave`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ larkAppIds: checked }),
       });
+      if (!isMounted()) return;
       const respBody = await r.json();
+      if (!isMounted()) return;
       const lines = (respBody.result ?? []).map((x: any) => {
         if (!x.ok) return `${x.larkAppId}: 失败 (${x.error ?? 'unknown'})`;
         const closed = (x.closedSessions ?? []) as any[];
         const failed = closed.filter(c => !c.ok).length;
         const ok = closed.length - failed;
+        // Closed locally but the remote session survived: not a failure, but it
+        // must not disappear into the plain "closed N" tally.
+        const residuals = closed.filter(c => c.ok && c.residual)
+          .map(c => describeCloseResidual(c.residual));
         const note = closed.length === 0
           ? ''
-          : failed === 0 ? `（关闭 ${ok} 个会话）` : `（关闭 ${ok} 个，${failed} 个失败）`;
+          : `（关闭 ${ok} 个会话${failed ? `，${failed} 个失败` : ''}`
+            + `${residuals.length ? `，${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
-      alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
+      toast(lines || `Unexpected: ${JSON.stringify(respBody)}`, { kind: 'success' });
       await props.onReloadGroups({ force: true });
+      if (!isMounted()) return;
     } catch (err) {
-      alert('Network error: ' + err);
+      if (!isMounted()) return;
+      toast('Network error: ' + err, { kind: 'error' });
     } finally {
-      props.onClose();
+      if (isMounted()) props.onClose();
     }
   }
 
   async function disband(): Promise<void> {
-    if (inChat.length === 0) return;
-    if (!confirm(`确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`)) return;
+    if (!isAlive() || inChat.length === 0) return;
+    const confirmed = await confirm({ title: '解散群聊', message: `确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`, danger: true });
+    if (!isAlive() || !confirmed) return;
     const ordered = [...inChat].sort((a, b) =>
       (b.larkAppId === ownerAppId ? 1 : 0) - (a.larkAppId === ownerAppId ? 1 : 0),
     );
     const errs: string[] = [];
     for (const member of ordered) {
+      if (!isAlive()) return;
       try {
         const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/disband`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ larkAppId: member.larkAppId }),
         });
+        if (!isMounted()) return;
         const respBody = await r.json();
+        if (!isMounted()) return;
         if (respBody.ok) {
           const closed = (respBody.closedSessions ?? []) as any[];
           const failed = closed.filter(c => !c.ok).length;
           const ok = closed.length - failed;
+          const residuals = closed.filter(c => c.ok && c.residual)
+            .map(c => describeCloseResidual(c.residual));
           const closedNote = closed.length === 0
             ? ''
-            : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
-          alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
+            : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
+              + `${residuals.length ? `\n⚠️ ${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}。`;
+          toast(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`, { kind: 'success' });
           await props.onReloadGroups({ force: true });
+          if (!isMounted()) return;
           props.onClose();
           return;
         }
         errs.push(`${member.botName ?? member.larkAppId}: ${respBody.error ?? r.status}`);
       } catch (err) {
+        if (!isAlive()) return;
         errs.push(`${member.botName ?? member.larkAppId}: ${err}`);
       }
     }
-    alert(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`);
+    if (!isAlive()) return;
+    toast(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`, { kind: 'error' });
   }
 
   return (
@@ -1007,6 +1701,17 @@ function ManageDialog(props: {
         <span><b>chatId</b><code>{chat.chatId}</code></span>
         <span><b>{tr('groups.owner')}</b><code>{chat.ownerId ?? tr('common.unknown')}</code></span>
       </div>
+      {!available ? (
+        <p className="hint-warn" data-chat-unavailable>该群聊已不在最新列表中，管理操作已禁用。</p>
+      ) : null}
+
+      <ProjectGroupModeSection
+        chat={chat}
+        members={inChat}
+        disabled={!available}
+        tr={tr}
+        onSaved={() => props.onReloadGroups({ force: true })}
+      />
 
       <fieldset>
         <legend>{tr('groups.oncall')}</legend>
@@ -1018,8 +1723,44 @@ function ManageDialog(props: {
             key={member.larkAppId}
             chat={chat}
             member={member}
+            disabled={!available}
             tr={tr}
-            onSaved={async () => { await props.onReloadGroups({ force: true }); }}
+            onSaved={() => props.onReloadGroups({ force: true })}
+          />
+        ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('grantAdmin.sectionTitle')}</legend>
+        <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
+      </fieldset>
+
+      <fieldset>
+        <legend>新话题默认模型</legend>
+        <p><small>CLI 跟随 Bot 的 Agent 配置；模型和思考强度可单独覆盖，选择继承则沿用 Agent 配置。修改仅影响新话题。</small></p>
+        {inChat.map(member => <GroupDefaultModelsRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
+          models={member.defaultModels} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('groups.pinStreamingCardSection')}</legend>
+        <p><small>{tr('groups.pinStreamingCardBotHint')}</small></p>
+        {inChat.length === 0 ? (
+          <p className="empty">没有机器人在群里</p>
+        ) : inChat.map(member => (
+          <GroupPinStreamingCardRow
+            key={`pin-${member.larkAppId}`}
+            chat={chat}
+            member={member}
+            disabled={!available}
+            tr={tr}
+            onSaved={() => props.onReloadGroups({ force: true })}
           />
         ))}
       </fieldset>
@@ -1037,6 +1778,7 @@ function ManageDialog(props: {
                   name="leave-bot"
                   value={member.larkAppId}
                   checked={leaveSelection.has(member.larkAppId)}
+                  disabled={!available}
                   onChange={ev => toggleLeave(member.larkAppId, ev.currentTarget.checked)}
                 />
                 <span className="checkbox-row-main">
@@ -1052,8 +1794,8 @@ function ManageDialog(props: {
       <p className="g-manage-danger-hint">{tr('groups.dangerHint')}</p>
       <div className="actions">
         <button type="button" onClick={props.onClose}>{tr('sessions.dismiss')}</button>
-        <button id="g-leave-btn" type="button" disabled={inChat.length === 0} onClick={() => void leaveSelected()}>{tr('groups.leaveSelected')}</button>
-        <button id="g-disband-btn" type="button" className="contrast" disabled={inChat.length === 0} onClick={() => void disband()}>{tr('groups.disband')}</button>
+        <button id="g-leave-btn" type="button" disabled={!available || inChat.length === 0} onClick={() => void leaveSelected()}>{tr('groups.leaveSelected')}</button>
+        <button id="g-disband-btn" type="button" className="contrast" disabled={!available || inChat.length === 0} onClick={() => void disband()}>{tr('groups.disband')}</button>
       </div>
     </article>
   );
@@ -1120,9 +1862,14 @@ function DialogHost(props: {
       />
     );
   } else if (props.dialog?.type === 'manage') {
+    const capturedChat = props.dialog.chat;
+    const currentChat = props.snapshot.chats.find(chat => chat.chatId === capturedChat.chatId);
+    const chat = currentChat ?? capturedChat;
     content = (
       <ManageDialog
-        chat={props.dialog.chat}
+        key={capturedChat.chatId}
+        chat={chat}
+        available={!!currentChat}
         tr={props.tr}
         onClose={props.onClose}
         onReloadGroups={props.onReloadGroups}
@@ -1152,6 +1899,8 @@ function GroupsPage() {
   const timersRef = useRef<Set<number>>(new Set());
   const delayResolversRef = useRef<Map<number, () => void>>(new Map());
   const roleContextRunRef = useRef(0);
+  const snapshotRequestRunRef = useRef(0);
+  const snapshotSuccessRunRef = useRef(0);
   const [snapshot, setSnapshotState] = useState<GroupsSnapshot>(emptyGroupsSnapshot);
   const [roleContext, setRoleContext] = useState<RoleProfileContext>(() => emptyRoleContext());
   const [filters, setFilters] = useState<GroupFilters>({ q: '', missingOnly: false });
@@ -1201,26 +1950,36 @@ function GroupsPage() {
   }, []);
 
   const reloadGroups = useCallback(async (options?: { force?: boolean }): Promise<GroupsSnapshot> => {
-    const next = await fetchGroupsSnapshot({ force: options?.force });
-    if (!mountedRef.current) return next;
-    setSnapshot(next);
-    setLoadError(null);
-    void refreshRoleProfileContext(next);
-    return next;
+    const runId = ++snapshotRequestRunRef.current;
+    try {
+      const next = await fetchGroupsSnapshot({ force: options?.force });
+      if (!mountedRef.current || runId < snapshotSuccessRunRef.current) return snapshotRef.current;
+      snapshotSuccessRunRef.current = runId;
+      setSnapshot(next);
+      setLoadError(null);
+      void refreshRoleProfileContext(next);
+      return next;
+    } catch (error) {
+      if (!mountedRef.current || runId !== snapshotRequestRunRef.current) return snapshotRef.current;
+      throw error;
+    }
   }, [refreshRoleProfileContext, setSnapshot]);
 
   const refreshUntilSeen = useCallback(async (chatId: string, expectedBotIds: Set<string>): Promise<void> => {
+    const runId = ++snapshotRequestRunRef.current;
     const delays = [600, 1200, 1200, 1200, 1200, 1200];
     for (const ms of delays) {
       await delay(ms);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || runId < snapshotSuccessRunRef.current) return;
       let next: GroupsSnapshot;
       try { next = await fetchGroupsSnapshot({ force: true }); }
       catch { continue; }
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || runId < snapshotSuccessRunRef.current) return;
       const row = (next.chats ?? []).find(chat => chat.chatId === chatId);
       if (row && allExpectedInChat(row, expectedBotIds)) {
+        snapshotSuccessRunRef.current = runId;
         setSnapshot(next);
+        setLoadError(null);
         void refreshRoleProfileContext(next);
         return;
       }
@@ -1254,10 +2013,15 @@ function GroupsPage() {
     };
   }, [reloadGroups]);
 
-  const rows = useMemo(
+  // 会话群（p2pMode=group 自动创建，session-groups-store 分型标记）与常驻群
+  // 分开管理：主列表只展示常驻群，会话群收进下方折叠区——它们由 bot 自动
+  // 创建/命名/管理，数量随会话增长，混排会淹没真正需要人工管理的常驻群。
+  const allMatched = useMemo(
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
+  const rows = useMemo(() => allMatched.filter(c => !(c as any).sessionGroup), [allMatched]);
+  const sessionRows = useMemo(() => allMatched.filter(c => (c as any).sessionGroup), [allMatched]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
@@ -1280,7 +2044,7 @@ function GroupsPage() {
 
   async function openCreateDialog(): Promise<void> {
     if (snapshotRef.current.bots.length === 0) {
-      alert(tr('groups.noBotsOnline'));
+      toast(tr('groups.noBotsOnline'), { kind: 'warning' });
       return;
     }
     let roleProfiles: RoleProfileSummaryLike[] = [];
@@ -1307,7 +2071,7 @@ function GroupsPage() {
     const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
     const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
     if (!missing.length) {
-      alert('All configured bots are already in this chat.');
+      toast('All configured bots are already in this chat.', { kind: 'warning' });
       return;
     }
     setDialog({ type: 'add-bots', chat });
@@ -1426,6 +2190,28 @@ function GroupsPage() {
           </div>
         )}
       </section>
+      {!loading && sessionRows.length > 0 ? (
+        <details className="overview-block groups-session-section" open={!!filters.q} data-session-groups>
+          <summary style={{ cursor: 'pointer', padding: '10px 4px', fontWeight: 600, opacity: 0.85 }}>
+            🤖 {tr('groups.sessionSection')}（{sessionRows.length}）
+            <span style={{ fontWeight: 400, opacity: 0.7, marginLeft: 8 }}>{tr('groups.sessionSectionHint')}</span>
+          </summary>
+          <OverviewList id="g-session-body" className="groups-list">
+            {sessionRows.map(chat => (
+              <GroupListRow
+                chat={chat}
+                bots={snapshot.bots}
+                roleContext={roleContext}
+                tr={tr}
+                key={chat.chatId}
+                onAddBots={openAddBotsDialog}
+                onSaveProfile={openSaveProfileDialog}
+                onManage={openManageDialog}
+              />
+            ))}
+          </OverviewList>
+        </details>
+      ) : null}
       <DialogHost
         dialog={dialog}
         snapshot={snapshot}

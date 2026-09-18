@@ -3,6 +3,8 @@ import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+  REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 
@@ -145,7 +147,54 @@ export function mentionAppId(m: any): string | undefined {
 }
 
 /**
- * Whether a message explicitly @mentions the given bot. SHARED single source of
+ * Extract @-mentions carried by a post (rich-text) message's inline `at` nodes,
+ * as routing-only `LarkMention`s for the --mention-back participant window.
+ *
+ * WHY separate from parseEventMessage().mentions: a post's `message.mentions[]`
+ * is frequently empty — the real @s live as inline `{ tag: 'at', user_id,
+ * user_name }` nodes in the content (the realtime @-gate isBotMentioned already
+ * scans these). Folding them into the general `parsed.mentions` would ripple
+ * into prompt rendering / stripLeadingMentions / mention hints, so this stays a
+ * dedicated lane consumed ONLY by buildTurnParticipants.
+ *
+ * A post `at`'s `user_id` is an `ou_` open_id (in-group) or a `cli_` app_id
+ * (out-of-group bot). We classify into openId vs appId; `all` and any other
+ * shape are surfaced WITHOUT an executable id so the participant core marks the
+ * window incomplete rather than inventing a candidate. Deliberately NO position
+ * filtering (unlike mention-targets' command parsing) — every counterpart in the
+ * turn counts, including a leading @ of the answering bot (excluded later by
+ * self open_id/app_id). Returns [] on non-post shapes / parse errors.
+ */
+export function extractPostAtParticipants(message: { content?: string } | null | undefined): LarkMention[] {
+  const out: LarkMention[] = [];
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (!Array.isArray(inner?.content)) return out;
+  let seq = 0;
+  for (const para of inner.content) {
+    if (!Array.isArray(para)) continue;
+    for (const node of para) {
+      if (node?.tag === 'at') {
+        const uid: string | undefined = typeof node.user_id === 'string' ? node.user_id : undefined;
+        const name: string | undefined = typeof node.user_name === 'string' ? node.user_name : undefined;
+        const isOpenId = !!uid && uid.startsWith('ou_');
+        const isAppId = !!uid && uid.startsWith('cli_');
+        out.push({
+          key: `@_post_at_${seq}`,
+          name: name ?? uid ?? '',
+          ...(isOpenId ? { openId: uid } : {}),
+          ...(isAppId ? { appId: uid } : {}),
+          idType: isAppId ? 'app_id' : 'open_id',
+        });
+      }
+      seq++;
+    }
+  }
+  return out;
+}
+
+/**
  * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
  * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
  * "explicit @ hands off to normal routing, not the listener" rule can never
@@ -409,6 +458,16 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           }
         }
       }
+      // Rich-text uploads made through some Lark clients are not inline nodes.
+      // They arrive beside the localized post body as a top-level `files` array.
+      // Resolve that body first (above), then append these descriptors; pushIfNew
+      // collapses a file that Lark happens to represent in both places.
+      const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
+      for (const file of topLevelFiles) {
+        if (file?.file_key) {
+          pushIfNew(resources, { type: 'file', key: file.file_key, name: file.file_name ?? file.file_key });
+        }
+      }
       return resources;
     }
 
@@ -474,6 +533,7 @@ export function parseEventMessage(
           openId: mentionOpenId(m),
           userId: mentionIdentity(m).userId,
           unionId: mentionUnionId(m),
+          appId: mentionIdentity(m).appId,
           idType: m.id_type,
         }))
       : undefined;
@@ -534,6 +594,64 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
     }
   }
   return { title: '', content: [] };
+}
+
+/** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
+ *  （openId/appId 已解析）与飞书事件里的原始 `message.mentions[]`（id/id_type）。 */
+type LooseMention = {
+  name?: string;
+  openId?: string;
+  appId?: string;
+  id?: { open_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+};
+
+/**
+ * 剥掉**对本 bot** 的所有 `@名字`，不限位置。
+ *
+ * 话题指令头的解析前置步骤：路由判定本来就按 `mentions` 数组（`isBotMentioned`），
+ * 与 @ 在文本里的位置无关，所以 `标题 /t … 正文 @机器人` 里那个结尾的 @ 只是寻址，
+ * 不能占住一个 token 位把正文切歪（决策 D8）。
+ *
+ * 与 {@link stripLeadingMentions} 的分工：那个按**位置**剥（开头连续的 @，谁的都剥），
+ * 这个按**身份**剥（只剥本 bot 的，任意位置）。对其他成员 / 其它 bot 的 @ 一律保留
+ * ——那是正文内容，CLI 需要看到。两者可以叠加：daemon 先按位置剥前导，再按身份剥自己。
+ *
+ * 认不出本 bot（没有 mentions、或没有一条匹配 open_id / app_id）时原样返回。
+ */
+export function stripBotMentions(
+  content: string,
+  mentions: readonly LooseMention[] | undefined,
+  self: { botOpenId?: string; larkAppId?: string },
+): string {
+  if (!mentions || mentions.length === 0) return content;
+  const names = new Set<string>();
+  for (const m of mentions) {
+    const openId = m?.openId ?? mentionOpenId(m as any);
+    const appId = m?.appId ?? mentionAppId(m as any);
+    const isSelf = (!!self.botOpenId && openId === self.botOpenId)
+      || (!!self.larkAppId && appId === self.larkAppId);
+    if (isSelf && typeof m?.name === 'string' && m.name.trim()) names.add(m.name);
+  }
+  if (names.size === 0) return content;
+  // 长名字优先，否则 "@Claude" 会先吃掉 "@Claude分身" 的前半截，留下孤儿 "分身"
+  //（与 stripLeadingMentions 里同一条教训）。
+  const alternation = [...names]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  // 连同紧贴的**行内**空白一起吃掉，只在 @ 两侧都有空白时补回一个空格：句中的
+  // "干活 @bot 继续" 不粘连，行首/行尾的 @ 不留下孤零零的空格。换行与正文缩进
+  // 一个字符都不动——正文要按原始排版交给 CLI。
+  const pattern = new RegExp(`([^\\S\\r\\n]*)@(?:${alternation})([^\\S\\r\\n]*)`, 'g');
+  return content
+    .replace(pattern, (_match, before: string, after: string) => (before && after ? ' ' : ''))
+    .trim();
+}
+
+/** 把用户可控的名字安全地嵌进正则（名字里可能有 `.` `+` `(` 等元字符）。 */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -639,6 +757,12 @@ function joinPostNodeText(parts: string[]): string {
   return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/** Placeholder for inbound voice messages. The daemon's audio-transcribe hook
+ *  replaces it with the ASR transcript (prefixed) before the turn is
+ *  dispatched; paths the hook doesn't cover still get this safe placeholder
+ *  instead of the raw {"file_key":...} JSON. */
+export const AUDIO_PLACEHOLDER = '[语音]';
+
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
@@ -676,6 +800,11 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
         return '[文件]';
       }
     }
+    if (msgType === 'audio') {
+      // 语音消息的转写在 daemon 的 audio-transcribe hook 里完成（下载 opus →
+      // ASR → 带前缀文本）；这里只给占位符，避免原始 JSON 注入 CLI。
+      return AUDIO_PLACEHOLDER;
+    }
     if (msgType === 'interactive') {
       return extractCardContent(rawContent, numberer);
     }
@@ -689,9 +818,30 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
 }
 
 /**
- * botmux-generated reply-card footer signature. New cards carry both a visible
- * versioned link marker and an exact element id. The canonical repository URL
- * is NOT a signature: it is valid body content. For pre-signature cards we
+ * Extract the download key from an inbound audio message's raw content
+ * (`{"file_key":"...","duration":<ms>}`). Returns null when the content isn't
+ * valid JSON or carries no usable file_key — callers should treat that as a
+ * permanent failure (reply, don't retry). `duration` is optional and surfaced
+ * as durationMs for callers that want to log/skip overlong clips.
+ */
+export function extractAudioMeta(rawContent: string): { fileKey: string; durationMs?: number } | null {
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (!parsed || typeof parsed.file_key !== 'string' || !parsed.file_key) return null;
+    return {
+      fileKey: parsed.file_key,
+      ...(typeof parsed.duration === 'number' ? { durationMs: parsed.duration } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * botmux-generated reply-card footer signature. New cards carry both an
+ * invisible text marker and an exact element id. Older signed cards used a
+ * versioned link, which remains recognized for compatibility. The canonical
+ * repository URL is NOT a signature: it is valid body content. For pre-signature cards we
  * recognize only the exact old default-brand + recipient chrome shape; a
  * default-brand-only old card is intentionally preserved because it is
  * indistinguishable from an ordinary repository link.
@@ -740,9 +890,13 @@ function hasExactMarkerMarkdown(value: string): boolean {
   return false;
 }
 
+function hasCurrentFooterMarker(value: unknown): value is string {
+  return typeof value === 'string' && value.includes(REPLY_CARD_FOOTER_MARKER);
+}
+
 function isSignedFormatBFooterLine(line: string): boolean {
   const inner = greyFontInner(line);
-  return inner !== null && hasExactMarkerMarkdown(inner);
+  return inner !== null && (hasCurrentFooterMarker(inner) || hasExactMarkerMarkdown(inner));
 }
 
 /** Strict compatibility recognizer for Format A cards emitted before the
@@ -841,8 +995,11 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
     // 卡片的 outgoing 消息）让 elements 内容自己说话，避免在正文前堆一行
     // 多余的 `[卡片]`。整张卡片真的没内容时下方 `parts.join('\n') || '[卡片]'`
     // 会兜底返回占位。
-    const title = card.title ?? card.header?.title?.content;
+    const title = nestedCardText(card.title) ?? nestedCardText(card.header?.title);
     if (title) parts.push(`[卡片: ${title}]`);
+    for (const tagText of extractCardHeaderTagTexts(card.header)) {
+      parts.push(`[标签: ${tagText}]`);
+    }
 
     // v2 cards nest elements under `body`; fall back to legacy top-level.
     const rootElements = Array.isArray(card.body?.elements)
@@ -875,12 +1032,21 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           }
           const textNodes: string[] = [];
           const buttons: string[] = [];
-          let hasFooterProof = false;
+          let inSignedFooter = false;
           for (const node of paragraph) {
-            if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
+            if (inSignedFooter) continue;
+            if (node.tag === 'text') {
+              if (hasCurrentFooterMarker(node.text)) {
+                textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
+                inSignedFooter = true;
+                continue;
+              }
+              if (node.text) textNodes.push(node.text);
+            }
             else if (node.tag === 'a') {
               if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
-                hasFooterProof = true;
+                inSignedFooter = true;
+                continue;
               }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
@@ -924,7 +1090,19 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
             }
           }
           const line = textNodes.join('').trim();
-          if (line && !hasFooterProof) parts.push(line);
+          if (line) {
+            if (inSignedFooter) {
+              const lastBreak = line.lastIndexOf('\n');
+              if (lastBreak >= 0) {
+                const beforeFooter = line.slice(0, lastBreak).trim();
+                if (beforeFooter) parts.push(beforeFooter);
+              }
+              // No newline before the signed marker means the whole paragraph is
+              // footer chrome (brand/usage/recipient). Keep nothing.
+            } else {
+              parts.push(line);
+            }
+          }
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
@@ -1036,6 +1214,34 @@ export function mergeCardText(textA: string, textB: string): string {
   const baseLines = b.split('\n').filter(l => !isPureCardUpgradeFallback(l));
   const bAll = baseLines.map(normalizeForDedup).join('');
 
+  // CardKit can expose header metadata in only one of the two message-detail
+  // representations. B remains authoritative for the single card title, while
+  // tags are an exact-value union: if B renders one tag and A renders a second,
+  // neither fact may disappear merely because both share the same metadata kind.
+  const metadataKind = (line: string): 'card' | 'tag' | undefined => {
+    if (/^\[卡片(?::[^\]]+)?\]$/.test(line.trim())) return 'card';
+    if (/^\[标签:[^\]]+\]$/.test(line.trim())) return 'tag';
+    return undefined;
+  };
+  const bHasCardMetadata = baseLines.some(line => metadataKind(line) === 'card');
+  const bTagMetadata = new Set(
+    baseLines
+      .filter(line => metadataKind(line) === 'tag')
+      .map(normalizeForDedup)
+      .filter(Boolean),
+  );
+  const seenMetadata = new Set<string>();
+  const missingMetadata = a.split('\n').filter(line => {
+    const kind = metadataKind(line);
+    if (!kind) return false;
+    const key = normalizeForDedup(line);
+    if (kind === 'card' && bHasCardMetadata) return false;
+    if (kind === 'tag' && bTagMetadata.has(key)) return false;
+    if (!key || seenMetadata.has(key)) return false;
+    seenMetadata.add(key);
+    return true;
+  });
+
   const filled = baseLines.map(line => {
     const sm = stripInlineMarkup(line).trimEnd();
     // empty-value field label, e.g. "值班人:" — but not bracketed section
@@ -1049,6 +1255,16 @@ export function mergeCardText(textA: string, textB: string): string {
     if (normalizeForDedup(value) && bAll.includes(normalizeForDedup(value))) return line;
     return `${line.replace(/\s*$/, '')} ${value}`;
   });
+  const missingCards = missingMetadata.filter(line => metadataKind(line) === 'card');
+  const missingTags = missingMetadata.filter(line => metadataKind(line) === 'tag');
+  if (missingCards.length > 0) filled.unshift(...missingCards);
+  if (missingTags.length > 0) {
+    let lastCardIndex = -1;
+    for (let index = 0; index < filled.length; index++) {
+      if (metadataKind(filled[index]) === 'card') lastCardIndex = index;
+    }
+    filled.splice(lastCardIndex + 1, 0, ...missingTags);
+  }
 
   // One honest marker if A carried sub-cards Lark only renders client-side.
   if (aHoleCount > 0) filled.push(CARD_EMBEDDED_PLACEHOLDER);
@@ -1143,8 +1359,9 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
   'worktree_toggle_mode',
   // config / grant / relay cards
-  'config_toggle', 'config_set', 'config_quota', 'config_text_open',
-  'config_text_save', 'grant_chat', 'grant_global', 'grant_deny',
+  'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+  'config_quota_save', 'config_text_open', 'config_text_save',
+  'grant_chat', 'grant_global', 'grant_deny',
   'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
   // host-overload alert + codex notifier cards
   'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
@@ -1197,6 +1414,106 @@ function withImgAlt(label: string, alt: string): string {
   return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
 }
 
+/** Read visible text from a CardKit value. Lark message reads often replace
+ *  the builder JSON with a rendered tree (`property.elements[].property.content`).
+ *  Header titles/tags and native table labels/cells all use this same normalizer
+ *  so quoted/history does not depend on the original send shape. */
+function nestedCardText(value: unknown): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(nestedCardText).filter((part): part is string => Boolean(part));
+    return parts.length > 0 ? parts.join('') : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const record = value as Record<string, any>;
+  const direct = firstNonEmptyString(
+    record.text?.content,
+    record.content,
+    record.property?.content,
+    typeof record.text === 'string' ? record.text : undefined,
+  );
+  if (direct) return direct;
+
+  // CardKit may expose both a rendered `elements` tree and markdown metadata.
+  // Prefer the rendered tree and only fall back to metadata to avoid repeating
+  // the same visible cell text twice.
+  const childGroups = [
+    record.property?.elements,
+    record.elements,
+    record.property?.markdownElements,
+    record.markdownElements,
+  ];
+  for (const children of childGroups) {
+    if (!Array.isArray(children) || children.length === 0) continue;
+    const nested = nestedCardText(children);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function extractCardHeaderTagTexts(header: unknown): string[] {
+  if (!header || typeof header !== 'object') return [];
+  const record = header as Record<string, any>;
+  const groups: unknown[] = [record.text_tag_list];
+  if (record.i18n_text_tag_list && typeof record.i18n_text_tag_list === 'object') {
+    groups.push(...Object.values(record.i18n_text_tag_list));
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    if (!Array.isArray(group)) continue;
+    for (const tag of group) {
+      const text = nestedCardText(tag?.text ?? tag)?.trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      result.push(text);
+    }
+  }
+  return result;
+}
+
+/** Newlines become `<br>` so a single value cannot split the reconstructed
+ *  table into extra rows. */
+function cardTableCellText(value: unknown): string {
+  const text = nestedCardText(value);
+  return (text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\n/g, '<br>');
+}
+
+/** Reconstruct an original schema-v2 native table as readable pipe Markdown.
+ *  `botmux send` deliberately emits native tables because Lark's markdown
+ *  widget cannot draw a grid; history/quoted/cross-bot reads must still retain
+ *  those facts instead of silently dropping the whole component. */
+function extractTableMarkdown(el: any): string | null {
+  if (!Array.isArray(el?.columns) || el.columns.length === 0) return null;
+  const columns = el.columns.map((column: any, index: number) => ({
+    key: typeof column?.name === 'string' && column.name ? column.name : `c${index}`,
+    label: cardTableCellText(column?.display_name) || `列 ${index + 1}`,
+  }));
+  const lines = [
+    `| ${columns.map((column: any) => column.label).join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+  ];
+  for (const row of Array.isArray(el.rows) ? el.rows : []) {
+    const cells = columns.map((column: any, index: number) => {
+      const value = Array.isArray(row)
+        ? row[index]
+        : row && typeof row === 'object'
+          ? row[column.key]
+          : undefined;
+      return cardTableCellText(value);
+    });
+    lines.push(`| ${cells.join(' | ')} |`);
+  }
+  return lines.join('\n');
+}
+
 type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
 
 /** Recursively extract image resources from an original-format card element. */
@@ -1232,22 +1549,47 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   const tag = el.tag;
 
   // The public element id alone is not ownership proof: third-party cards may
-  // collide with it. New botmux footers carry all four invariants together.
+  // collide with it. New botmux footers carry the id plus the reserved text
+  // marker; legacy cards carry the exact reserved link marker.
   const elementText = el.text?.content ?? el.content;
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && tag === 'markdown'
-    && el.text_size === 'notation_small_v2'
+    && (
+      el.text_size === undefined
+      || el.text_size === 'notation'
+      || el.text_size === 'notation_small_v2'
+    )
     && typeof elementText === 'string'
-    && isSignedFormatBFooterLine(elementText)
+    && (hasCurrentFooterMarker(elementText) || hasExactMarkerMarkdown(elementText))
   ) {
     return;
+  }
+
+  // Promoted H1/H2 heading widgets: Lark strips `text_size` when a message is
+  // read back, so the ATX prefix is rebuilt from the element id (the only
+  // carrier that survives normalization). This keeps heading hierarchy across
+  // sessions and lets a cross-bot re-send promote the line again.
+  if (tag === 'markdown' && typeof el.element_id === 'string') {
+    const idMatch = REPLY_CARD_HEADING_ELEMENT_ID_RE.exec(el.element_id);
+    if (idMatch) {
+      const heading = (typeof elementText === 'string' ? elementText : nestedCardText(el))?.trim();
+      if (heading) {
+        parts.push(`${'#'.repeat(Number(idMatch[1]))} ${heading}`);
+        return;
+      }
+    }
   }
 
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
     if (text) parts.push(text);
+  }
+
+  if (tag === 'table') {
+    const table = extractTableMarkdown(el);
+    if (table) parts.push(table);
   }
 
   // div.fields[] — v2 cards put most body text in a fields array of lark_md

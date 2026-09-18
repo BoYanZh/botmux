@@ -60,6 +60,9 @@ vi.mock('../src/core/daemon-ipc-auth.js', async (importOriginal) => {
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
   isRemoteAccessEnabled: vi.fn(() => false),
+  // Workflow feature defaults ON (production default) so /help renders the
+  // workflow section as before; the gate itself is covered in workflow-feature-gate.test.ts.
+  isWorkflowFeatureEnabled: vi.fn(() => true),
   // repoPickerScanOptions is the shared helper command-handler depends on;
   // default to legacy (include worktrees), overridden per-test.
   repoPickerScanOptions: vi.fn(() => ({ includeWorktrees: true })),
@@ -92,6 +95,15 @@ vi.mock('../src/services/role-profile-store.js', () => ({
   writeRoleProfileEntry: vi.fn(),
 }));
 
+// Shells out to `bytedcli`; these tests are about what /status and /login SAY,
+// not about the real CLI being installed and logged in.
+vi.mock('../src/services/bytedcli-auth.js', () => ({
+  hasBytedcliHome: vi.fn(() => false),
+  beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' })),
+  completeBytedcliLogin: vi.fn(async () => ({ state: 'authorized' as const })),
+  pendingBytedcliChallenge: vi.fn(() => null),
+}));
+
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -116,6 +128,10 @@ vi.mock('../src/bot-registry.js', () => ({
     return Object.keys(out).length ? out : undefined;
   }),
   getLoadedConfigPath: vi.fn(() => process.env.BOTS_CONFIG),
+  // Provenance of the above (see core/config-dir.ts). A path resolved from
+  // BOTS_CONFIG was really parsed, so it is 'loaded'; undefined when there is
+  // no path at all.
+  getLoadedConfigProvenance: vi.fn(() => (process.env.BOTS_CONFIG ? 'loaded' : undefined)),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
   // own bot. Default to the Claude process; the split-brain test overrides this
   // to prove the /group election does NOT depend on getAllBots().
@@ -152,6 +168,12 @@ vi.mock('../src/services/session-store.js', () => ({
     chatType,
   })),
   updateSession: vi.fn(),
+  getSession: vi.fn(() => undefined),
+  findActiveChatScopeSessionsByChat: vi.fn(() => []),
+  findActiveSessionsByWorkingDir: vi.fn(() => []),
+  findActiveSessionsByWorkingDirStrict: vi.fn(() => []),
+  getOwnedSession: vi.fn(() => undefined),
+  listSessions: vi.fn(() => []),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
 
@@ -181,6 +203,12 @@ vi.mock('../src/services/project-scanner.js', () => ({
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
   pushWorktreeBranch: vi.fn(async () => {}),
+  isLinkedWorktree: vi.fn(async () => false),
+  mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
+  worktreeRootFor: vi.fn(async (dir: string) => dir),
+  withWorktreeTargetLock: vi.fn(async (_path: string, fn: () => Promise<unknown>) => fn()),
+  removeRepoWorktree: vi.fn(async () => {}),
+  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -205,6 +233,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     (sid: string) =>
       `{"header":{"title":{"content":"🛑 会话已关闭"}},"action":"resume","cmd":"botmux resume ${sid.substring(0, 12)}"}`,
   ),
+  buildForkPanelCard: vi.fn((children: any[]) => JSON.stringify({ children })),
   buildSlashListCard: vi.fn((params: any) => JSON.stringify(params)),
   buildRelayPickerCard: vi.fn(
     (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string, visibility?: string) => JSON.stringify({
@@ -239,7 +268,7 @@ vi.mock('../src/im/lark/client.js', () => ({
       this.name = 'UserTokenMissingError';
     }
   },
-  deleteMessage: vi.fn(),
+  deleteMessage: vi.fn(async () => true),
   sendMessage: vi.fn(async () => 'card-msg-id'),
   // /relay picker replies land anchored at the invocation message / 话题 via
   // replyMessage (reply-at-invocation), not sessionReply. Args mirror the
@@ -250,6 +279,8 @@ vi.mock('../src/im/lark/client.js', () => ({
   // Default returns null so picker entries fall back to raw chatId.
   getChatName: vi.fn(async () => null),
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+  getChatModeStrict: vi.fn(async () => 'topic' as const),
+  getMessageThreadId: vi.fn(async () => 'omt_child'),
   // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
   // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
   // scenarios override with mockRejectedValueOnce to exercise the fallback.
@@ -301,10 +332,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // still hold — topic-group behaviour, where ephemeral is unavailable.
   deliverEphemeralOrReply: vi.fn(async (_ds: any, _op: any, _content: string, _type: string, reply: () => Promise<unknown>) => { await reply(); }),
   transferSession: vi.fn(async () => ({ ok: true })),
+  forkSession: vi.fn(async () => ({ ok: true, childSessionId: 'child-sess-1' })),
+  isForkCapableSession: vi.fn(() => true),
   // /relay --create empty-leader path closes the scratch via this; default
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // `isRelayableRealSession(ds)` — true when ds.worker is set OR persisted
   // CLI markers exist (session.cliId / session.lastCliInput). The default
   // makeSession fixture sets cliId='claude-code' so most tests pass the
@@ -316,6 +350,14 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // /term payload. Default to the in-chat visible-to-you channel; tests override
   // per-scenario (dm / failed / not_ready).
   deliverWritableTerminalCardTo: vi.fn(async () => 'ephemeral'),
+  // /card show path. postFreshStreamingCard returns false for sessions that
+  // structurally can't post a live card (VC meeting-receiver among them); the
+  // handler then picks an accurate reason. Default false so /card show tests
+  // exercise the not-ready / vc-receiver branch; override per-scenario.
+  postFreshStreamingCard: vi.fn(async () => false),
+  postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
+  resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
+  reconcileBotStreamingCardPins: vi.fn(),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -337,6 +379,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   buildNewTopicCliInput: vi.fn((prompt: string) => ({ content: `WRAPPED:${prompt}` })),
   ensureSessionWhiteboard: vi.fn((ds: any) => { ds.session.whiteboardId = 'wb_test'; }),
   getAvailableBots: vi.fn(async () => []),
+  resumeSession: vi.fn(),
 }));
 
 // Only the two discovery/validation entrypoints are stubbed; keep the real
@@ -373,7 +416,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
   resolveUserToken: vi.fn(async () => null),
+  listAuthorizedUsers: vi.fn(() => []),
+  resolveOAuthRedirectUri: vi.fn(() => 'http://127.0.0.1:9768/callback'),
   DOC_COMMENT_OAUTH_SCOPES: ['docs:document.comment:read'],
+  FEED_GROUP_OAUTH_SCOPES: ['im:feed_group'],
 }));
 
 vi.mock('../src/im/lark/doc-comment.js', () => {
@@ -397,6 +443,7 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
 });
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
+  docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),
@@ -464,14 +511,47 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
 }));
 
+vi.mock('../src/services/bot-union-ids-store.js', () => ({
+  getBotUnionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/team-bots-store.js', () => ({
+  isTeamBot: vi.fn(() => false),
+}));
+
+vi.mock('../src/services/platform-team-store.js', () => ({
+  isPlatformTeamBot: vi.fn(() => false),
+}));
+
+vi.mock('../src/services/worktree-cleanup-store.js', () => ({
+  putWorktreeCleanupJob: vi.fn((_: string, input: any) => ({ ...input, id: 'cleanup-123', createdAt: 1, updatedAt: 1 })),
+  getWorktreeCleanupJob: vi.fn(() => undefined),
+  deleteWorktreeCleanupJob: vi.fn(() => true),
+}));
+
 vi.mock('../src/services/card-mode-store.js', () => ({
   setCardMode: vi.fn(async () => ({ ok: true })),
 }));
 
+vi.mock('../src/services/pin-streaming-card-mode-store.js', () => ({
+  setChatStreamingCardPin: vi.fn(async () => ({ ok: true, changed: true })),
+}));
+
+vi.mock('../src/services/cot-mode-store.js', () => ({
+  setCotMode: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../src/im/lark/cot-message.js', () => ({
+  handleCotThinkingUpdate: vi.fn(() => true),
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
+import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
+import { setCotMode } from '../src/services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import {
@@ -484,31 +564,40 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
+import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
+import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
+import { isTeamBot } from '../src/services/team-bots-store.js';
+import { isPlatformTeamBot } from '../src/services/platform-team-store.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
+import { t } from '../src/i18n/index.js';
+import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
+import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
 import { putVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
-import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
@@ -552,6 +641,21 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
+function closeWorktreeState(
+  sessionId: string,
+  siblingSessionIds: string[] = [],
+  safetyFingerprint = 'clean-state',
+  invokerOpenId = 'ou_sender',
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    sessionId,
+    worktreeDir: resolve('/home/testuser/project-wt-task'),
+    siblingSessionIds: [...siblingSessionIds].sort(),
+    safetyFingerprint,
+    invokerOpenId,
+  })).digest('hex');
+}
+
 function makeDaemonSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
     session: makeSession(),
@@ -582,11 +686,18 @@ function makeLarkMessage(content: string, overrides: Partial<LarkMessage> = {}):
   };
 }
 
+// The most-recently constructed deps' activeSessions map. In production
+// `setActiveSessionsRegistry(activeSessions)` makes worker-pool's authoritative
+// `closeSession` delete from this very map; the mock below models that same
+// registry removal so /close tests can assert the session is gone.
+let lastMadeActiveSessions: Map<string, DaemonSession> | undefined;
+
 function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
   const activeSessions = new Map<string, DaemonSession>();
   if (ds) {
     activeSessions.set(sessionKey(ROOT_ID, ds.larkAppId), ds);
   }
+  lastMadeActiveSessions = activeSessions;
   return {
     activeSessions,
     sessionReply: vi.fn(async () => 'reply-msg-id'),
@@ -619,7 +730,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/cleanup-wt', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -652,15 +763,105 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 31 = current master command set (30) + /fork (session clone).
-    // /subscribe-lark-doc remains
-    // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(31);
+    // /tabs 与 /tab 由 Lark pre-routing 拦截，不属于 daemon command；否则
+    // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
+    // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
+    // 按文件 API 订阅命令语义，不做别名。
+    expect(DAEMON_COMMANDS.size).toBe(40);
+    expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
     expect(DAEMON_COMMANDS.has('/list-slash-command')).toBe(true);
     expect(DAEMON_COMMANDS.has('/slash')).toBe(true);
+  });
+});
+
+describe('/cli session selection', () => {
+  it('persists a pending CLI selection and allows pre-freeze reselection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({
+      state: 'pending', entryId: 'codex', cliId: 'codex', cliRuntime: expect.objectContaining({ id: 'codex' }), wrapperCli: null,
+      cliPathOverride: null, launchShell: null, startupCommands: [],
+    }));
+    expect(ds.session.agentFrozen).toBeUndefined();
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot?.entryId).toBe('hermes');
+  });
+
+  it('rejects selection after history and does not mutate the snapshot', async () => {
+    const snapshot = { version: 1 as const, state: 'pending' as const, entryId: 'codex', cliId: 'codex' as const, cliRuntime: null, cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [] };
+    const ds = makeDaemonSession({ hasHistory: true, session: makeSession({ cliId: 'codex', cliLaunchSnapshot: snapshot }) });
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toEqual(snapshot);
+  });
+
+  it('rejects bare /cli and unknown cli ids', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli does-not-exist'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, 'Usage: /cli <cliId>\nUnknown or invalid CLI.', undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('rejects riff because it requires bot-level backend configuration', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli riff'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
+
+  it('canonicalizes accepted CLI ids before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli CODEX'), makeDeps(ds), LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot?.cliId).toBe('codex');
+    expect(ds.session.cliLaunchSnapshot?.entryId).toBe('codex');
+  });
+
+  it('rejects mixed-case Riff before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli RIFF'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
   });
 });
 
@@ -737,6 +938,47 @@ describe('/list-slash-command discovery', () => {
     }
   });
 
+  it('mirrors the frozen CLI in the listing: Codex App shows NO passthrough, interactive Codex keeps /goal', async () => {
+    mockCodexAppBot(); // bot CURRENT config.cliId = 'codex-app'
+
+    // A session frozen as Codex App: the runner has no passthrough surface, so
+    // builtin + adapter + custom must all render empty (matching the router's
+    // early empty return) — never a fake `/model`/`/compact` passthrough list.
+    const appDs = makeDaemonSession({
+      larkAppId: CODEX_APP_ID,
+      session: makeSession({ cliId: 'codex-app' }),
+    });
+    await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), makeDeps(appDs), CODEX_APP_ID);
+    expect(buildSlashListCard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ builtin: [], adapterDefaults: [], custom: [] }),
+      expect.anything(),
+    );
+
+    // Inverse: bot flipped to Codex App but this session is frozen as
+    // interactive Codex → listing keeps builtin + the adapter-scoped /goal.
+    vi.mocked(buildSlashListCard).mockClear();
+    const tuiDs = makeDaemonSession({
+      larkAppId: CODEX_APP_ID,
+      session: makeSession({ cliId: 'codex' }),
+    });
+    await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), makeDeps(tuiDs), CODEX_APP_ID);
+    const call = vi.mocked(buildSlashListCard).mock.calls.at(-1)?.[0] as any;
+    expect(call.builtin).toContain('/model');
+    expect(call.adapterDefaults).toContain('/goal');
+  });
+
+  it.each(['codex-app', 'mira', 'mir', 'dsh'] as const)('shows NO passthrough for runner CLI %s', async (cliId) => {
+    const ds = makeDaemonSession({
+      larkAppId: LARK_APP_ID,
+      session: makeSession({ cliId }),
+    });
+    await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), makeDeps(ds), LARK_APP_ID);
+    expect(buildSlashListCard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ builtin: [], adapterDefaults: [], custom: [] }),
+      expect.anything(),
+    );
+  });
+
   it('shows only effective custom passthrough commands (drops daemon-shadow + junk, normalizes)', async () => {
     // 手写 bots.json 可能留下 `/status`（遮蔽 daemon 命令，parser 出于兼容会保留但
     // 路由会丢弃）、非法项、大小写不一；展示侧须与 resolvePassthroughCommands 同口径。
@@ -781,7 +1023,10 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
   it('contains /group and its /g alias', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/group')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/g')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/project')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/skills')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/sessions')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/cleanup-wt')).toBe(true);
   });
 
   it('is a subset of DAEMON_COMMANDS (they are still daemon-handled)', () => {
@@ -899,7 +1144,202 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
   });
 });
 
+describe('/botconfig reasoningEffort compatibility validation', () => {
+  it('rejects unsupported TraeX reasoning effort before writing bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-reasoning-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'traex',
+      model: 'DeepSeek-V4-Pro',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'TraeX',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'traex' as const,
+        model: 'DeepSeek-V4-Pro',
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const deps = makeDeps();
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        makeLarkMessage('/botconfig set reasoningEffort xhigh', { senderId: 'ou_sender' }),
+        deps,
+        'app-1',
+      );
+
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].reasoningEffort).toBeUndefined();
+      expect((bot.config as any).reasoningEffort).toBeUndefined();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('reasoning_effort_not_supported_by_model');
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
+describe('/botconfig set p2pOpen (私聊对话全开) via the real text command', () => {
+  it('turns DMs on and off through `/botconfig set`, keeping bots.json tidy', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-p2popen-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    // 真实入口是带 set 子命令的形式（`/botconfig` 只认 get/set/unset/help），
+    // 所以这里执行的是用户会打的那串字，而不是直接调 applyConfigField。
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+    try {
+      await run('/botconfig set p2pOpen on');
+      expect(stored().p2pOpen).toBe(true);
+      expect((bot.config as any).p2pOpen).toBe(true);
+
+      // off → 删 key（缺省即关），内存同步成 undefined；与 dashboard 通道同语义。
+      await run('/botconfig set p2pOpen off');
+      expect('p2pOpen' in stored()).toBe(false);
+      expect((bot.config as any).p2pOpen).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
+describe('/botconfig set cardActionAckTimeoutMs via the real text command', () => {
+  it('sets, range-checks, and unsets the bot-level ACK cutoff', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-card-ack-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+    try {
+      await run('/botconfig set cardActionAckTimeoutMs 1200');
+      expect(stored().cardActionAckTimeoutMs).toBe(1_200);
+      expect((bot.config as any).cardActionAckTimeoutMs).toBe(1_200);
+
+      await run('/botconfig set cardActionAckTimeoutMs 2501');
+      expect(stored().cardActionAckTimeoutMs).toBe(1_200);
+      expect((bot.config as any).cardActionAckTimeoutMs).toBe(1_200);
+
+      await run('/botconfig unset cardActionAckTimeoutMs');
+      expect(stored().cardActionAckTimeoutMs).toBeUndefined();
+      expect((bot.config as any).cardActionAckTimeoutMs).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
+  it('persists pinStreamingCard and returns promptly even when hot reconciliation throws or hangs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-pinstreaming-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+    const change = await import('../src/services/pin-streaming-card-change.js');
+
+    try {
+      const disposeThrow = change.registerPinStreamingCardChangeHandler(() => {
+        throw new Error('reconcile failed');
+      });
+      await expect(run('/botconfig set pinStreamingCard on')).resolves.toBeUndefined();
+      disposeThrow();
+      expect(stored().pinStreamingCard).toBe(true);
+      expect((bot.config as any).pinStreamingCard).toBe(true);
+
+      let release!: () => void;
+      const disposePending = change.registerPinStreamingCardChangeHandler(() => {
+        void new Promise<void>((resolve) => { release = resolve; });
+      });
+      await expect(run('/botconfig set pinStreamingCard off')).resolves.toBeUndefined();
+      disposePending();
+      expect('pinStreamingCard' in stored()).toBe(false);
+      expect((bot.config as any).pinStreamingCard).toBeUndefined();
+      release();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+
   it('rejects an over-long displayName and persists a valid one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));
     const configPath = join(dir, 'bots.json');
@@ -1035,10 +1475,69 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     }
   });
 
+  it('keeps raw passthrough off structured/service CLIs while honoring a frozen interactive override', () => {
+    mockCodexAppBot();
+
+    // App Server turns must use the structured message lane; raw_input has no
+    // matching dispatch reservation and would leave the session stuck after
+    // the model final arrives.
+    expect(resolvePassthroughCommands(CODEX_APP_ID).size).toBe(0);
+
+    // Existing sessions freeze their CLI. A pre-switch interactive Codex
+    // session must retain native slash passthrough even if the bot config now
+    // points at Codex App, while the inverse must stay structured.
+    expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/model')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'codex-app').size).toBe(0);
+    // Runner adapters (mira/mir/dsh) only accept framed input; raw slash
+    // passthrough would be rejected by the runner and wedge the session.
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    // ebsd is interactive, but every external message must pass through the
+    // service-user envelope and structured terminal-marker ledger.
+    expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'ebsd').size).toBe(0);
+  });
+
+  it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {
+    // Regression for the earlier miss: the override only guarded the codex-app
+    // early return, so `resolveAdapterDefaultPassthroughCommands` still read the
+    // bot's CURRENT config. When the bot default flips codex→codex-app, a frozen
+    // interactive Codex session then LOST its adapter-scoped `/goal` (it fell
+    // through as a plain message instead of raw_input). Builtin `/model` masked
+    // this because it never touches the adapter layer — so assert `/goal`.
+    mockCodexAppBot(); // bot CURRENT config.cliId = 'codex-app'
+
+    // Frozen interactive Codex session (override='codex'): keeps native /goal.
+    expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/goal')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands(CODEX_APP_ID, 'codex')).toContain('/goal');
+    // No override → reads current codex-app config → adapter layer is empty.
+    expect(resolveAdapterDefaultPassthroughCommands(CODEX_APP_ID)).not.toContain('/goal');
+    // Inverse: a bot whose current CLI is codex, frozen as codex-app → nothing.
+    expect(resolvePassthroughCommands('app-2', 'codex-app').size).toBe(0);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2', 'codex-app')).not.toContain('/goal');
+  });
+
   it('keeps /goal out of the global passthrough list but enables it for Claude and Codex adapters', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
+  });
+
+  it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {
+    // /fast is a tier toggle, not "start a unit of work": it lives in the global
+    // PASSTHROUGH_COMMANDS (forwarded to Codex on an existing session), and is
+    // deliberately NOT in any adapter's defaultPassthroughCommands — so a bare
+    // /fast in an empty topic must not cold-start a session (owner policy).
+    // Regression guard: an earlier revision put /fast in the codex adapter
+    // default, which both broke that no-cold-start policy and (before that) a
+    // revision that removed /fast from every set left it never reaching Codex.
+    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true); // codex
+    expect(resolvePassthroughCommands('app-1').has('/fast')).toBe(true); // claude-code (harmless unknown-command)
+    expect(resolvePassthroughCommands(undefined).has('/fast')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast'); // no cold-start
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
   });
 
   it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
@@ -1105,59 +1604,85 @@ describe('parseSlashCommandInvocation', () => {
     });
   });
 
+  it('preserves multiline fork tasks as one daemon command', () => {
+    const content = '/fork 调研这个问题\n补齐失败清理';
+    expect(parseSlashCommandInvocation(content)).toEqual({
+      cmd: '/fork',
+      content,
+    });
+  });
+
   it('ignores non-command text', () => {
     expect(parseSlashCommandInvocation('请解释 /adopt 怎么设计')).toBeNull();
   });
 });
 
-describe('parseForceTopicInvocation', () => {
+describe('parseTopicHeader（取代 parseForceTopicInvocation 的路由元命令判定）', () => {
+  /** 只关心「是不是 force-topic + 正文是什么」——这是旧 parseForceTopicInvocation 的全部契约。 */
+  function forceTopic(content: string): { prompt: string } | null {
+    const parsed = parseTopicHeader(content);
+    return isTopicHeader(parsed) ? { prompt: parsed.prompt } : null;
+  }
+
   it('parses /t with prompt', () => {
-    expect(parseForceTopicInvocation('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X' });
+    expect(forceTopic('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X' });
   });
 
   it('parses /topic with prompt', () => {
-    expect(parseForceTopicInvocation('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y' });
+    expect(forceTopic('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y' });
   });
 
-  it('parses bare /t (no args) with empty prompt', () => {
-    expect(parseForceTopicInvocation('/t')).toEqual({ prompt: '' });
+  it('parses bare /t and bare /topic with an empty prompt', () => {
+    expect(forceTopic('/t')).toEqual({ prompt: '' });
+    expect(forceTopic('/topic')).toEqual({ prompt: '' });
   });
 
-  it('parses bare /topic (no args) with empty prompt', () => {
-    expect(parseForceTopicInvocation('/topic')).toEqual({ prompt: '' });
+  it('is case-insensitive on the sentinel itself', () => {
+    expect(forceTopic('/T hello')).toEqual({ prompt: 'hello' });
+    expect(forceTopic('/Topic hello')).toEqual({ prompt: 'hello' });
   });
 
-  it('is case-insensitive on the command itself', () => {
-    expect(parseForceTopicInvocation('/T hello')).toEqual({ prompt: 'hello' });
-    expect(parseForceTopicInvocation('/Topic hello')).toEqual({ prompt: 'hello' });
+  it('preserves multiline prompt content verbatim after the sentinel', () => {
+    expect(forceTopic('/t line1\nline2\nline3')).toEqual({ prompt: 'line1\nline2\nline3' });
+
   });
 
-  it('preserves multiline prompt content verbatim after the prefix', () => {
-    const content = '/t line1\nline2\nline3';
-    expect(parseForceTopicInvocation(content)).toEqual({ prompt: 'line1\nline2\nline3' });
+  it('retains cwd and worktree lifecycle aliases', () => {
+    expect(parseForceTopicInvocation('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(parseForceTopicInvocation('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+    expect(parseForceTopicInvocation('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(parseForceTopicInvocation('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
   });
 
   it('does not match similar prefixes', () => {
-    expect(parseForceTopicInvocation('/tea is good')).toBeNull();
-    expect(parseForceTopicInvocation('/talk to me')).toBeNull();
-    expect(parseForceTopicInvocation('/topical')).toBeNull();
+    expect(forceTopic('/tea is good')).toBeNull();
+    expect(forceTopic('/talk to me')).toBeNull();
+    expect(forceTopic('/topical')).toBeNull();
   });
 
-  it('only matches at the very start of content', () => {
-    expect(parseForceTopicInvocation('hello /t world')).toBeNull();
-    expect(parseForceTopicInvocation('  /t hello')).toEqual({ prompt: 'hello' }); // tolerate leading whitespace
+  it('tolerates leading whitespace', () => {
+    expect(forceTopic('  /t hello')).toEqual({ prompt: 'hello' });
+
   });
 
   it('returns null for non-slash text', () => {
-    expect(parseForceTopicInvocation('hello world')).toBeNull();
-    expect(parseForceTopicInvocation('')).toBeNull();
+    expect(forceTopic('hello world')).toBeNull();
+    expect(forceTopic('')).toBeNull();
   });
 
   it('does not collide with parseSlashCommandInvocation outputs', () => {
     // /close, /restart, /repo etc. must NOT be claimed as force-topic invocations.
-    expect(parseForceTopicInvocation('/close')).toBeNull();
-    expect(parseForceTopicInvocation('/restart')).toBeNull();
-    expect(parseForceTopicInvocation('/repo 1')).toBeNull();
+    expect(forceTopic('/close')).toBeNull();
+    expect(forceTopic('/restart')).toBeNull();
+    expect(forceTopic('/repo 1')).toBeNull();
+  });
+
+  it('刻意的行为变化：/t 之前的文字现在是可读标题，不再判为非 force-topic', () => {
+    // 旧 parseForceTopicInvocation 要求 `/t` 在第 0 位，`hello /t world` 返回 null。
+    // 新语法把 `/t` 之前的文字当标题（飞书话题列表显示的是原消息，bot 改不了标题，
+    // 所以可读文字必须排在最前）。护栏在 topic-header 的单测里：标题不得含 `/` 开头的
+    // token、不超过 3 行、归一化后不超过 200 字，否则仍判为非 force-topic。
+    expect(parseTopicHeader('hello /t world')).toMatchObject({ ok: true, title: 'hello', prompt: 'world' });
   });
 });
 
@@ -1169,7 +1694,16 @@ describe('handleCommand', () => {
       // command must delegate this side effect instead of publishing a second
       // patch itself.
       publishClosedSessionPatch(sessionId);
-      return { ok: true, alreadyClosed: false, known: true };
+      // Model the authoritative registry removal too: in production
+      // setActiveSessionsRegistry wires worker-pool's map to deps.activeSessions,
+      // so closeSession deletes the closed session from it. /close no longer
+      // deletes the key itself — it delegates to this lifecycle.
+      if (lastMadeActiveSessions) {
+        for (const [k, candidate] of lastMadeActiveSessions) {
+          if (candidate.session.sessionId === sessionId) lastMadeActiveSessions.delete(k);
+        }
+      }
+      return { ok: true, outcome: 'closed', alreadyClosed: false, known: true };
     });
     vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
@@ -1198,6 +1732,195 @@ describe('handleCommand', () => {
     // on them — pin the factory defaults so tests pass in any order (shuffle).
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+    vi.mocked(deleteMessage).mockResolvedValue(true);
+    vi.mocked(sendMessage).mockResolvedValue('card-msg-id');
+    vi.mocked(replyMessage).mockResolvedValue('picker-card-msg-id');
+    vi.mocked(getChatModeStrict).mockResolvedValue('topic');
+    vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
+    vi.mocked(forkSession).mockResolvedValue({ ok: true, childSessionId: 'child-sess-1' });
+    vi.mocked(isForkCapableSession).mockReturnValue(true);
+    vi.mocked(sessionStore.getSession).mockReturnValue(undefined);
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
+    vi.mocked(sessionStore.listSessions).mockReturnValue([]);
+    vi.mocked(resumeSession).mockReset();
+  });
+
+  describe('/fork sub-topic', () => {
+    it('creates a child topic and forwards the multiline task as the first fork turn', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+          scope: 'thread',
+        }),
+      });
+      const deps = makeDeps(ds);
+      const task = '调研这个问题\n补齐失败清理';
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage(`/fork ${task}`, { threadId: 'omt_parent' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(getChatModeStrict).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+      expect(sendMessage).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        CHAT_ID,
+        expect.stringContaining('调研这个问题'),
+        'post',
+      );
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        CHAT_ID,
+        'card-msg-id',
+        'group',
+        'thread',
+        expect.objectContaining({
+          forkTaskText: task,
+          larkThreadId: 'omt_child',
+          turnId: 'msg_001',
+        }),
+      );
+      const options = vi.mocked(forkSession).mock.calls[0][5]!;
+      expect(options).toMatchObject({
+        senderOpenId: 'ou_sender',
+        senderIsBot: false,
+      });
+      expect(options.buildInitialPrompt?.('child-sess-1')).toEqual({
+        content: expect.stringContaining(task),
+      });
+      const initialPromptCall = vi.mocked(buildNewTopicCliInput).mock.calls.at(-1)!;
+      expect(initialPromptCall[10]).toEqual({ openId: 'ou_sender', type: 'user' });
+      const actualSessionManager = await vi.importActual<typeof import('../src/core/session-manager.js')>(
+        '../src/core/session-manager.js',
+      );
+      expect(actualSessionManager.renderSenderTag(initialPromptCall[10])).toContain('open_id="ou_sender"');
+      expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('omt_child'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('reports an orphan topic when fork creation and message recall both fail', async () => {
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: false, error: 'worker_busy' });
+      vi.mocked(deleteMessage).mockResolvedValueOnce(false);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '继续排查',
+        ds,
+        makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }),
+        LARK_APP_ID,
+      );
+
+      expect(result).toEqual({ ok: false, error: 'worker_busy', orphanTopic: true });
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+    });
+
+    it('turns a topic creation exception into a user-visible failure', async () => {
+      vi.mocked(sendMessage).mockRejectedValueOnce(new Error('lark unavailable'));
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('topic_creation_failed'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(deleteMessage).not.toHaveBeenCalled();
+    });
+
+    it('recalls the created topic when forkSession throws unexpectedly', async () => {
+      vi.mocked(forkSession).mockRejectedValueOnce(new Error('spawn exploded'));
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '继续排查',
+        ds,
+        makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }),
+        LARK_APP_ID,
+      );
+
+      expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+    });
+  });
+
+  describe('/fork --create lineage durability', () => {
+    it('persists parent lineage even when the created-notice reply fails (expired root → 400)', async () => {
+      // Regression for the ordering blocker: the "created" notice is a reply to
+      // the parent session's root message — the same message whose expiry this
+      // PR's other fix addresses. If that notice throws, control must NOT skip
+      // the lineage write, or /forklist stays empty in the exact "root expired"
+      // scenario the PR targets. We assert lineage is durable BEFORE the notice.
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: true, childSessionId: 'child-create-1' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat', cliId: 'codex' }),
+      });
+      const deps = makeDeps(ds);
+      // First sessionReply (the created notice) rejects like a 400 on the
+      // expired root; later calls (if any) resolve.
+      let replyCall = 0;
+      (deps.sessionReply as any).mockImplementation(async () => {
+        replyCall += 1;
+        if (replyCall === 1) throw new Error('Request failed with status code 400');
+        return 'reply-msg-id';
+      });
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 直播开发备份'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      // forkSession ran for the new group and carried the group name as task text.
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        expect.any(String),
+        expect.any(String),
+        'group',
+        'chat',
+        expect.objectContaining({ forkTaskText: '直播开发备份' }),
+      );
+      // The load-bearing assertion: lineage persisted despite the notice throwing.
+      expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
+      );
+    });
   });
 
   describe('doc comment commands', () => {
@@ -1213,11 +1936,13 @@ describe('handleCommand', () => {
         LARK_APP_ID,
       );
 
+      // 第五参 = 下这条订阅命令的人：订阅是他建立的，之后的评论读写按他的权限走。
       expect(generateAuthUrl).toHaveBeenCalledWith(
         LARK_APP_ID,
         'secret-1',
         'feishu',
         DOC_COMMENT_OAUTH_SCOPES,
+        'ou_sender',
       );
       expect(subscribeDocFile).not.toHaveBeenCalled();
       expect(putDocSubscription).not.toHaveBeenCalled();
@@ -1293,11 +2018,13 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('文档权限');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
+      // 第五参 = 下这条订阅命令的人：订阅是他建立的，之后的评论读写按他的权限走。
       expect(generateAuthUrl).toHaveBeenCalledWith(
         LARK_APP_ID,
         'secret-1',
         'feishu',
         DOC_COMMENT_OAUTH_SCOPES,
+        'ou_sender',
       );
     });
 
@@ -1413,10 +2140,10 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         expect.objectContaining({
           fileToken: 'doc_token_12345678901234567890',
-          sessionAnchor: 'doc:doc_token_12345678901234567890',
+          sessionAnchor: 'doc:doc_token_12345678901234567890:watch',
           sessionId: undefined,
           scope: 'chat',
-          chatId: 'doc:doc_token_12345678901234567890',
+          chatId: 'doc:doc_token_12345678901234567890:watch',
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
@@ -1487,6 +2214,109 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
+    it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('App Server 和 Codex App 会话仍在运行'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('does not report a shared App Server disconnect as complete when close leaves a residual', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('未能确认完全断开');
+      expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+    });
+
+    it.each([
+      {
+        command: '/detach',
+        close: {
+          ok: true,
+          outcome: 'closed',
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: 'App Server 和 Codex App 会话仍在运行',
+      },
+      {
+        command: '/detach',
+        close: {
+          ok: false,
+          alreadyClosed: false,
+          error: 'remote_close_unproven',
+          retryable: true,
+        },
+        expected: '未能安全断开',
+      },
+      {
+        command: '/disconnect',
+        close: {
+          ok: true,
+          outcome: 'closed_with_residual',
+          residual: { reason: 'local_subtree_boundary_unproven' },
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: '未能确认完全断开',
+      },
+    ])('maps shared $command close outcomes without claiming an unverified detach', async ({ command, close, expected }) => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce(close as never);
+
+      await handleCommand(command, ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain(expected);
+      if ((close as { outcome?: string }).outcome !== 'closed') {
+        expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+      }
+    });
+
     it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -1531,6 +2361,7 @@ describe('handleCommand', () => {
         expect.stringContaining('会话已关闭'),
         'interactive',
         expect.any(Function),
+        undefined,
       );
       // /close now replies with an interactive card carrying a Resume button
       // and a copyable `botmux resume <id>` command — assert on the card shape
@@ -1546,6 +2377,421 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+
+
+    it('continues sibling and worktree cleanup when the closed-session card delivery fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(deliverEphemeralOrReply).mockRejectedValueOnce(new Error('card delivery unavailable'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+    });
+
+    it('persists a retry job when final worktree removal fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(removeRepoWorktree).mockRejectedValueOnce(new Error('worktree busy'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(withWorktreeTargetLock).toHaveBeenCalledWith('/home/testuser/project-wt-task', expect.any(Function));
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task',
+        error: 'worktree busy',
+      }));
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('/cleanup-wt cleanup-123');
+    });
+
+    it('does not persist a cleanup job when removal succeeded but its success reply fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, content) => {
+        if (String(content).includes('额外关闭 0 个同 worktree 会话')) throw new Error('reply unavailable');
+      });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
+    });
+
+    it('does not report a retained retry job when cleanup succeeded but its success reply fails', async () => {
+      const deps = makeDeps(undefined);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(getWorktreeCleanupJob).mockReturnValueOnce({
+        id: 'cleanup-123', larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project', worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'clean-state', error: 'busy', createdAt: 1, updatedAt: 1,
+      });
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, content) => {
+        if (String(content).includes('已重试并移除 worktree')) throw new Error('reply unavailable');
+      });
+
+      await handleCommand('/cleanup-wt', ROOT_ID, makeLarkMessage('/cleanup-wt cleanup-123'), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalled();
+      expect(deleteWorktreeCleanupJob).toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1])).join('\n'))
+        .not.toContain('任务已保留');
+    });
+
+    it('retries a durable cleanup job without an active session', async () => {
+      const deps = makeDeps(undefined);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(getWorktreeCleanupJob).mockReturnValueOnce({
+        id: 'cleanup-123', larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project', worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'clean-state', error: 'busy', createdAt: 1, updatedAt: 1,
+      });
+
+      await handleCommand('/cleanup-wt', ROOT_ID, makeLarkMessage('/cleanup-wt cleanup-123'), deps, LARK_APP_ID);
+
+      expect(withWorktreeTargetLock).toHaveBeenCalledWith('/home/testuser/project-wt-task', expect.any(Function));
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      expect(deleteWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), 'cleanup-123');
+    });
+
+    it('`/close wt` closes the session and removes a linked worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('额外关闭 0 个同 worktree 会话');
+    });
+
+
+
+    it('`/close wt` fails closed when the cross-store inventory is unavailable', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict)
+        .mockImplementationOnce(() => { throw new Error('inventory unavailable'); });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('inventory unavailable');
+    });
+
+    it('binds worktree confirmation state to the requesting operator', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValue(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValue('/home/testuser/project');
+      const state = closeWorktreeState(ds.session.sessionId, [], 'clean-state', 'ou_requester');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${state}`, {
+        senderId: 'ou_other_operator',
+      }), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n'))
+        .toContain('状态在确认卡生成后发生变化');
+    });
+
+    it('`/close wt` asks for confirmation when other sessions share the worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('确认关闭话题并删除 worktree'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('`/close wt --yes` without a confirmation state never deletes even a clean worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('confirmation_state'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('`/close wt --yes` refuses to close a cross-bot sibling outside the trusted team', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-remote', larkAppId: 'app-2' }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('不属于可信团队');
+    });
+
+    it('`/close wt --yes` allows a trusted-team cross-bot sibling', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-remote', larkAppId: 'app-2' }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+      vi.mocked(getBotUnionId).mockReturnValueOnce('on_team_bot');
+      vi.mocked(isTeamBot).mockReturnValueOnce(true);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValueOnce({ larkAppId: 'app-2', ipcPort: 9999 });
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, outcome: 'closed' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })));
+
+      try {
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-remote'])}`), deps, LARK_APP_ID);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+
+      expect(isPlatformTeamBot).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+    });
+
+    it('`/close wt --yes` closes sibling sessions before removing the shared worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('额外关闭 1 个同 worktree 会话');
+    });
+
+    it('rejects a stale worktree confirmation card and returns a fresh card', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true,
+        dirtyFiles: ['src/new-change.ts'],
+        ahead: 0,
+        unpushedCommits: [],
+        fingerprint: 'new-state',
+      });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes --state=stale-state'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('状态在确认卡生成后发生变化');
+      expect(replies).toContain('confirmation_state');
+      expect(replies).toContain('src/new-change.ts');
+    });
+
+    it('rechecks worktree content after closing writers and refuses changed state', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })
+        .mockResolvedValueOnce({ dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'], ahead: 0, unpushedCommits: [], fingerprint: 'changed-state' });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, [], 'clean-state')}`), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'changed-state',
+      }));
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('关闭会话后 worktree 内容发生变化');
+      expect(replies).toContain('/cleanup-wt cleanup-123');
+    });
+
+    it('`/close wt --yes` preserves the worktree when a sibling close is refused', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+      vi.mocked(closeSession)
+        .mockResolvedValueOnce({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })
+        .mockResolvedValueOnce({ ok: false, alreadyClosed: false, error: 'remote_close_failed', retryable: true });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('其他 1 个会话未能关闭');
+      expect(replies).toContain('worktree 未删除');
+    });
+
+    it('`/close wt --yes` preserves the worktree when a cross-daemon sibling leaves a residual', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDirStrict).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-remote', larkAppId: 'app-2' }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+      vi.mocked(getBotUnionId).mockReturnValueOnce('on_team_bot');
+      vi.mocked(isTeamBot).mockReturnValueOnce(true);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValueOnce({ larkAppId: 'app-2', ipcPort: 9999 });
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'remote_cancel_unverified', taskId: 'remote-task-1' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+      try {
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-remote'])}`), deps, LARK_APP_ID);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('其他 1 个会话未能关闭');
+      expect(replies).toContain('worktree 未删除');
+    });
+
+
+
+
+
+    it('`/close wt` asks for confirmation when the worktree has dirty or unpushed changes', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyCount: 2, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('⚠️ 未提交改动：2 个文件'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(replies).toContain('⚠️ 未 push 提交：2 个');
+      expect(replies).toContain('src/a.ts');
+      expect(replies).toContain('abc123 fix close wt');
+      expect(replies).toContain('删除后：');
+    });
+
+    it('`/close wt` refuses in a top-level chat-scope session', async () => {
+      const ds = makeDaemonSession({ scope: 'chat', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.scope = 'chat';
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('只用于 `/tw` 创建的子话题');
+    });
+
+    it('`/close wt` refuses to delete a normal checkout', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project' });
+      ds.session.workingDir = '/home/testuser/project';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(false);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('不是 linked worktree');
     });
 
     it('keeps the active session and reports a visible failure when teardown is refused', async () => {
@@ -1570,10 +2816,82 @@ describe('handleCommand', () => {
       expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('ZMX ownership probe unavailable');
     });
 
+    it('reports a refused close instead of claiming the session was closed', async () => {
+      // A remote backend that cannot prove its remote session was cancelled
+      // RETURNS {ok:false} rather than throwing, and leaves the row active. This
+      // path used to only inspect thrown errors, so it announced "已关闭" and sent
+      // the closed-session card while the remote session was still running and
+      // still holding the injected credential — the exact lie the daemon-side fix
+      // exists to remove.
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_cancel_failed',
+        retryable: true,
+        taskId: 'mojo-sid-123',
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      // Active record kept so the close is retryable.
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
+      // The "session closed" card must NOT be delivered.
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('会话关闭失败');
+      expect(reply).toContain('mojo_cancel_failed');
+      expect(reply).toContain('mojo-sid-123');
+    });
+
+    it('reports a residual instead of a plain closed card', async () => {
+      // The row DID close, so this is not a failure — but a remote session was
+      // deliberately left running, and the ordinary closed card would say
+      // everything is gone.
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      // No ordinary "closed" card.
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('mojo-parked-9');
+      expect(reply).toContain('未被取消');
+    });
+
+    it('a LOCAL-subtree residual on /close points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('本机');       // points at the host subtree
+      expect(reply).not.toContain('undefined');
+      expect(reply).not.toMatch(/远端会话.*未.*取消/);
+    });
+
     it('does not delete a replacement session that wins the anchor while close awaits cleanup', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
-      let releaseClose!: (value: { ok: true; alreadyClosed: boolean; known: boolean }) => void;
+      let releaseClose!: (value: CloseSessionResult) => void;
       vi.mocked(closeSession).mockImplementationOnce(() => new Promise(resolve => {
         releaseClose = resolve;
       }));
@@ -1588,7 +2906,7 @@ describe('handleCommand', () => {
         title: 'replacement',
       };
       deps.activeSessions.set(sessionKey(ROOT_ID, LARK_APP_ID), replacement);
-      releaseClose({ ok: true, alreadyClosed: false, known: true });
+      releaseClose({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
       await closing;
 
       expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(replacement);
@@ -1652,6 +2970,54 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('adopt'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('should reject Riff sessions with close-and-recreate guidance', async () => {
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'riff';
+      ds.session.backendType = 'riff';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringMatching(/Riff.*不支持重启.*\/close/),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('should reject Mojo restarts with the same remote guard (round-4 gate)', async () => {
+      // Unlike riff (whose worker refuses the IPC), a mojo worker EXECUTES
+      // restart — its teardown cancels the remote session and cold-boots a
+      // context-less replacement. The riff-only guard made /restart a real
+      // remote-destruction entry point for mojo.
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'mojo';
+      ds.session.backendType = 'mojo';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringMatching(/Mojo.*不支持重启.*\/close/),
         undefined,
         LARK_APP_ID,
         'msg_001',
@@ -1817,6 +3183,77 @@ describe('handleCommand', () => {
       // than its executable basename.
       expect(legacyReply).toContain('codex:');
       expect(legacyReply).not.toContain('vendor-codex:');
+    });
+
+    // Per tool, because the answer really does differ between them: /login
+    // grants Lark only, while bytedcli authenticates against ByteCloud SSO. One
+    // combined verdict claimed "you are authorized" for a tool the token has no
+    // bearing on, and the reader found out only when a command failed.
+    describe('trigger-user auth lines', () => {
+      function statusWith(triggerUserAuth: unknown, authorized: boolean) {
+        vi.mocked(listAuthorizedUsers).mockReturnValue(
+          authorized ? [{ openId: 'ou_sender', userName: '孙晓雪', expiresAt: '', refreshExpiresAt: '' }] : [],
+        );
+        vi.mocked(getBot).mockImplementation((() => ({
+          botName: 'Claude',
+          config: {
+            larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+            workingDir: '~/projects', workingDirs: ['~/projects'],
+            triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined,
+          },
+        })) as any);
+        return makeDeps(makeDaemonSession({ worker: { killed: false } as any, workerPort: 8080 }));
+      }
+
+      async function statusText(deps: any) {
+        await handleCommand('/status', ROOT_ID, makeLarkMessage('/status'), deps, LARK_APP_ID);
+        return (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      }
+
+      it('says nothing at all when the policy is off', async () => {
+        const text = await statusText(statusWith({ enabled: false }, true));
+        expect(text).not.toContain('Trigger-user auth');
+      });
+
+      it('names the authorized person for lark-cli', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
+        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+      });
+
+      it('tells an unauthorized sender what the fallback is and how to change it', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
+        expect(text).toContain('lark-cli: 你未授权');
+        expect(text).toContain('bot 身份');
+        expect(text).toContain('/login');
+      });
+
+      it('warns that the command will be refused under fallback: none', async () => {
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['lark-cli'], fallback: 'none' }, false),
+        );
+        expect(text).toContain('命令会被拒绝');
+      });
+
+      // The bug this split fixes: ByteCloud is a separate identity provider, so
+      // an authorized Lark token says nothing about bytedcli. This sender has a
+      // Lark token and no bytedcli login, and the two lines must disagree.
+      it('reports bytedcli separately even when Lark is authorized', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(false);
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
+        );
+        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+        expect(text).toContain('bytedcli: 你未授权');
+        expect(text).toContain('/login bytedcli');
+      });
+
+      it('reports bytedcli as authorized once that person has logged in', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['bytedcli'] }, false),
+        );
+        expect(text).toContain('bytedcli: 以你自己的身份调用');
+      });
     });
   });
 
@@ -1988,6 +3425,64 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('已自动创建并切换');
     });
 
+    it('should reject before path creation while Codex App dispatch ownership is non-empty', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.codexAppDispatchLedger = [
+        { dispatchId: 'd-1', turnId: 't-1', state: 'accepted', content: 'owned' },
+      ];
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/owned'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('未结算');
+    });
+
+    it('should reject Riff cwd changes before creating or persisting the target', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.backendType = 'riff';
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/riff-role'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('Riff');
+      expect(replyContent).toContain('/close');
+    });
+
+    it('should reject Mojo cwd changes before creating or persisting the target (P1-a)', async () => {
+      // killWorker refuses unprepared live retirement for every remote backend
+      // (P0-2), so a /cd that repinned first left the live worker on the OLD
+      // cwd while reporting success — the riff-only guard let mojo through
+      // into exactly that split brain.
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.backendType = 'mojo';
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/mojo-role'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('Mojo');
+      expect(replyContent).toContain('/close');
+    });
+
     it('should reject /cd when auto-create fails', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
       vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });
@@ -2108,10 +3603,13 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Agent 当前未运行');
     });
 
-    it('requests native rename from a live Codex worker without restarting it', async () => {
+    it.each([
+      ['codex', '/bin/codex'],
+      ['traex', '/bin/traex'],
+    ] as const)('requests native rename from a live %s worker without restarting it', async (cliId, cliPathOverride) => {
       const send = vi.fn();
       const ds = makeDaemonSession({
-        session: makeSession({ cliId: 'codex', cliPathOverride: '/bin/codex' }),
+        session: makeSession({ cliId, cliPathOverride }),
         worker: { killed: false, connected: true, send } as any,
       });
       const deps = makeDeps(ds);
@@ -2124,13 +3622,127 @@ describe('handleCommand', () => {
       expect(ds.session.nativeSessionTitle).toBe('Native 同步');
       expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('已向 codex 发送原生改名请求');
+      expect(replyContent).toContain(`已向 ${cliId} 发送原生改名请求`);
     });
   });
 
   // ─── /repo ──────────────────────────────────────────────────────────────
 
   describe('/repo', () => {
+    it('refuses a repo switch over a live Riff generation before teardown or refork', async () => {
+      const oldSession = makeSession({
+        cliId: 'riff',
+        backendType: 'riff',
+        riffParentTaskId: 'task-live',
+        workingDir: '/remote/riff',
+      });
+      const ds = makeDaemonSession({
+        pendingRepo: false,
+        workingDir: '/remote/riff',
+        worker: { killed: false } as any,
+        initConfig: { backendType: 'riff' } as any,
+        session: oldSession,
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session).toBe(oldSession);
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
+    });
+
+    it('refuses a repo switch over a live Mojo generation before teardown or refork (round-4 gate)', async () => {
+      const oldSession = makeSession({
+        cliId: 'mojo',
+        backendType: 'mojo',
+        riffParentTaskId: 'mojo-task-live',
+        workingDir: '/remote/mojo',
+      });
+      const ds = makeDaemonSession({
+        pendingRepo: false,
+        workingDir: '/remote/mojo',
+        worker: { killed: false } as any,
+        initConfig: { backendType: 'mojo' } as any,
+        session: oldSession,
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session).toBe(oldSession);
+      expect(ds.workingDir).toBe('/remote/mojo');
+      expect(ds.session.riffParentTaskId).toBe('mojo-task-live');
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
+    });
+
+    it('does not create a replacement session when the old close left a residual', async () => {
+      // Choosing a directory is not consent to leave a remote session running. The
+      // old row DID close, so this is not a failure — but the switch must stop and
+      // say so rather than spawning a replacement over an uncancelled remote.
+      const ds = makeDaemonSession({ pendingRepo: false, worker: null });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+      vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('mojo-parked-9');
+      expect(said).toContain('未创建新会话');
+    });
+
+    it('a LOCAL-subtree residual on repo switch points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+      // A local residual has no taskId. The old wording rendered "远端会话 undefined
+      // 未取消" and sent the operator after a nonexistent remote session.
+      const ds = makeDaemonSession({ pendingRepo: false, worker: null });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+      vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('本机');
+      expect(said).toContain('未创建新会话');
+      expect(said).not.toContain('undefined');
+      expect(said).not.toMatch(/远端会话.*未.*取消/);
+    });
+
     it('shared fold-back: every command reply carries the triggering messageId as turnId', async () => {
       // A shared (chat-scope) session triggered from inside a Lark thread
       // records currentReplyTarget={turnId: messageId}. Command replies must
@@ -2201,14 +3813,19 @@ describe('handleCommand', () => {
 
       expect(ds.workingDir).toBe('/home/testuser/project-b');
       // ds.session is replaced by createSession result (pendingRepo is false → else branch)
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalled();
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('sess-001');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'project-b (dev)', 'group', undefined,
+        { source: 'ordinary-feishu' },
       );
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(withActiveSessionKeyLock).toHaveBeenCalledWith(
+        deps.activeSessions,
+        sessionKey(ROOT_ID, LARK_APP_ID),
+        expect.any(Function),
+      );
     });
 
     it('keeps the old ZMX session active when repo-switch teardown is refused', async () => {
@@ -2241,8 +3858,23 @@ describe('handleCommand', () => {
       const ds = makeDaemonSession({
         pendingRepo: false,
         scope: 'chat',
+        currentReplyTarget: {
+          rootMessageId: 'om_old_reply_topic',
+          turnId: 'turn-old',
+          updatedAt: new Date().toISOString(),
+        },
+        replyThreadAliases: {
+          om_old_reply_topic: {
+            createdAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+          },
+        },
+        streamCardReplyTargetKey: 'thread:om_old_reply_topic',
         session: makeSession({ scope: 'chat', rootMessageId: originalRoot }),
       });
+      ds.session.currentReplyTarget = ds.currentReplyTarget;
+      ds.session.replyThreadAliases = ds.replyThreadAliases;
+      ds.session.streamCardReplyTargetKey = 'thread:om_old_reply_topic';
       const deps = makeDeps(ds);
       deps.activeSessions.clear();
       deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
@@ -2256,9 +3888,16 @@ describe('handleCommand', () => {
 
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, originalRoot, 'project-a (main)', 'group', 'chat',
+        { source: 'ordinary-feishu' },
       );
       expect(ds.session.scope).toBe('chat');
       expect(ds.session.rootMessageId).toBe(originalRoot);
+      expect(ds.currentReplyTarget).toBeUndefined();
+      expect(ds.replyThreadAliases).toBeUndefined();
+      expect(ds.streamCardReplyTargetKey).toBeUndefined();
+      expect(ds.session.currentReplyTarget).toBeUndefined();
+      expect(ds.session.replyThreadAliases).toBeUndefined();
+      expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
       const persisted = vi.mocked(sessionStore.updateSession).mock.calls.find(
         ([s]) => s.sessionId === 'new-session-123',
       )?.[0];
@@ -2345,8 +3984,69 @@ describe('handleCommand', () => {
       expect(scanMultipleProjects).toHaveBeenCalledWith(
         ['/home/testuser'],
         3,
-        { includeWorktrees: false },
+        expect.objectContaining({
+          includeWorktrees: false,
+          onBudgetExceeded: expect.any(Function),
+        }),
       );
+    });
+
+    // ── Scan-budget prompts (behavioural, not just wiring) ──────────────────
+    // These fire the onBudgetExceeded callback the handler passes in and assert
+    // the USER-VISIBLE consequence. A mutation that keeps the callback wired but
+    // empties its body (`() => {}`) leaves scanBudgetHit false, so both prompts
+    // vanish — and both of these tests must go red. (The `expect.any(Function)`
+    // wiring check above cannot catch that; this is the rev1 false-green lesson.)
+    it('budget hit with zero repos → warns to narrow the root and sends NO card', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      // scan bailed at the budget before finding anything: empty list + callback.
+      vi.mocked(scanMultipleProjects).mockImplementation(((_dirs: any, _depth: any, options: any) => {
+        options?.onBudgetExceeded?.({ reason: 'dirs', dirsVisited: 4000, baseDir: '/home/testuser' });
+        return [];
+      }) as any);
+
+      const ds = makeDaemonSession({ worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      // t() returns the resolved zh string here, so assert on stable fragments
+      // that are UNIQUE to each i18n key (avoids brittle full-text matching).
+      // scan_budget_no_repos: "…已在到达上限后中止，未发现 git 仓库。"
+      // no_git_repos:         "在 {dirs} 下未找到 git 仓库。"
+      const replies = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
+      // Must warn with the budget-specific message (mentions 中止 / 收窄根目录)…
+      expect(replies.some(c => typeof c === 'string' && c.includes('到达上限后中止') && c.includes('未发现 git 仓库'))).toBe(true);
+      // …and must NOT have fallen through to the plain "未找到 git 仓库" empty message.
+      expect(replies.some(c => typeof c === 'string' && c.includes('下未找到 git 仓库'))).toBe(false);
+      // …nor sent an interactive repo-selection card (there are no repos to pick).
+      const sentCard = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls
+        .some(c => c[2] === 'interactive');
+      expect(sentCard).toBe(false);
+    });
+
+    it('budget hit with a partial list → sends the "incomplete" notice BEFORE the card', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      // scan found one repo but tripped the budget: partial list + callback.
+      vi.mocked(scanMultipleProjects).mockImplementation(((_dirs: any, _depth: any, options: any) => {
+        options?.onBudgetExceeded?.({ reason: 'time', dirsVisited: 12, baseDir: '/home/testuser' });
+        return [{ name: 'proj', path: '/home/testuser/proj', branch: 'main' }];
+      }) as any);
+
+      const ds = makeDaemonSession({ worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const calls = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls;
+      // scan_budget_partial is the only message containing "列表可能不完整".
+      const partialIdx = calls.findIndex(c => typeof c[1] === 'string' && (c[1] as string).includes('列表可能不完整'));
+      const cardIdx = calls.findIndex(c => c[2] === 'interactive');
+      // Both must happen…
+      expect(partialIdx).toBeGreaterThanOrEqual(0);
+      expect(cardIdx).toBeGreaterThanOrEqual(0);
+      // …and the "may be incomplete" notice must precede the card.
+      expect(partialIdx).toBeLessThan(cardIdx);
     });
 
     it('should resolve a first-level project name and switch repo (mid-session)', async () => {
@@ -2361,6 +4061,7 @@ describe('handleCommand', () => {
       expect(ds.workingDir).toBe('/home/testuser/payments');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'payments (main)', 'group', undefined,
+        { source: 'ordinary-feishu' },
       );
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       // the pending repo-selection card must be withdrawn after resolving
@@ -2388,6 +4089,67 @@ describe('handleCommand', () => {
       expect(sessionStore.createSession).not.toHaveBeenCalled(); // pending path, not a switch
       expect(ds.pendingRepo).toBe(false);
       expect(ds.session.initialUserTurnPending).toBe(true);
+    });
+
+
+
+    it('`/repo here` starts a pending session in its already-pinned current directory', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        worker: null,
+        workingDir: '/home/testuser/current-chat-repo',
+      });
+      ds.session.workingDir = '/home/testuser/current-chat-repo';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/current-chat-repo');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('current-chat-repo');
+    });
+
+
+
+    it('`/repo here` can inherit a sibling chat-scope session directory for a fresh topic', async () => {
+      vi.mocked(sessionStore.findActiveChatScopeSessionsByChat).mockReturnValueOnce([{
+        sessionId: 'peer-chat-session',
+        chatId: CHAT_ID,
+        rootMessageId: CHAT_ID,
+        title: 'peer',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'app-2',
+        scope: 'chat',
+        chatType: 'group',
+        workingDir: '/home/testuser/current-chat-repo',
+      } as any]);
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/current-chat-repo');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+    });
+
+    it('`/repo here` reports a clear error when no current directory is pinned', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('当前群聊还没有可复用的工作目录');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
     });
 
     it('should reply path_not_found when the arg resolves to nothing', async () => {
@@ -2614,25 +4376,57 @@ describe('handleCommand', () => {
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
-    it('does not consume the pending launch while a card commit owns the shared claim', async () => {
+    it('retains the opening reservation and buffers when forkWorker fails before accept', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
-        pendingRepoCommitInFlight: true,
-        pendingPrompt: 'hello world',
-        pendingTurnId: 'om_pending_turn',
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        pendingFollowUps: ['buffered follow-up'],
       });
       const deps = makeDeps(ds);
+      vi.mocked(forkWorker).mockImplementationOnce(() => {
+        expect(ds.pendingRepo).toBe(true);
+        expect(ds.initialStartPending).toBe(true);
+        expect(ds.pendingPrompt).toBe('first prompt');
+        expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+        throw new Error('fork preaccept failed');
+      });
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
-      expect(forkWorker).not.toHaveBeenCalled();
-      expect(getAvailableBots).not.toHaveBeenCalled();
       expect(ds.pendingRepo).toBe(true);
-      expect(ds.pendingRepoCommitInFlight).toBe(true);
-      expect(ds.pendingPrompt).toBe('hello world');
-      expect(ds.pendingTurnId).toBe('om_pending_turn');
-      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
-      expect(replies).toContain('已有一个 worktree 正在创建');
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.pendingPrompt).toBe('first prompt');
+      expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+      expect(deleteMessage).not.toHaveBeenCalled();
+    });
+
+    it('retries /repo after a synchronous first Riff fork failure stamps the backend', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        worker: null,
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(forkWorker)
+        .mockImplementationOnce(() => {
+          ds.session.backendType = 'riff';
+          ds.initConfig = { backendType: 'riff' } as any;
+          throw new Error('riff child fork failed');
+        })
+        .mockImplementationOnce(() => {});
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.worker).toBeNull();
+      expect(ds.session.backendType).toBe('riff');
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledTimes(2);
+      expect(ds.pendingRepo).toBe(false);
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).not.toContain('/close');
     });
 
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
@@ -2740,6 +4534,13 @@ describe('handleCommand', () => {
         pendingRepo: true,
         pendingPrompt: '帮我看看这个 bug',
         pendingTurnId: 'om_buffered_first',
+        pendingChatContext: {
+          chatId: CHAT_ID,
+          name: '【Pippit】【BUG】测试群',
+          description: 'https://example.test/issue/detail/123',
+          mode: 'group',
+          fetchStatus: 'ok',
+        },
       });
       const deps = makeDeps(ds);
 
@@ -2749,7 +4550,13 @@ describe('handleCommand', () => {
       expect(buildNewTopicCliInput).toHaveBeenCalled();
       expect(ensureSessionWhiteboard).toHaveBeenCalledWith(ds);
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
-      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({
+        whiteboardId: 'wb_test',
+        chatContext: {
+          chatId: CHAT_ID,
+          description: 'https://example.test/issue/detail/123',
+        },
+      });
       expect(forkWorker).toHaveBeenCalledWith(
         ds,
         { content: 'WRAPPED:帮我看看这个 bug' },
@@ -2757,7 +4564,65 @@ describe('handleCommand', () => {
       );
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
+      expect(ds.pendingChatContext).toBeUndefined();
       // The buffered message IS the first real user turn — nothing is pending.
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
+    });
+
+    it('uses the selected CLI snapshot when pendingRepo is submitted with /repo', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '帮我看看这个 bug',
+        session: makeSession({
+          cliId: undefined,
+          cliLaunchSnapshot: {
+            version: 1,
+            state: 'pending',
+            entryId: 'codex',
+            cliId: 'codex',
+            cliRuntime: null,
+            cliPathOverride: null,
+            wrapperCli: null,
+            model: null,
+            reasoningEffort: null,
+            launchShell: null,
+            startupCommands: [],
+          },
+        }),
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
+    });
+
+    it('submits chat context when bare /repo follows an empty group-join prompt', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: 'om_group_join',
+        pendingChatContext: {
+          chatId: CHAT_ID,
+          name: '【Pippit】【BUG】测试群',
+          description: 'https://example.test/issue/detail/123',
+          mode: 'group',
+          fetchStatus: 'ok',
+        },
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(buildNewTopicCliInput).toHaveBeenCalled();
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('');
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({
+        chatContext: { chatId: CHAT_ID },
+      });
+      expect(forkWorker).toHaveBeenCalledWith(
+        ds,
+        { content: 'WRAPPED:' },
+        { turnId: 'om_group_join' },
+      );
       expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
@@ -2793,7 +4658,7 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, {
         content: 'WRAPPED:clean',
         codexAppInput,
-      });
+      }, false);
       expect(ds.pendingSubstituteTrigger).toBeUndefined();
     });
 
@@ -3283,6 +5148,92 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('新话题');
       expect(replyContent).toContain('静默模式');
     });
+
+    it('defaults to group top-level when created from a topic/adopt session (no position modifier)', async () => {
+      // A schedule born inside a topic (including an adopted one) must not pin
+      // its results to that topic. Without an explicit modifier the default is
+      // top-level and the root bookmark is dropped.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      // Default extractScheduleModifiers mock returns no executionPosition.
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-topic-default' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      // Simulate a topic-scope (adopt) session: scope is 'thread'.
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.executionPosition).toBe('top-level');
+      expect(callArgs.scope).toBe('chat');
+      // The adopt topic root must not be retained as a bookmark.
+      expect(callArgs.rootMessageId).toBeUndefined();
+    });
+
+    it('stamps the human creator identity (open_id + tenant-stable union_id)', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-human' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_creator',
+        senderUnionId: 'on_creator',
+        senderType: 'user',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_creator');
+      expect(callArgs.ownerUnionId).toBe('on_creator');
+    });
+
+    it('withholds the union_id when the creating sender is not a human', async () => {
+      // A bot-created task must not be able to run as the bot: without a
+      // union_id the scheduled turn carries no identity at all, so
+      // identity-bound tools fail closed instead of borrowing the bot's access.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-bot' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_bot_sender',
+        senderUnionId: 'on_bot_sender',
+        senderType: 'app',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_bot_sender');
+      expect(callArgs.ownerUnionId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────
@@ -3294,11 +5245,157 @@ describe('handleCommand', () => {
 
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
 
-      // brand 第三参：测试 bot 未配 brand → normalizeBrand → 'feishu'
-      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu');
+      // brand 第三参：测试 bot 未配 brand → normalizeBrand → 'feishu'。
+      // 第五参是发起人 open_id：token 代表一个人而不是一个 bot，不带它的话同一个
+      // bot 里第二个人 /login 会覆盖第一个人，之后所有人都在用最后那个人的权限。
+      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', [], 'ou_sender');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('飞书用户授权');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
+    });
+
+    // 授权提示必须跟真实回调方式一致。没配 oauthRedirectBase 时浏览器会停在
+    // ERR_CONNECTION_REFUSED，用户必须自己粘回地址栏；配了之后 Dashboard 会自动
+    // 完成兑换，这时候还教人「复制地址栏、看 F12」只会把人劝退——而被劝退的人
+    // 恰恰是点了授权链接、却不知道下一步该干什么的那批人。
+    it('tells the manual paste steps when no oauthRedirectBase is configured', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(resolveOAuthRedirectUri).mockReturnValue('http://127.0.0.1:9768/callback');
+
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.login.step2', undefined, 'zh'));
+      expect(replyContent).toContain(t('cmd.login.step3', undefined, 'zh'));
+      expect(replyContent).not.toContain(t('cmd.login.step2_auto', undefined, 'zh'));
+    });
+
+    it('tells the auto-callback steps when oauthRedirectBase is configured', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(resolveOAuthRedirectUri).mockReturnValue('https://botmux.example.com/oauth/callback');
+
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.login.step2_auto', undefined, 'zh'));
+      // 自动回调也留一句「万一没跳转就粘地址栏」的兜底，别让人卡在报错页上。
+      expect(replyContent).toContain(t('cmd.login.step2_auto_fallback', undefined, 'zh'));
+      expect(replyContent).not.toContain(t('cmd.login.step3', undefined, 'zh'));
+    });
+
+    // ByteCloud SSO is a different identity provider from Feishu OAuth, with no
+    // conversion between them, so `/login` and `/login bytedcli` are two
+    // separate authorizations. Split into begin/done because the device-code
+    // flow needs a human to go click something — blocking the session on that
+    // would hold the turn open for as long as they take.
+    // Feishu returns a structured `missing_scopes` array on 99991679, so "ask for
+    // exactly what was refused" needs no guessing — and no giant default set
+    // that makes every person approve permissions they will never use.
+    describe('/login --scope', () => {
+      it('builds an authorization URL carrying the requested scopes', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:write_only'), deps, LARK_APP_ID);
+
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:write_only'], 'ou_sender',
+        );
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('docx:document:write_only');
+      });
+
+      it('accepts several scopes at once', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID,
+          makeLarkMessage('/login --scope docx:document:write_only drive:file:upload'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:write_only', 'drive:file:upload'], 'ou_sender',
+        );
+      });
+
+      // A typo does not degrade — Feishu rejects the whole authorize URL with
+      // 20043 and the person is handed a link that just fails to open, with no
+      // hint which word was wrong. Catch it here where we can name it.
+      it('refuses a scope name that does not exist', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID, makeLarkMessage('/login --scope docx:documnet'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('docx:documnet');
+      });
+
+      // Guards the catalog actually loading: if the JSON failed to bundle,
+      // isKnownLarkUserScope accepts everything and the typo test above would
+      // pass for the wrong reason.
+      it('accepts a scope that really exists', () => {
+        expect(isKnownLarkUserScope('docx:document:readonly')).toBe(true);
+        expect(isKnownLarkUserScope('docx:document')).toBe(false); // only :readonly/:create/:write_only
+      });
+
+      it('explains itself when no scope is given', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
+      });
+    });
+
+    describe('/login bytedcli', () => {
+      it('returns the ByteCloud link and says it is separate from Feishu', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(beginBytedcliLogin).toHaveBeenCalledWith('ou_sender');
+        expect(text).toContain('https://cloud.example.com/auth?state=x');
+        expect(text).toContain('/login bytedcli done');
+        // Without this the person reasonably assumes their Feishu /login covered it.
+        expect(text).toContain('两边都要授权');
+      });
+
+      it('completes the pending challenge on done', async () => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+
+        expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('授权成功');
+      });
+
+      // Not an error: they just have not clicked yet. Reporting a failure would
+      // send them off to start over for no reason.
+      it('says pending, not failed, when the person has not authorized yet', async () => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'pending' });
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain('还没检测到授权完成');
+      });
+
+      it('tells them to start one when done arrives with no challenge', async () => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+
+        expect(completeBytedcliLogin).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login bytedcli');
+      });
+
+      // The challenge is keyed by the person who started it, so one person's
+      // `done` can never complete somebody else's login.
+      it('resumes the challenge belonging to the sender', async () => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+
+        expect(pendingBytedcliChallenge).toHaveBeenCalledWith('ou_sender');
+      });
     });
 
     it('should show token status with "status" subcommand', async () => {
@@ -3316,6 +5413,99 @@ describe('handleCommand', () => {
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
   describe('/adopt', () => {
+    function makeLiveRiffSession(): DaemonSession {
+      return makeDaemonSession({
+        workingDir: '/remote/riff',
+        worker: { killed: false } as any,
+        initConfig: { backendType: 'riff' } as any,
+        session: makeSession({
+          cliId: 'riff',
+          backendType: 'riff',
+          riffParentTaskId: 'task-live',
+          workingDir: '/remote/riff',
+        }),
+      });
+    }
+
+    it('refuses adopt over a live Riff generation before mutating ownership', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+      const target = {
+        source: 'tmux' as const,
+        tmuxTarget: '0:1.0',
+        cliPid: 4242,
+        sessionId: 'host-cli',
+        cliId: 'claude-code' as const,
+        cwd: '/local/adopt',
+        paneCols: 80,
+        paneRows: 24,
+      };
+
+      await startAdoptSession(target, ds, deps, LARK_APP_ID);
+
+      expect(validateAdoptTarget).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses resume import over a live Riff generation before mutating lineage', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+
+      await startResumeImportSession({
+        cliSessionId: 'native-resume-id', cwd: '/local/resume', title: 'Imported task', lastActivityAt: 1,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses a Codex App thread takeover over a live Riff generation', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+
+      await startCodexAppThreadSession({
+        threadId: 'codex-thread-id',
+        name: 'Imported Codex thread',
+        preview: 'preview',
+        cwd: '/local/codex-app',
+      }, ds, deps, LARK_APP_ID);
+
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.session.cliId).toBe('riff');
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
     it('refuses adopt while the session is still on the pendingRepo gate and posts a close-session card', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
@@ -3494,6 +5684,159 @@ describe('handleCommand', () => {
       expect(discoverAdoptableSessions).toHaveBeenCalledWith('claude-code');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('未发现可接入');
+    });
+
+    it('resumes an exact closed Botmux session id instead of treating it as a tmux pane', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const restored = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'ad24e30d-25fa-4450-8e84-9e108cb74c92',
+          status: 'active',
+          cliId: 'claude-code',
+          cliSessionId: 'ad24e30d-25fa-4450-8e84-9e108cb74c92',
+        }),
+      });
+      const closed = {
+        ...restored.session,
+        status: 'closed' as const,
+      };
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt ad24e30d-25fa-4450-8e84-9e108cb74c92'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('会话已恢复');
+      expect(reply).not.toContain('tmux pane');
+    });
+
+    it('resolves a closed Botmux session by its CLI-native id without duplicating ownership', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'botmux-session-id',
+        status: 'closed',
+        cliId: 'codex',
+        cliSessionId: 'native-thread-id',
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.listSessions).mockReturnValueOnce([closed]);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt native-thread-id'), deps, LARK_APP_ID);
+
+      expect(resumeSession).toHaveBeenCalledWith('botmux-session-id', deps.activeSessions);
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('tmux pane');
+    });
+
+    it('does not move a managed session from another topic through /adopt', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'other-topic-session',
+        status: 'closed',
+        rootMessageId: 'om_other_topic',
+        cliSessionId: 'native-other-topic',
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      const deps = makeDeps(scratch);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt other-topic-session'), deps, LARK_APP_ID);
+
+      expect(resumeSession).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('另一个话题');
+      expect(reply).toContain('botmux resume other-topic-session');
+      expect(reply).not.toContain('tmux pane');
+    });
+
+    it('does not resume a materialized scheduled run from the containing chat anchor', async () => {
+      const scratch = makeDaemonSession({
+        scope: 'chat',
+        chatId: CHAT_ID,
+        hasHistory: false,
+        session: makeSession({
+          sessionId: 'scratch-session',
+          scope: 'chat',
+          chatId: CHAT_ID,
+          cliId: undefined,
+        }),
+      });
+      const closed = makeSession({
+        sessionId: 'materialized-schedule-run',
+        status: 'closed',
+        scope: 'chat',
+        chatId: CHAT_ID,
+        rootMessageId: 'om_materialized_root',
+        deferredScheduleRun: {
+          taskId: 'task-1',
+          turnId: 'schedule:task-1:run-1',
+          routingAnchor: 'schedule-run:task-1:run-1',
+          createdAt: '2026-08-27T00:00:00.000Z',
+        },
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt materialized-schedule-run'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('另一个话题');
+    });
+
+    it('says when an exact managed session will resume as a fresh CLI session', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'cursor-without-native-id',
+        status: 'closed',
+        cliId: 'cursor',
+        cliSessionId: undefined,
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt cursor-without-native-id'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('新起干净会话');
+      expect(reply).toContain('旧上下文不会带回');
     });
 
     it('passes the bot current custom Codex executable into live adopt discovery', async () => {
@@ -3685,6 +6028,101 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已继续 Codex App 对话');
       expect(replyContent).toContain('Fix botmux');
+    });
+
+    it('attaches a Codex App bot to an existing App Server thread without changing its default runtime', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              // Existing BotMux Codex App topics keep this default. Only the
+              // explicitly selected /adopt thread switches to the official
+              // `codex --remote` client below.
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: '019e-remote-thread',
+          name: 'Continue GUI thread',
+          preview: 'fallback preview',
+          cwd: '/repo/remote-codex',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex-app' as any,
+          // A temporary topic shell might have frozen an old launcher; the
+          // remote attach must clear it before the new fork.
+          wrapperCli: 'old-wrapper codex',
+          agentFrozen: true,
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt 019e-remote-thread'), deps, CODEX_APP_ID);
+
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      expect(ds.session.cliId).toBe('codex');
+      expect(ds.session.cliSessionId).toBe('019e-remote-thread');
+      expect(ds.session.existingAppServerEndpoint)
+        .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
+      expect(ds.session.wrapperCli).toBeUndefined();
+      expect(ds.session.agentFrozen).toBeUndefined();
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('已共享接入现有 Codex App 对话');
+      expect(replyContent).toContain('不会新建或停止开发机 App Server');
+    });
+
+    it('does not let an existing App Server shared topic adopt a second thread', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-already-attached',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), deps, CODEX_APP_ID);
+
+      expect(listCodexAppThreads).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1])
+        .toContain('本话题已共享接入一条 Codex App 对话');
     });
   });
 
@@ -4133,15 +6571,18 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
 
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      // The card is anchored at the invocation: flat 普通群 (default 'chat'
-      // mode) → quote-reply of the /relay message, NOT reply_in_thread, NOT
-      // sessionReply (which folds into the session's turn topic / top level).
-      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
-      expect(anchorMsgId).toBe('msg_001');
-      expect(inThread).toBe(false);
-      expect(msgType).toBe('interactive');
+      // Default-private picker: flat 普通群 (default 'chat' mode) now sends the
+      // picker as an ephemeral card visible only to the invoker — NOT a visible
+      // reply, NOT sessionReply. (Decoupled from privateCard; see the gate.)
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [ephAppId, ephChatId, ephOpenId, replyContent] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      expect(ephAppId).toBe(LARK_APP_ID);
+      expect(ephChatId).toBe(CHAT_ID);
+      expect(ephOpenId).toBe('ou_sender');
+      expect(vi.mocked(replyMessage)).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
       const card = JSON.parse(replyContent as string);
       const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
@@ -4193,12 +6634,18 @@ describe('handleCommand', () => {
       expect(containerValue?.root_id).toBe('om_topic_root_x');
     });
 
-    it('picker falls back to sessionReply when reply-at-invocation fails', async () => {
+    it('picker falls back to sessionReply when reply-at-invocation fails (thread-scope visible path)', async () => {
+      // Thread-scope pickers stay on the VISIBLE in-thread reply (ephemeral has
+      // no thread anchor). When that replyMessage refuses (e.g. the /relay
+      // message was withdrawn mid-flight), we fall back to sessionReply.
       vi.mocked(replyMessage).mockRejectedValueOnce(new Error('message withdrawn'));
-      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
       const deps = makeDeps(ds);
 
-      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay', {
+        rootId: 'om_topic_root_x',
+        threadId: 'omt_thread_x',
+      }), deps, LARK_APP_ID);
 
       const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(msgType).toBe('interactive');
@@ -4232,10 +6679,12 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), scratchDs);
 
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
-      const card = JSON.parse(replyContent as string);
+      // Default-private picker → ephemeral even when empty.
+      const [, , , cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      const card = JSON.parse(cardJson as string);
       // Scratch must NOT show — picker empty (no interactive_containers).
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
@@ -4258,10 +6707,11 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), adoptDs);
 
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
-      const card = JSON.parse(replyContent as string);
+      const [, , , cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      const card = JSON.parse(cardJson as string);
       // No interactive containers rendered — picker is empty after filtering out the adopt session.
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
@@ -4484,8 +6934,12 @@ describe('handleCommand', () => {
       expect(containerValue?.visibility).toBe('public');
     });
 
-    it('privateCard OFF + flat 普通群: picker stays a visible reply (no ephemeral)', async () => {
-      // Default bot has no privateCard — the gate must not fire.
+    it('privateCard OFF + flat 普通群 (chat-scope): picker STILL defaults to ephemeral (decoupled from privateCard)', async () => {
+      // Default-private picker (孙晓雪 2026-08-16): the /relay picker leaks the
+      // invoker's session list, has zero public benefit (invoker is always the
+      // owner, buttons are owner-only), so it goes ephemeral in a flat 普通群
+      // regardless of the privateCard config. privateCard now gates ONLY
+      // /card & /close, no longer the picker.
       const { sendEphemeralCard } = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
       const otherDs: DaemonSession = {
@@ -4501,11 +6955,17 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
-      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
-      const card = JSON.parse(replyContent as string);
+      // Ephemeral send to the invoker even with privateCard OFF.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      expect(appId).toBe(LARK_APP_ID);
+      expect(chatId).toBe(CHAT_ID);
+      expect(openId).toBe('ou_sender');
+      expect(vi.mocked(replyMessage)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      const card = JSON.parse(cardJson as string);
       const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
-      expect(containerValue?.visibility).toBe('public');
+      expect(containerValue?.visibility).toBe('private');
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
@@ -4580,10 +7040,11 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherUserDs);
 
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
-      const card = JSON.parse(replyContent as string);
+      const [, , , cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      const card = JSON.parse(cardJson as string);
       // No interactive containers — empty picker (otherUser's session filtered out).
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
@@ -5210,6 +7671,7 @@ describe('/card — operator / canOperate gate', () => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCardMode).mockResolvedValue({ ok: true } as any);
+    vi.mocked(setChatStreamingCardPin).mockResolvedValue({ ok: true, changed: true } as any);
   });
 
   it('rejects a non-operator (canOperate=false): operator_only notice, no mode change', async () => {
@@ -5235,6 +7697,222 @@ describe('/card — operator / canOperate gate', () => {
     expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
+  });
+
+  it('Plan B: /card on a VC meeting-agent session gets the ordinary not-ready notice (no special-casing)', async () => {
+    // Under Plan B a meeting agent is an ordinary chat-scope session, so /card
+    // behaves exactly like any other session — postFreshStreamingCard no longer
+    // structurally refuses it, and there is no meeting-receiver-specific reason.
+    // When a post genuinely can't happen yet, the operator sees the same generic
+    // not-ready text as every other session.
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
+    })) as any);
+    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
+    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: true }) });
+    const deps = makeDeps(ds);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('终端尚未就绪');
+    expect(reply).not.toContain('会议接收会话');
+  });
+
+  it('operator: /card pin off updates the per-chat Pin opt-out without touching streamingCardForced or setCardMode', async () => {
+    const ds = makeDaemonSession();
+    ds.streamingCardForced = true;
+    const deps = makeDeps(ds);
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin off', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    expect(setCardMode).not.toHaveBeenCalled();
+    expect(ds.streamingCardForced).toBe(true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('置顶');
+  });
+
+  it('operator: /card pin on works without a live session and does not touch setCardMode', async () => {
+    const deps = makeDeps();
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin on', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    expect(setCardMode).not.toHaveBeenCalled();
+  });
+
+  it('operator: /card pin on under master-off removes the chat override but replies with the master-off hint', async () => {
+    const deps = makeDeps();
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: {
+        larkAppId: id,
+        larkAppSecret: 's',
+        cliId: 'claude-code' as const,
+        pinStreamingCard: false,
+        noPinStreamingCardChats: [CHAT_ID],
+      },
+    })) as any);
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin on', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    expect(setCardMode).not.toHaveBeenCalled();
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('bot 级');
+  });
+
+  it('operator: /card pin status distinguishes master off, chat opt-out, and effective on', async () => {
+    const deps = makeDeps();
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: false },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('bot 级');
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: true, noPinStreamingCardChats: [CHAT_ID] },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('当前群');
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: true },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('已开启');
+  });
+});
+
+describe('/cot — thinking-process message switch (operator / canOperate)', () => {
+  const CHAT_ID = 'oc_chat_1';
+  const botWith = (config: Record<string, unknown>) =>
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, ...config },
+    })) as any);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
+    botWith({ thinkingCard: true });
+  });
+
+  it('rejects a non-operator: operator_only notice, no mode change', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_random', '/cot off', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅授权用户');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot off mutes the chat via setCotMode(off=true)', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot off', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已关闭');
+  });
+
+  it('/cot on restores the chat and confirms when the master switch is on', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
+    botWith({ thinkingCard: false });
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('thinkingCard on');
+  });
+
+  it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
+    botWith({});
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot status reports on / chat-muted / master-off states', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
+
+    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
+
+    botWith({ thinkingCard: false });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot status appends the tool-output line only when thinkingCardToolResult is off', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('工具输出');
+
+    botWith({ thinkingCard: true, thinkingCardToolResult: false });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
+    expect(reply).toContain('开启中');
+    expect(reply).toContain('工具输出：已关闭');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('unknown subcommand shows usage', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot bogus', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('用法');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot show without a live session replies no_active_session', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('没有活跃');
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+  });
+
+  it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
+    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    const ds = makeDaemonSession();
+    ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
+    const deps = makeDeps(ds);
+    // This legacy turn has no persisted reply card; the shared fs mock otherwise reports every path as present.
+    vi.mocked(existsSync).mockReturnValueOnce(false);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({
+      type: 'thinking_update',
+      turnId: 'om_turn9',
+      entries: [{ kind: 'thinking', text: 'so far' }],
+    }));
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('已召唤');
+  });
+
+  it('/cot show while idle: arms the one-shot force for the next turn', async () => {
+    const ds = makeDaemonSession();
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 });
 

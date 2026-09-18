@@ -45,19 +45,10 @@ const SERVER_BOOT_DEADLINE_MS = 5000;
 // agent still re-arms the watcher and we never accumulate an
 // indefinitely-orphaned subprocess on process teardown.
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
-// Herdr 0.7.5 replaced the free-form `agent start --cwd -- <argv...>` command
-// with a managed-agent facade that targets an existing shell pane and launches
-// one of Herdr's known coding-agent kinds. The command itself waits for the TUI
-// to become interactive, so let it use its 30s default plus a small IPC margin.
+// Bound automatic agent detection after explicitly running the launcher in a
+// new pane. Input readiness remains gated by the worker's onAgentStatus hook.
 const PANE_AGENT_START_TIMEOUT_MS = 30_000;
-const PANE_AGENT_EXEC_TIMEOUT_MS = PANE_AGENT_START_TIMEOUT_MS + 5_000;
-// A newly-created workspace can be returned before its login shell reaches an
-// interactive prompt. `agent start` then fails immediately with
-// `agent_pane_busy`; retry only that transient response, bounded independently
-// from the agent's own startup timeout.
-const PANE_SHELL_READY_TIMEOUT_MS = 5_000;
-const PANE_SHELL_READY_POLL_MS = 100;
-const PANE_SHELL_READY_MAX_ATTEMPTS = Math.ceil(PANE_SHELL_READY_TIMEOUT_MS / PANE_SHELL_READY_POLL_MS);
+const PANE_AGENT_DETECTION_POLL_MS = 100;
 // Watch the full useful lifecycle, not just settled statuses. Herdr's
 // `wait agent-status --status X` is level-triggered: when the pane is already
 // in X it succeeds immediately. After one status wins we therefore exclude it
@@ -79,6 +70,7 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   agy: 'agy',
   omp: 'omp',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   copilot: 'copilot',
   kimi: 'kimi',
   'kiro-cli': 'kiro',
@@ -124,12 +116,13 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
  * 0.7.5's actionable `unknown option: --cwd` into the generic
  * "failed to start agent" message. Keep command arguments (which may contain
  * credentials in --env values) out of the exception while preserving the
- * upstream error code/message.
+ * upstream error code/message. `allowEmpty` accepts successful commands such
+ * as `pane run` that do not emit JSON.
  */
 function requiredJsonCommand(
   operation: string,
   args: string[],
-  opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv },
+  opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv; allowEmpty?: boolean },
 ): any {
   let raw = '';
   try {
@@ -147,7 +140,10 @@ function requiredJsonCommand(
     const detail = stderr || stdout;
     throw new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
   }
-  if (!raw) throw new Error(`${operation} failed: empty response`);
+  if (!raw) {
+    if (opts?.allowEmpty) return undefined;
+    throw new Error(`${operation} failed: empty response`);
+  }
   let value: any;
   try {
     value = JSON.parse(raw);
@@ -162,7 +158,7 @@ function requiredJsonCommand(
   return value;
 }
 
-function herdrUsesPaneAgentStart(): boolean {
+function herdrUsesManagedAgentFacade(): boolean {
   try {
     const out = execFileSync('herdr', ['--version'], {
       encoding: 'utf-8',
@@ -200,18 +196,13 @@ function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function canForwardPaneAgentArgs(args: readonly string[]): boolean {
-  return args.every(arg => !/[\x00-\x1f\x7f]/.test(arg));
-}
-
 /** Build a short-lived canonical launcher for Herdr's managed-agent facade.
  *
- * Herdr 0.7.5 rejects control characters in `agent start` arguments, while
- * Botmux intentionally passes multiline system/initial prompts to several
- * CLIs. Put the exact executable + argv in a mode-0700 script and give Herdr
- * no agent arguments. The shell immediately execs the real CLI, so Herdr still
- * observes and validates the actual supported coding-agent process. The script
- * is removed as soon as Herdr reports the TUI interactive.
+ * Run this script by absolute path so interactive shell rc files cannot
+ * shadow it by prepending real CLI directories to PATH. The mode-0700 script
+ * restores the launch PATH and execs the full command, including wrappers and
+ * multiline prompts. It removes itself before exec; the backend also cleans
+ * up when automatic agent detection succeeds or any launch step fails.
  */
 function createPaneAgentLauncher(
   canonicalExecutable: string,
@@ -353,6 +344,7 @@ export class HerdrBackend implements SessionBackend {
   private lastText = '';
   private exited = false;
   private started = false;
+  private actuallyReattached = false;
   private cols = 200;
   private rows = 50;
   private agentProbeFailures = 0;
@@ -370,11 +362,18 @@ export class HerdrBackend implements SessionBackend {
   cliPid?: number;
   cliCwd?: string;
 
+  /** Default managed agent name for a Botmux-launched CLI (the single source of
+   *  truth shared by the constructor default and the selector's agent-precise
+   *  reattach probe). */
+  static defaultAgentName(): string {
+    return 'botmux';
+  }
+
   constructor(
     readonly sessionName: string,
     private readonly opts: HerdrBackendOptions = {},
   ) {
-    this.agentName = opts.agentName ?? 'botmux';
+    this.agentName = opts.agentName ?? HerdrBackend.defaultAgentName();
     if (opts.externalTarget?.paneId) this.paneId = opts.externalTarget.paneId;
   }
 
@@ -490,7 +489,7 @@ export class HerdrBackend implements SessionBackend {
   }
 
   get isReattach(): boolean {
-    return this.opts.isReattach ?? false;
+    return this.actuallyReattached;
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -520,20 +519,39 @@ export class HerdrBackend implements SessionBackend {
 
     const external = this.opts.externalTarget;
     if (external) {
+      this.actuallyReattached = false;
       this.paneId = external.paneId ?? external.target;
     } else {
       // Reuse an existing `botmux` agent ONLY when we're genuinely re-attaching
       // to a still-alive session (daemon restart while the herdr server kept
       // running). On a fresh start — including the resume:true respawn after a
-      // /restart — we must always `agent start` the new CLI. Reusing here is
+      // /restart — we must always launch the new CLI. Reusing here is
       // what made /restart silently no-op: herdr can resurrect a dead `botmux`
       // row from persisted metadata, and reuse would skip `agent start` so the
       // new command never ran. killSession() now deletes that metadata, but we
       // also gate reuse on isReattach so a stale row can never be adopted.
-      const existing = this.isReattach ? this.getAgent() : undefined;
+      const existing = this.opts.isReattach ? this.getAgent() : undefined;
       if (existing) {
+        this.actuallyReattached = true;
         this.paneId = existing.pane_id;
-      } else if (herdrUsesPaneAgentStart()) {
+      } else if (this.opts.isReattach) {
+        // FREEZE the reattach decision (mirrors ZmxBackend: "never turn a stale
+        // reattach into a new CLI after the backing session disappeared"). The
+        // worker predicted reattach from an earlier probe and therefore SKIPPED
+        // the cold-path setup that only runs on !willReattachPersistent — the
+        // PENDING generation proof AND the credential-only Seatbelt/bwrap wrapper.
+        // If the `botmux` agent vanished between that probe and here, silently
+        // launching a fresh CLI would launch it WITHOUT the credential
+        // boundary (unsafe on an enrolled host) and leave the old committed marker
+        // in place to later reattach it as "isolated". Post-spawn teardown can't
+        // undo an already-executed unwrapped CLI, so we must refuse HERE: throw so
+        // the worker's next launch takes the cold path (write PENDING + assemble
+        // the wrapper BEFORE creating the agent).
+        throw new Error(
+          `herdr agent ${this.agentName} in ${this.sessionName} disappeared before reattach; `
+          + `refusing to silently start a fresh (unwrapped) generation`,
+        );
+      } else if (herdrUsesManagedAgentFacade()) {
         this.paneId = this.startPaneAgent(bin, args, opts);
       } else {
         const envArgs = this.opts.ownsSession === false
@@ -563,29 +581,35 @@ export class HerdrBackend implements SessionBackend {
     //   - Re-attach / external adopt: snapshot the current screen so we only
     //     stream new deltas. Worker.ts explicitly seeds the initial screen
     //     via captureCurrentScreen() in those paths.
-    this.lastText = (this.isReattach || this.opts.externalTarget) ? this.readRecentAnsi() : '';
+    this.lastText = (this.actuallyReattached || this.opts.externalTarget) ? this.readRecentAnsi() : '';
     this.startPolling();
     this.startStatusWatcher();
   }
 
-  write(data: string): void {
-    if (this.exited) return;
+  write(data: string): boolean {
+    if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]), { timeout: 5000 });
+    return runHerdr(
+      herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]),
+      { timeout: 5000 },
+    );
   }
 
-  sendText(text: string): void {
-    this.write(text);
+  sendText(text: string): boolean {
+    return this.write(text);
   }
 
-  sendSpecialKeys(...keys: string[]): void {
-    if (this.exited) return;
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]), { timeout: 5000 });
+    return runHerdr(
+      herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]),
+      { timeout: 5000 },
+    );
   }
 
-  pasteText(text: string): void {
-    this.write(text);
+  pasteText(text: string): boolean {
+    return this.write(text);
   }
 
   resize(cols: number, rows: number): void {
@@ -750,27 +774,27 @@ export class HerdrBackend implements SessionBackend {
 
   /** Herdr >=0.7.5 managed-agent launch protocol.
    *
-   * The new facade no longer accepts an arbitrary executable or cwd directly:
-   * create a shell workspace with the requested cwd/env, then ask Herdr to
-   * launch a supported coding-agent kind in that exact root pane. Prepending
-   * an absolute binary's directory to PATH preserves cliPathOverride installs
-   * whose basename is still the canonical Herdr executable (for example a Pi
-   * installed under ~/.local/bin/node/bin/pi).
+   * `agent start --kind` types a bare CLI name into the interactive shell. Its
+   * rc files can reorder PATH and bypass our launcher, losing wrappers and
+   * argv. Execute the launcher explicitly with `pane run`, wait for Herdr to
+   * detect the expected kind, then name and verify that exact pane's agent.
    */
   private startPaneAgent(bin: string, args: string[], opts: SpawnOpts): string {
-    const kind = paneAgentKindForExecutable(bin);
+    // Launch wrappers can replace bin with env, systemd-run, or a sandbox.
+    // Identify the managed kind by the original CLI; the launcher still
+    // executes the complete wrapped command.
+    const cliBin = opts.cliBin ?? bin;
+    const kind = paneAgentKindForExecutable(cliBin);
     if (!kind) {
       throw new Error(
-        `Herdr >=0.7.5 cannot launch executable "${basename(bin)}" as a managed coding agent; ` +
+        `Herdr >=0.7.5 cannot launch executable "${basename(cliBin)}" as a managed coding agent; ` +
         'use a Herdr-supported CLI executable or select the tmux backend',
       );
     }
-
-    const workspaceEnv = environmentForPaneAgent(bin, this.childEnv);
+    const workspaceEnv = environmentForPaneAgent(cliBin, this.childEnv);
     const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
-    const launcher = createPaneAgentLauncher(basename(bin), bin, args, originalPath);
-    workspaceEnv.PATH = [launcher.dir, originalPath].filter(Boolean).join(delimiter);
     let workspaceId: string | undefined;
+    let launcher: ReturnType<typeof createPaneAgentLauncher> | undefined;
     try {
       const created = requiredJsonCommand(
         `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
@@ -789,40 +813,53 @@ export class HerdrBackend implements SessionBackend {
         throw new Error(`herdr workspace create for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
       }
 
-      const startArgs = herdrSessionArgs(this.sessionName, [
-        'agent', 'start', this.agentName,
-        '--kind', kind,
-        '--pane', paneId,
-        '--timeout', String(PANE_AGENT_START_TIMEOUT_MS),
-        // Herdr 0.7.5 on macOS resolves managed kinds through its integration
-        // instead of the workspace PATH, so the canonical launcher may not run.
-        // Forward control-character-free argv as well (Pi's @prompt-file path
-        // is safe) to preserve session identity and initial-message delivery.
-        // Multiline argv still stays exclusively in the launcher because Herdr
-        // rejects control characters with invalid_agent_argument.
-        ...(canForwardPaneAgentArgs(args) ? ['--', ...args] : []),
-      ]);
-      const readyDeadline = Date.now() + PANE_SHELL_READY_TIMEOUT_MS;
-      let started: any;
-      for (let attempt = 1; ; attempt++) {
-        try {
-          started = requiredJsonCommand(
-            `herdr agent start ${this.agentName} in ${this.sessionName}`,
-            startArgs,
-            { timeout: PANE_AGENT_EXEC_TIMEOUT_MS, env: this.childEnv },
-          );
+      launcher = createPaneAgentLauncher(basename(cliBin), bin, args, originalPath);
+      requiredJsonCommand(
+        `herdr pane run ${paneId} in ${this.sessionName}`,
+        // One quoted COMMAND argument reaches the shell verbatim, even while
+        // it is loading rc files. Never pass the CLI's argv through Herdr.
+        herdrSessionArgs(this.sessionName, ['pane', 'run', paneId, shellSingleQuote(launcher.path)]),
+        { timeout: 5000, env: this.childEnv, allowEmpty: true },
+      );
+
+      const detectionDeadline = Date.now() + PANE_AGENT_START_TIMEOUT_MS;
+      let detected = false;
+      while (Date.now() < detectionDeadline) {
+        const listed = requiredJsonCommand(
+          `herdr agent list in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, ['agent', 'list']),
+          { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
+        );
+        const agent = extractAgents(listed).find(row => row?.pane_id === paneId && !agentRowExited(row));
+        if (agent?.agent === kind) {
+          detected = true;
           break;
-        } catch (err) {
-          const paneBusy = err instanceof Error && err.message.includes('agent_pane_busy');
-          if (!paneBusy || attempt >= PANE_SHELL_READY_MAX_ATTEMPTS || Date.now() >= readyDeadline) throw err;
-          sleepSync(PANE_SHELL_READY_POLL_MS);
         }
+        if (typeof agent?.agent === 'string' && agent.agent) {
+          throw new Error(`Herdr detected "${agent.agent}" instead of "${kind}" in pane ${paneId}`);
+        }
+        sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
       }
-      const agent = extractAgent(started);
-      if (!agent?.pane_id) {
-        throw new Error(`herdr agent start ${this.agentName} in ${this.sessionName} failed: missing agent pane`);
+      if (!detected) {
+        throw new Error(`Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`);
       }
-      return agent.pane_id;
+
+      requiredJsonCommand(
+        `herdr agent rename ${paneId} to ${this.agentName} in ${this.sessionName}`,
+        herdrSessionArgs(this.sessionName, ['agent', 'rename', paneId, this.agentName]),
+        { timeout: 5000, env: this.childEnv },
+      );
+      const named = requiredJsonCommand(
+        `herdr agent get ${this.agentName} in ${this.sessionName}`,
+        herdrSessionArgs(this.sessionName, ['agent', 'get', this.agentName]),
+        { timeout: 5000, env: this.childEnv },
+      );
+      if (extractAgent(named)?.pane_id !== paneId) {
+        throw new Error(`Herdr agent "${this.agentName}" in ${this.sessionName} did not resolve to pane ${paneId} after rename`);
+      }
+      // Recognition can precede interactive readiness. The worker retains its
+      // first-prompt gate until onAgentStatus/normal prompt detection releases it.
+      return paneId;
     } catch (err) {
       // Workspace creation succeeded but the CLI did not. Remove only the
       // workspace created by this attempt so a shared user session is never
@@ -835,7 +872,7 @@ export class HerdrBackend implements SessionBackend {
       }
       throw err;
     } finally {
-      rmSync(launcher.dir, { recursive: true, force: true });
+      if (launcher) rmSync(launcher.dir, { recursive: true, force: true });
     }
   }
 

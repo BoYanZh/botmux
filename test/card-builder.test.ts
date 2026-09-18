@@ -14,6 +14,7 @@ import {
   buildSessionCard,
   buildStreamingCard,
   buildRepoSelectCard,
+  REPO_SELECT_CARD_MAX_BYTES,
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
@@ -21,6 +22,8 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildConfigQuotaCard,
+  buildForkPanelCard,
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
@@ -91,6 +94,12 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
       .filter((e: any) => e.tag === 'interactive_container')
       .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
 
+  it('uses Card JSON 2.0 fill width instead of the legacy wide-screen field', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en'));
+    expect(card.schema).toBe('2.0');
+    expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+  });
+
   it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
@@ -108,9 +117,10 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
+    expect(texts[0]).not.toContain('Session ID:');
   });
 
-  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+  it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],
       'om_root',
@@ -119,10 +129,23 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
-    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('distinguishes otherwise identical history candidates without showing their session ids', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', [
+      { cliSessionId: 'hidden-one', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+      { cliSessionId: 'hidden-two', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+    ]));
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain('Candidate: #1');
+    expect(texts[1]).toContain('Candidate: #2');
+    expect(JSON.stringify(texts)).not.toContain('hidden-one');
+    expect(JSON.stringify(texts)).not.toContain('hidden-two');
   });
 
   it('uses a configured runtime name for both live and resume rows', () => {
@@ -365,8 +388,7 @@ describe('buildSlashListCard', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders card-behaviour toggles', () => {
-    const card = parse(buildConfigCard({
+  const configData = (quota: number | null) => ({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
       cliId: 'codex',
@@ -381,7 +403,7 @@ describe('buildConfigCard', () => {
       customPassthroughCommands: null,
       startupCommands: null,
       teamRole: null,
-      quota: null,
+      quota,
       admins: 1,
       booleans: [
         { key: 'disableStreamingCard', on: false },
@@ -392,8 +414,12 @@ describe('buildConfigCard', () => {
         { key: 'autoStartOnNewTopic', on: false },
         { key: 'disableCliBypass', on: false },
         { key: 'restrictGrantCommands', on: false },
+        { key: 'p2pOpen', on: true },
       ],
-    }, 'en'));
+    });
+
+  it('renders card-behaviour toggles', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
 
     const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
     expect(toggle).toBeTruthy();
@@ -408,6 +434,127 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+
+  it('renders the p2pOpen quick-toggle in the security section (zh + en)', () => {
+    const en = parse(buildConfigCard(configData(null), 'en'));
+    const toggle = allActions(en).find((a: any) => a.value?.field === 'p2pOpen');
+    expect(toggle).toBeTruthy();
+    expect(toggle.value.action).toBe('config_toggle');
+    // Fixture has it on → primary + 🟢, same convention as its neighbours.
+    expect(toggle.type).toBe('primary');
+    expect(toggle.text.content).toBe('🟢 Open DMs');
+
+    const zh = parse(buildConfigCard(configData(null), 'zh'));
+    expect(allActions(zh).find((a: any) => a.value?.field === 'p2pOpen').text.content).toBe('🟢 私聊全开');
+
+    // It rides the existing 安全/授权 group — three buttons, no new action row.
+    const securityRow = en.elements
+      .filter((e: any) => e.tag === 'action')
+      .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'p2pOpen'));
+    expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
+      .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen']);
+  });
+
+  it('shows the p2pOpen toggle as off when the bot has not opted in', () => {
+    const data = configData(null);
+    data.booleans = data.booleans.map(b => (b.key === 'p2pOpen' ? { key: 'p2pOpen', on: false } : b));
+    const toggle = allActions(parse(buildConfigCard(data, 'en'))).find((a: any) => a.value?.field === 'p2pOpen');
+    expect(toggle.type).toBe('default');
+    expect(toggle.text.content).toBe('⚪ Open DMs');
+  });
+
+  it('describes the built-in grant-card and Oncall quota defaults', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
+    const quotaEdit = allActions(card).find((a: any) => a.value?.action === 'config_quota_open');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(quotaEdit.text.content).toBe('Set message quota');
+    expect(text).toContain('Default: grant card 3 / Oncall unmetered');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it.each([3, 12, 1000])('shows the arbitrary current quota %i without a fixed-options select', current => {
+    const card = parse(buildConfigCard(configData(current), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain(`${current} messages per person on grant cards (Oncall unmetered)`);
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('explains a legacy quota above the supported range without placing it in a select', () => {
+    const card = parse(buildConfigCard(configData(5000), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('renders a free-input quota card for the 1–1000 range', () => {
+    const card = parse(buildConfigQuotaCard(configData(12), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const save = form.elements.find((element: any) => element.value?.action === 'config_quota_save');
+
+    expect(input).toMatchObject({ name: 'messageQuota', default_value: '12' });
+    expect(input.placeholder.content).toContain('1–1000');
+    expect(save.action_type).toBe('form_submit');
+  });
+
+  it('leaves the legacy quota input blank while retaining the compatibility explanation', () => {
+    const card = parse(buildConfigQuotaCard(configData(5000), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(input.default_value).toBe('');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
+  });
+});
+
+describe('buildForkPanelCard', () => {
+  it('renders an actionable row for each child and normalizes multiline tasks', () => {
+    const card = parse(buildForkPanelCard([
+      { instruction: 'investigate\ncleanup', status: 'active', link: 'https://example.test/thread/1' },
+      { instruction: 'ship fix', status: 'closed', link: 'https://example.test/thread/2' },
+    ], 'en'));
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+
+    expect(table.rows).toEqual([
+      {
+        instruction: 'investigate cleanup',
+        status: '🟢 running',
+        link: '[open](https://example.test/thread/1)',
+      },
+      {
+        instruction: 'ship fix',
+        status: '⚪ closed',
+        link: '[open](https://example.test/thread/2)',
+      },
+    ]);
+  });
+
+  it('renders an explicit empty state for /forklist', () => {
+    const card = parse(buildForkPanelCard([], 'en'));
+
+    expect(card.body.elements).toEqual([
+      {
+        tag: 'markdown',
+        content: 'This session has no forked tasks yet. Use `/fork <task>` to create one.',
+      },
+    ]);
   });
 });
 
@@ -436,10 +583,15 @@ describe('buildSessionCard', () => {
     expect(card.header.title.content).toContain(TITLE);
   });
 
-  it('should escape markdown special characters in title', () => {
-    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* and [link]'));
-    expect(card.header.title.content).toContain('\\*bold\\*');
-    expect(card.header.title.content).toContain('\\[link\\]');
+  it('renders a plain_text title literally (no markdown backslashes) and strips <at> tags', () => {
+    // plain_text header is not markdown: markdown specials pass through as-is,
+    // and mention markup is stripped so no raw <at id=...></at> can leak.
+    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* <at id=ou_x></at> [link]'));
+    expect(card.header.title.content).toContain('*bold*');
+    expect(card.header.title.content).toContain('[link]');
+    expect(card.header.title.content).not.toContain('\\');
+    expect(card.header.title.content).not.toContain('<at');
+    expect(card.header.title.content).not.toContain('ou_x');
   });
 
   it('should default to "Claude" display name when cliId is omitted', () => {
@@ -631,6 +783,14 @@ describe('buildSessionCard', () => {
       expect(restartBtn.value.session_id).toBe(SID);
     });
 
+    it('should omit restart for Riff management cards', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'riff', true));
+      const actions = findActions(card);
+
+      expect(actions.find((a: any) => a.value?.action === 'restart')).toBeUndefined();
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'close']);
+    });
+
     it('should NOT include "get write link" button', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
@@ -752,16 +912,133 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
+    it('shows a red, neutral no-progress label for stalled turns', () => {
+      const zh = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'stalled'));
+      expect(zh.header.template).toBe('red');
+      expect(zh.header.title.content).toContain('长时间无进展');
+
+      const en = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'stalled', undefined, 'hidden',
+        undefined, undefined, false, false, 'en',
+      ));
+      expect(en.header.template).toBe('red');
+      expect(en.header.title.content).toContain('No recent progress');
+    });
+
     it('should show green template and "等待输入" for idle status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       expect(card.header.template).toBe('green');
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('should include escaped title in header', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
-      expect(card.header.title.content).toContain('Fix \\*bug\\*');
+    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).not.toContain('等待输入');
+    });
+
+    it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.title.content).toContain('工作中');
+    });
+
+    it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+          model: 'GPT-5.6-Sol',
+          reasoningEffort: 'xhigh',
+        },
+      ));
+      // Single markdown element: metrics · runtime, one continuous text run.
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('GPT-5.6-Sol'),
+      );
+      expect(line).toBeTruthy();
+      expect(line.text_size).toBe('notation_small_v2');
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K · **GPT-5.6-Sol**');
+      expect(line.content).toContain('xhigh');
+      // metrics and runtime joined by ' · ' in reading order
+      expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
+      expect(card.elements.some((element: any) => element.tag === 'column_set'
+        && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it('renders metrics alone (no trailing runtime) when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } },
+      ));
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(line.content).not.toContain('·  ·');
+    });
+
+    it('keeps a plain full-width usage markdown when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+        },
+      ));
+      const usage = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(usage.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(usage.text_size).toBe('notation_small_v2');
+    });
+
+    it('renders a plain_text title without markdown backslashes and strips <at> mention leaks', () => {
+      // plain_text header: NOT markdown, so no backslash-escaping (that leaked as
+      // visible '\\<at' before). A title seeded from a message with an @mention
+      // must not surface the raw <at id=...></at> tag.
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, 'Fix bug <at id=ou_abc123></at> now', '', 'idle',
+      ));
+      expect(card.header.title.content).toContain('Fix bug');
+      expect(card.header.title.content).toContain('now');
+      expect(card.header.title.content).not.toContain('<at');
+      expect(card.header.title.content).not.toContain('</at>');
+      expect(card.header.title.content).not.toContain('ou_abc123');
+      expect(card.header.title.content).not.toContain('\\');
       expect(card.header.title.content).toContain('等待输入');
+    });
+
+    // ── Read-only service-tier badge (19th positional arg) ─────────────────
+    it('omits the tier badge by default', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', 'codex'));
+      expect(card.header.title.content).not.toContain('⚡');
+    });
+
+    it('renders the actual tier id after the CLI name (not a hardcoded "Fast")', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'codex',
+        'hidden', undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, // 17th arg: usage snapshot
+        undefined, // 18th arg: runtimeDisplayName
+        '⚡ priority', // 19th arg: serviceTierBadge
+      ));
+      expect(card.header.title.content).toContain('⚡ priority');
+      // Badge sits between the CLI name and the ` · title` separator.
+      expect(card.header.title.content).toMatch(/Codex ⚡ priority · /);
+      expect(card.header.title.content).not.toContain('Fast');
     });
 
     it('should show red usage-limit status with retry time', () => {
@@ -1025,17 +1302,58 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('hides selected streaming-card controls without affecting the others', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['terminal', 'writeLink', 'close'],
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+    });
+
+    it('treats output as one control group and omits empty action containers', () => {
+      const screenshot = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'screenshot',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output'],
+      ));
+      const screenshotActions = findActions(screenshot);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+
+      const allHidden = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
+      ));
+      expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
+    });
+
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
+      // （没有 turn 在跑），handler 侧只要求 worker 活着。
+      expect(actions.map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
     });
@@ -1047,6 +1365,55 @@ describe('buildStreamingCard', () => {
 
       expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
       expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+    });
+  });
+
+  // ── Writable terminal link (writableTerminalLinkInCard opt-in) ──────────
+
+  describe('writable terminal link', () => {
+    const WURL = 'https://example.com/writable?token=secret';
+
+    const buildWithWritable = (locale: 'zh' | 'en' = 'zh') => parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+      undefined, undefined, false, false, locale, undefined, WURL,
+    ));
+
+    const allActionButtons = (card: any): any[] =>
+      card.elements.filter((e: any) => e.tag === 'action').flatMap((row: any) => row.actions);
+
+    it('renders the writable URL as a primary URL button instead of a raw markdown link', () => {
+      const card = buildWithWritable();
+      // No markdown element carries the token URL (the previous shape rendered
+      // the long URL as a raw markdown link blob).
+      const mdLinks = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(mdLinks.every((m: any) => !m.content.includes('?token='))).toBe(true);
+
+      const writableBtn = allActionButtons(card).find((a: any) => a.multi_url?.url.includes('?token='));
+      expect(writableBtn).toBeDefined();
+      expect(writableBtn.type).toBe('primary');
+      expect(writableBtn.text.content).toContain('可操作');
+      expectDirectUrl(writableBtn.multi_url.url, WURL);
+      expectDirectUrl(writableBtn.multi_url.pc_url, WURL);
+      expect(writableBtn.multi_url.android_url).toBe(WURL);
+      expect(writableBtn.multi_url.ios_url).toBe(WURL);
+    });
+
+    it('keeps the group-visible warning as a note under the button (zh + en)', () => {
+      const zh = buildWithWritable('zh');
+      const zhNote = zh.elements.find((e: any) => e.tag === 'note');
+      expect(zhNote).toBeDefined();
+      expect(JSON.stringify(zhNote)).toContain('群内可见');
+
+      const en = buildWithWritable('en');
+      const enNote = en.elements.find((e: any) => e.tag === 'note');
+      expect(enNote).toBeDefined();
+      expect(JSON.stringify(enNote)).toContain('visible to everyone');
+    });
+
+    it('omits the writable button and warning when no writable URL is set', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
+      expect(allActionButtons(card).some((a: any) => a.multi_url?.url.includes('?token='))).toBe(false);
+      expect(card.elements.some((e: any) => e.tag === 'note')).toBe(false);
     });
   });
 
@@ -1386,6 +1753,99 @@ describe('buildRepoSelectCard', () => {
       expect(selectStatic.options).toHaveLength(0);
     });
   });
+
+  // ── Byte budget ────────────────────────────────────────────────────────
+
+  describe('byte budget', () => {
+    // A broad scan root (observed live: 1174 projects) serialized past Feishu's
+    // ~109 KB card limit, the send threw 230025, and the session was left
+    // waiting on a card that was never published.
+    function manyProjects(n: number): ProjectInfo[] {
+      const out: ProjectInfo[] = [];
+      for (let i = 0; i < n; i++) {
+        // Repos first, then worktrees — the scanner's own compareProjects order.
+        const isRepo = i < 40;
+        out.push({
+          name: `project-with-a-fairly-long-name-${i}`,
+          path: `/root/iserver/some/deep/path/project-with-a-fairly-long-name-${i}`,
+          type: isRepo ? 'repo' : 'worktree',
+          branch: isRepo ? 'main' : `botmux-wt-feature-branch-${i}`,
+        });
+      }
+      return out;
+    }
+
+    function switchOptions(card: any): any[] {
+      const actionEl = card.elements.find((e: any) => e.tag === 'action');
+      return actionEl.actions.find((a: any) => a.tag === 'select_static').options;
+    }
+
+    function noteContents(card: any): string[] {
+      return card.elements.filter((e: any) => e.tag === 'note').map((e: any) => e.elements[0].content);
+    }
+
+    it('keeps an oversized scan under the byte budget', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root');
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('stays under budget in multi-picker mode too', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'zh', true);
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('truncates the tail rather than the head, so 1-based numbering still matches lastRepoScan', () => {
+      const all = manyProjects(3000);
+      const options = switchOptions(parse(buildRepoSelectCard(all, '/root/iserver', 'om_root')));
+      expect(options.length).toBeGreaterThan(0);
+      expect(options.length).toBeLessThan(all.length);
+      // Every visible option keeps its index in the FULL list: `/repo <N>`
+      // indexes lastRepoScan, which the caller stores unsliced.
+      options.forEach((opt: any, i: number) => {
+        expect(opt.text.content).toMatch(new RegExp(`^${i + 1}\\.`));
+        expect(opt.value).toBe(all[i].path);
+      });
+    });
+
+    it('drops worktrees before repos (scanner sorts repos first)', () => {
+      const options = switchOptions(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const repoLabels = options.filter((o: any) => !o.text.content.includes('[worktree]'));
+      expect(repoLabels).toHaveLength(40);
+    });
+
+    it('adds a truncation note naming shown/total and the /repo escape hatch', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const hint = notes.find(n => n.includes('仅显示前'));
+      expect(hint).toBeDefined();
+      expect(hint).toContain('共 3000 个');
+      expect(hint).toContain('/repo <路径|项目名>');
+      // The ordinary usage note survives alongside it.
+      expect(notes.some(n => n.includes('/repo <编号>'))).toBe(true);
+    });
+
+    it('localizes the truncation note', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'en')));
+      expect(notes.some(n => n.includes('lists only the first') && n.includes('of 3000'))).toBe(true);
+    });
+
+    it('leaves a normally-sized scan untouched: every project shown, no truncation note', () => {
+      const few = manyProjects(30);
+      const card = parse(buildRepoSelectCard(few, '/root/iserver', 'om_root'));
+      expect(switchOptions(card)).toHaveLength(30);
+      expect(noteContents(card).some(n => n.includes('仅显示前'))).toBe(false);
+    });
+
+    it('still shows one option when even a single project would exceed the budget', () => {
+      const huge: ProjectInfo[] = Array.from({ length: 3 }, (_, i) => ({
+        name: 'x'.repeat(REPO_SELECT_CARD_MAX_BYTES),
+        path: `/p/${i}`,
+        type: 'repo',
+        branch: 'main',
+      }));
+      const options = switchOptions(parse(buildRepoSelectCard(huge, '/root/iserver', 'om_root')));
+      expect(options).toHaveLength(1);
+    });
+  });
 });
 
 // ─── buildSessionClosedCard ─────────────────────────────────────────────────
@@ -1426,6 +1886,34 @@ describe('buildSessionClosedCard', () => {
     const md = findMarkdownContent(card);
     expect(md).toContain('不支持');
     expect(md).not.toMatch(/```/);
+  });
+
+  it('warns that resume starts a FRESH session when resumeStartsFresh is set', () => {
+    // Copilot/Kimi without a persisted cliSessionId: resuming reactivates the
+    // topic route, but the next spawn starts a fresh session — the card must
+    // not imply history is restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-fresh', 'om_root', 'topic', 'copilot', undefined, null, 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('新起干净会话');
+    expect(md).toContain('重新激活');
+    // The generic "可在飞书内 resume" line must NOT appear — it implies the
+    // CLI history comes back.
+    expect(md).not.toContain('可在飞书内 resume');
+    expect(md).not.toMatch(/```/);
+  });
+
+  it('does not show the fresh-session warning when a precise resume command exists', () => {
+    // resumeStartsFresh is only meaningful in the no-command branch; with a
+    // precise command the history really will be restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-cmd', 'om_root', 'topic', 'cursor', undefined,
+      'cursor-agent --resume chat-1', 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain('新起干净会话');
   });
 
   it('emits a Resume button targeting the closed sessionId', () => {
@@ -1880,4 +2368,34 @@ describe('buildPrivateSnapshotCard', () => {
     const note = card.elements.find((e: any) => e.tag === 'note');
     expect(JSON.stringify(note)).toContain('🔒');
   });
+});
+
+describe('remote backends get no PTY quick-action keys', () => {
+  /** The 11 quick-action buttons only make sense with a local terminal. */
+  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+
+  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
+    const card = buildStreamingCard(
+      'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
+      cliId as never,
+      'screenshot' as never,
+    );
+    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+  }
+
+  it('renders them for a local CLI', () => {
+    // Guards the negative assertions below: if the buttons stopped being rendered
+    // at all, those would pass for the wrong reason.
+    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  });
+
+  for (const cliId of ['riff', 'mojo'] as const) {
+    it(`hides them for ${cliId}`, () => {
+      // A remote backend has no terminal to drive, so these clicks are silently
+      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
+      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
+      // the next remote CLI cannot regress this the same way.
+      expect(keysIn(cliId)).toEqual([]);
+    });
+  }
 });

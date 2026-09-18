@@ -1,20 +1,30 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
+import { traeHistoryPath } from '../../services/traex-paths.js';
+import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
 import { TRAE_MIGRATION_DONE_MARKERS } from './traex.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-/** Global submit log — CoCo appends one JSON line here on every successful
- *  user submit across all sessions (mode:"user"). Format observed:
- *  `{"content":"...","mode":"user","timestamp":"..."}`. Used the same way
- *  the Codex adapter uses ~/.codex/history.jsonl: write → poll for our
- *  marker → retry Enter if missing → return {submitted:false, recheck}
- *  on final failure so worker can surface a Lark warning. */
-const HISTORY_PATH = join(cocoCacheRoot(), 'history.jsonl');
+/** Legacy global submit log — CoCo / traecli <0.201.5 appends one JSON line
+ *  here on every successful user submit across all sessions (mode:"user").
+ *  Format observed: `{"content":"...","mode":"user","timestamp":"..."}`.
+ *  Still polled for old traecli builds that keep writing here.
+ *
+ *  traecli 0.201.5+ moved the submit log to `$TRAE_HOME/cli/history.jsonl`
+ *  (see traeHistoryPath) in the Codex-shaped `{session_id, ts, text}` format —
+ *  the same file the traex adapter polls. Coco runs the SAME traecli binary,
+ *  so writeInput polls BOTH paths and confirms on whichever records our
+ *  submit; neither path is computed at module load (TRAE_HOME may be set
+ *  after process start). */
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
@@ -92,12 +102,10 @@ function historyDeltaContains(path: string, fromByte: number, prefix: string): b
   return false;
 }
 
-async function waitForHistoryAppend(
-  path: string, fromByte: number, prefix: string, timeoutMs: number,
-): Promise<boolean> {
+async function waitForConfirm(confirm: () => boolean, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
-    if (historyDeltaContains(path, fromByte, prefix)) return true;
+    if (confirm()) return true;
     await delay(100);
   }
   return false;
@@ -134,7 +142,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
@@ -142,6 +150,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       if (!disableCliBypass) args.push('--yolo');
+      // CoCo on traecli shares the low-quota picker; use its long config flag.
+      if (hideRateLimitModelNudge) args.push('--config', 'notice.hide_rate_limit_model_nudge=true');
       if (model && model.trim()) {
         // CoCo expects nested key path for model override. `model=...` exits 1,
         // while `model.name=...` starts correctly.
@@ -186,11 +196,6 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // send-keys-typing path because Claude Code can toggle bracketed paste
       // OFF after slash commands; CoCo on a fresh-spawn message doesn't have
       // that concern.
-      //
-      // Verification (unchanged): poll CoCo's platform-specific history.jsonl for the
-      // user-submit line whose decoded `content` starts with our prefix.
-      // Retry Enter up to 3 times, then return {submitted:false, recheck}
-      // for the worker's deferred recheck + Lark warning path.
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
 
@@ -206,8 +211,28 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      const baseByte = currentFileSize(HISTORY_PATH);
+      // Verification: poll BOTH submit logs for our marker and confirm on
+      // whichever records it. The legacy ~/.cache/coco/history.jsonl uses
+      // mode+content PREFIX matching (historyDeltaContains); the new
+      // $TRAE_HOME/cli/history.jsonl uses Codex-shaped {session_id,ts,text}
+      // EXACT matching (traexHistoryMatchDelta, shared with the traex adapter).
+      // Paths are resolved per submit so a TRAE_HOME set after process start
+      // is honored. Retry Enter up to 3 times, then return
+      // {submitted:false, recheck} for the worker's deferred recheck + Lark
+      // warning path.
+      const legacyHistoryPath = join(cocoCacheRoot(), 'history.jsonl');
+      const traeHistory = traeHistoryPath();
+      const baseByteLegacy = currentFileSize(legacyHistoryPath);
+      const baseByteTrae = currentFileSize(traeHistory);
       const prefix = submitPrefix(content);
+
+      // Submit confirmation is ownership-INDEPENDENT: any full-content match
+      // in either global submit log proves the Enter committed (mirrors the
+      // traex adapter's anyMatch rationale — a foreign-first line or absent
+      // pid must never suppress the confirmation).
+      const submitConfirmed = (): boolean =>
+        historyDeltaContains(legacyHistoryPath, baseByteLegacy, prefix)
+        || traexHistoryMatchDelta(traeHistory, baseByteTrae, content).found;
 
       try {
         if (pty.pasteText) {
@@ -228,39 +253,39 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       await delay(submitDelay);
       if (!trySendEnter()) return { submitted: false };
 
-      // Fresh-install short-wait: when history.jsonl is absent at submit
-      // time, give CoCo up to 1.2s to create it. If our marker shows up →
-      // success. If the file is still absent → trust the Enter and return
+      // Fresh-install short-wait: when BOTH submit logs are absent at submit
+      // time, give CoCo up to 1.2s to create one. If our marker shows up →
+      // success. If both files are still absent → trust the Enter and return
       // (this is the genuine "first run / coco doesn't write history"
-      // case). If the file appeared but our marker isn't there → fall
+      // case). If a file appeared but our marker isn't there → fall
       // through to the normal retry/failure loop — better to warn than to
       // silently mask a real submit failure on a new install.
-      if (!existsSync(HISTORY_PATH) && baseByte === 0) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200)) {
+      if (!existsSync(legacyHistoryPath) && !existsSync(traeHistory)) {
+        if (await waitForConfirm(submitConfirmed, 1200)) {
+          return { submitted: true };
+        }
+        if (!existsSync(legacyHistoryPath) && !existsSync(traeHistory)) {
           return undefined;
         }
-        if (!existsSync(HISTORY_PATH)) {
-          return undefined;
-        }
-        // File appeared during the wait but our marker isn't in it — fall
-        // through to the retry loop. baseByte stays 0 so the loop scans
-        // the whole file.
+        // A file appeared during the wait but our marker isn't in it — fall
+        // through to the retry loop. The baselines stay 0 for the file that
+        // was absent, so the loop scans its whole content.
       }
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-          return undefined;
+        if (await waitForConfirm(submitConfirmed, 800)) {
+          return { submitted: true };
         }
         if (!trySendEnter()) return { submitted: false };
       }
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-        return undefined;
+      if (await waitForConfirm(submitConfirmed, 800)) {
+        return { submitted: true };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a slow
       // CoCo (cold start, large initial prompt, heavy hooks) may still
       // append our marker after retries gave up. Worker re-scans after a
       // delay before deciding whether to warn the user.
-      const recheck = (): boolean => historyDeltaContains(HISTORY_PATH, baseByte, prefix);
+      const recheck = (): boolean => submitConfirmed();
       return { submitted: false, recheck };
     },
 
@@ -296,12 +321,30 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     ensureAskHook() { installCocoAskPlugin(this.resolvedBin); },
     // CoCo/Trae CLI reads the same skill root as the Trae-flavoured adapter.
     skillsDir: '~/.trae/skills',
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'Doubao-Seed-Code',
-      'Gemini-3.1-Pro-Preview',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['coco'],
+    // Live 模型枚举：coco 与 traex 共用同一 traecli 二进制（见 coco.ts 顶部
+    // 说明），`coco debug models` 输出与 `traex debug models` 同构的 JSON 目录，
+    // 复用共享解析。整包可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。
+    // 仅 dashboard 在用户选中 coco 时按需调用，不在 daemon/worker 启动路径上；
+    // 任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，picker
+    // 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

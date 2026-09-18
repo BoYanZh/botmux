@@ -2,10 +2,10 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
+import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { emitHookEvent } from '../../services/hook-runner.js';
+import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
@@ -15,6 +15,8 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { executeWithLarkGate } from './api-gate.js';
+import type { ChatContext } from '../../types.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -141,6 +143,39 @@ export function __testOnly_resetAllBotClients(): void {
   allBotClientsFingerprint = null;
 }
 
+/**
+ * Find the first locally-configured (non-apiOnly) bot that is a member of
+ * `chatId`, using the QUIET probe clients (probeLarkLogger) — so misses for
+ * bots not in the chat don't splash AxiosError blobs to stdout/logs the way a
+ * plain getBotClient()+isInChat loop does.
+ *
+ * Used by `bots invite`'s auto-add flow to pick a proxy bot already in the
+ * target group (Feishu requires the adding app to be a member). Returns the
+ * matching bot's appId+cliId, or null if none of our bots are in that chat.
+ * `preferAppId` (e.g. the current session bot) is checked first.
+ */
+export async function findLocalBotInChat(
+  chatId: string,
+  preferAppId?: string,
+): Promise<{ larkAppId: string; cliId: string } | null> {
+  const clients = getAllBotClients();
+  const ordered = [
+    ...clients.filter((c) => c.appId === preferAppId),
+    ...clients.filter((c) => c.appId !== preferAppId),
+  ];
+  for (const { appId, cliId, client } of ordered) {
+    try {
+      const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+      if ((res.code === 0 || res.code === undefined) && res.data?.is_in_chat) {
+        return { larkAppId: appId, cliId };
+      }
+    } catch {
+      /* probe miss (other-tenant / no scope / not in chat) — quiet, try next */
+    }
+  }
+  return null;
+}
+
 // ─── Error types ──────────────────────────────────────────────────────────────
 
 /** Thrown when the target message has been withdrawn (Lark code 230011). */
@@ -148,6 +183,19 @@ export class MessageWithdrawnError extends Error {
   constructor(messageId: string) {
     super(`Message ${messageId} has been withdrawn`);
     this.name = 'MessageWithdrawnError';
+  }
+}
+
+/**
+ * Thrown when a message has passed Lark's 14-day edit window and can never be
+ * PATCHed again (Lark code 230031). Unlike 230011 the message still exists —
+ * only updates are rejected permanently, so callers must stop retrying and post
+ * a fresh message rather than treating it as a transient failure.
+ */
+export class MessageUpdateExpiredError extends Error {
+  constructor(messageId: string) {
+    super(`Message ${messageId} can no longer be updated (past Lark's edit window)`);
+    this.name = 'MessageUpdateExpiredError';
   }
 }
 
@@ -197,6 +245,7 @@ function getLarkErrorCode(err: any): number | undefined {
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
 // Capability cache for the undocumented `/members/bots` endpoint. It prevents
 // repeated hits while the tenant/gateway cannot serve the API, but per-request
 // business errors (bad chat id, permission denial) must not poison other chats.
@@ -218,6 +267,31 @@ export interface OutboundMessageOptions {
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
   suppressHook?: boolean;
+  /** Fence the distinct post-provider hook effect. A failure drops only the
+   * hook because the Lark message has already been accepted and must not be
+   * reported as failed (which would invite a duplicate retry). */
+  beforeHook?: () => void | Promise<void>;
+  /** Frozen protected origin used by read-isolated hook forwarding. */
+  hookOrigin?: ManagedHookOrigin;
+}
+
+async function emitOutboundHookIfAllowed(
+  options: OutboundMessageOptions | undefined,
+  event: 'outbound.send' | 'outbound.reply',
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (options?.suppressHook) return;
+  try {
+    await options?.beforeHook?.();
+  } catch (err) {
+    logger.warn(`Dropped ${event} hook after authority changed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  if (options?.hookOrigin) {
+    emitHookEvent(event, payload, { managedOrigin: options.hookOrigin });
+  } else {
+    emitHookEvent(event, payload);
+  }
 }
 
 export async function sendMessage(
@@ -230,49 +304,49 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
-  const c = getBotClient(larkAppId);
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+  return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
+    const c = getBotClient(larkAppId);
+    const body = msgType === 'text'
+      ? JSON.stringify({ text: content })
+      : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
-  let res: any;
-  try {
-    res = await c.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: msgType as any,
-        content: body,
-        ...(uuid ? { uuid } : {}),
-      },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(chatId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: msgType as any,
+          content: body,
+          ...(uuid ? { uuid } : {}),
+        },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(chatId);
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
-    throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
+      throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
+    }
 
-  const messageId = res.data?.message_id;
-  if (!messageId) throw new Error('No message_id in response');
-  logger.info(`Sent message ${messageId} to chat ${chatId}`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.send', {
-      ...hookContext,
-      larkAppId,
-      chatId,
-      messageId,
-      msgType,
-      uuid,
-      content,
-    });
-  }
-  return messageId;
+    const messageId = res.data?.message_id;
+    if (!messageId) throw new Error('No message_id in response');
+    logger.info(`Sent message ${messageId} to chat ${chatId}`);
+    await emitOutboundHookIfAllowed(options, 'outbound.send', {
+        ...hookContext,
+        larkAppId,
+        chatId,
+        messageId,
+        msgType,
+        uuid,
+        content,
+      });
+    return messageId;
+  });
 }
 
 /**
@@ -293,77 +367,115 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
-  const c = getBotClient(larkAppId);
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+  return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    const c = getBotClient(larkAppId);
+    const body = msgType === 'text'
+      ? JSON.stringify({ text: content })
+      : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
-  let res: any;
-  try {
-    res = await c.im.v1.message.reply({
-      path: { message_id: messageId },
-      data: {
-        msg_type: msgType as any,
-        content: body,
-        ...(replyInThread ? { reply_in_thread: true } : {}),
-        ...(uuid ? { uuid } : {}),
-      },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(messageId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.reply({
+        path: { message_id: messageId },
+        data: {
+          msg_type: msgType as any,
+          content: body,
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+          ...(uuid ? { uuid } : {}),
+        },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
-    throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
+    }
 
-  const replyId = res.data?.message_id;
-  if (!replyId) throw new Error('No message_id in reply response');
-  logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.reply', {
-      ...hookContext,
-      larkAppId,
-      messageId,
-      replyId,
-      msgType,
-      replyInThread,
-      uuid,
-      content,
-    });
+    const replyId = res.data?.message_id;
+    if (!replyId) throw new Error('No message_id in reply response');
+    logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+    await emitOutboundHookIfAllowed(options, 'outbound.reply', {
+        ...hookContext,
+        larkAppId,
+        messageId,
+        replyId,
+        msgType,
+        replyInThread,
+        uuid,
+        content,
+      });
+    return replyId;
+  });
+}
+
+export type MessageUrgentMode = 'app' | 'sms' | 'phone';
+
+/**
+ * Buzz one or more users about a message sent by this bot.
+ *
+ * `app` is the ordinary in-app Buzz. SMS/phone use separate endpoints, scopes,
+ * and tenant quota. Callers should therefore require an explicit mode for the
+ * latter two and must not retry the primary message when this follow-up fails.
+ */
+export async function urgentMessage(
+  larkAppId: string,
+  messageId: string,
+  userOpenIds: string[],
+  mode: MessageUrgentMode = 'app',
+  requestOptions?: LarkRequestOptions,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'urgentMessage');
+  const recipients = [...new Set(userOpenIds.map(id => id.trim()).filter(Boolean))];
+  if (recipients.length === 0) throw new Error('Urgent message requires at least one user open_id');
+
+  const c = getBotClient(larkAppId);
+  const res: any = await (c as any).request({
+    method: 'PATCH',
+    url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/urgent_${mode}`,
+    params: { user_id_type: 'open_id' },
+    data: { user_id_list: recipients },
+    ...larkRequestDeadline(requestOptions),
+  });
+  if (res?.code !== 0 && res?.code !== undefined) {
+    throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
   }
-  return replyId;
+  logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
-  const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.messageReaction.create({
-    path: { message_id: messageId },
-    data: { reaction_type: { emoji_type: emojiType } },
+  return executeWithLarkGate(larkAppId, 'addReaction', async () => {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).im.v1.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: emojiType } },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to add reaction: ${res.msg} (code: ${res.code})`);
+    }
+    const reactionId = res.data?.reaction_id;
+    logger.info(`Added reaction ${emojiType} (${reactionId}) to message ${messageId}`);
+    return reactionId ?? '';
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to add reaction: ${res.msg} (code: ${res.code})`);
-  }
-  const reactionId = res.data?.reaction_id;
-  logger.info(`Added reaction ${emojiType} (${reactionId}) to message ${messageId}`);
-  return reactionId ?? '';
 }
 
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
   assertLarkTransport(larkAppId, 'removeReaction');
-  const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.messageReaction.delete({
-    path: { message_id: messageId, reaction_id: reactionId },
+  return executeWithLarkGate(larkAppId, 'removeReaction', async () => {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).im.v1.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to remove reaction: ${res.msg} (code: ${res.code})`);
+    }
+    logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to remove reaction: ${res.msg} (code: ${res.code})`);
-  }
-  logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
 }
 
 /**
@@ -526,46 +638,53 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
-  const c = getBotClient(larkAppId);
-  // Stamp callback-button ownership markers on interactive DMs too: this is the
-  // FIFTH card egress surface (config / write-link / substitute / overload / …
-  // cards all DM their callback buttons through here). Without it a peer bot
-  // reading such a DM via history flattens the buttons into its prompt, and —
-  // worse — a future botmux DM button with a new action would leak past the
-  // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
-  // create + deadline request), so one stamp covers both. Same total-function
-  // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
-  const data = {
-    receive_id: openId,
-    msg_type: msgType as any,
-    content: body,
-    ...(uuid ? { uuid } : {}),
-  };
+  return executeWithLarkGate(
+    larkAppId,
+    'sendUserMessage',
+    async () => {
+      const c = getBotClient(larkAppId);
+      // Stamp callback-button ownership markers on interactive DMs too: this is the
+      // FIFTH card egress surface (config / write-link / substitute / overload / …
+      // cards all DM their callback buttons through here). Without it a peer bot
+      // reading such a DM via history flattens the buttons into its prompt, and —
+      // worse — a future botmux DM button with a new action would leak past the
+      // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
+      // create + deadline request), so one stamp covers both. Same total-function
+      // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
+      const body = msgType === 'text'
+        ? JSON.stringify({ text: content })
+        : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+      const data = {
+        receive_id: openId,
+        msg_type: msgType as any,
+        content: body,
+        ...(uuid ? { uuid } : {}),
+      };
 
-  const res = requestOptions
-    ? await c.request({
-      method: 'POST',
-      url: '/open-apis/im/v1/messages',
-      params: { receive_id_type: 'open_id' },
-      data,
-      ...larkRequestDeadline(requestOptions),
-    })
-    : await c.im.v1.message.create({
-      params: { receive_id_type: 'open_id' },
-      data,
-    });
+      const res = requestOptions
+        ? await c.request({
+          method: 'POST',
+          url: '/open-apis/im/v1/messages',
+          params: { receive_id_type: 'open_id' },
+          data,
+          ...larkRequestDeadline(requestOptions),
+        })
+        : await c.im.v1.message.create({
+          params: { receive_id_type: 'open_id' },
+          data,
+        });
 
-  if (res.code !== 0) {
-    throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
-  }
+      if (res.code !== 0) {
+        throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
+      }
 
-  const messageId = res.data?.message_id;
-  if (!messageId) throw new Error('No message_id in response');
-  logger.info(`Sent DM ${messageId} to user ${openId}`);
-  return messageId;
+      const messageId = res.data?.message_id;
+      if (!messageId) throw new Error('No message_id in response');
+      logger.info(`Sent DM ${messageId} to user ${openId}`);
+      return messageId;
+    },
+    requestOptions?.signal ? { signal: requestOptions.signal } : undefined,
+  );
 }
 
 export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -590,12 +709,16 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
  * Throws on API failure (e.g. missing `im:chat`/member-read scope) so the
  * caller can decide how to degrade — it does NOT swallow errors, because a
  * silent empty list would look like "no allowedUser present" and wrongly
- * suppress auto-start.
+ * suppress auto-start. For the same reason it also throws when the member list
+ * exceeds the page cap (>2000 members) and is still `has_more`: a silently
+ * truncated list would make members past the cap look like "not in the chat"
+ * (wrong-answer fail-open), so a truncation is surfaced as an error instead.
  */
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   const c = getBotClient(larkAppId);
   const openIds: string[] = [];
   let pageToken: string | undefined;
+  let truncated = false;
   // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
   for (let page = 0; page < 20; page++) {
     const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
@@ -610,6 +733,15 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
+    // Hit the cap with more pages remaining → the list is incomplete. Fail
+    // closed rather than return a truncated list (see docstring).
+    if (page === 19) truncated = true;
+  }
+  if (truncated) {
+    throw new Error(
+      `Chat ${chatId} has more than 2000 members; member list truncated at the page cap. ` +
+      `Refusing to return an incomplete list (would misjudge members past the cap as "not in chat").`,
+    );
   }
   return openIds;
 }
@@ -630,6 +762,55 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
     return name.length > 0 ? name : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * 获取入群自动开工所需的群上下文。群模式、群名和群描述来自同一次
+ * chat.get，失败时保留 unavailable，避免把读取失败误判成字段为空。
+ */
+export async function getChatContext(larkAppId: string, chatId: string): Promise<ChatContext> {
+  const unavailable: ChatContext = {
+    chatId,
+    name: null,
+    description: null,
+    mode: 'unknown',
+    fetchStatus: 'unavailable',
+  };
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) {
+      logger.warn(`getChatContext(${chatId}) failed: ${res.msg} (code: ${res.code})`);
+      return unavailable;
+    }
+
+    const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+    const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+    let mode: ChatMode | 'unknown';
+    if (rawMode === 'p2p') mode = 'p2p';
+    else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+    else if (rawMode === 'group') mode = 'group';
+    else mode = 'unknown';
+
+    if (mode !== 'unknown') {
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    } else {
+      logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
+    }
+
+    const name = String(res.data?.name ?? '').trim();
+    const description = String(res.data?.description ?? '').trim();
+    return {
+      chatId,
+      name: name || null,
+      description: description || null,
+      mode,
+      fetchStatus: 'ok',
+    };
+  } catch (err: any) {
+    logger.warn(`getChatContext(${chatId}) errored: ${err?.message ?? err}`);
+    return unavailable;
   }
 }
 
@@ -796,16 +977,132 @@ export async function getChatMode(
  */
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
+  return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
+    const c = getBotClient(larkAppId);
+    try {
+      const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
+      if (res && typeof res.code === 'number' && res.code !== 0) {
+        logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.debug(`Failed to delete message ${messageId}: ${err}`);
+      return false;
+    }
+  });
+}
+
+export interface LarkPinRecord {
+  messageId: string;
+  chatId?: string;
+  operatorId?: string;
+  operatorIdType?: string;
+  createTime?: string;
+}
+
+function normalizeLarkPinRecord(pin: any): LarkPinRecord {
+  return {
+    messageId: typeof pin?.message_id === 'string' ? pin.message_id : '',
+    chatId: typeof pin?.chat_id === 'string' ? pin.chat_id : undefined,
+    operatorId: typeof pin?.operator_id === 'string' ? pin.operator_id : undefined,
+    operatorIdType: typeof pin?.operator_id_type === 'string' ? pin.operator_id_type : undefined,
+    createTime: typeof pin?.create_time === 'string' ? pin.create_time : undefined,
+  };
+}
+
+/**
+ * Pin a message in a chat (best-effort QoL). Returns the exact Pin record only
+ * when Lark explicitly confirms success (`code === 0`) and includes `data.pin`;
+ * any other outcome returns `null` and must not affect session behavior.
+ */
+export async function pinMessage(larkAppId: string, messageId: string): Promise<LarkPinRecord | null> {
+  assertLarkTransport(larkAppId, 'pinMessage');
   const c = getBotClient(larkAppId);
   try {
-    const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
-    if (res && typeof res.code === 'number' && res.code !== 0) {
-      logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+    const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return null;
+    }
+    const rawPin = res.data?.pin;
+    if (!rawPin || typeof rawPin !== 'object') {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=0 missing=data.pin`);
+      return null;
+    }
+    return normalizeLarkPinRecord(rawPin);
+  } catch (err) {
+    logger.debug(`[pin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return null;
+  }
+}
+
+const LARK_PIN_LIST_MAX_PAGE = 50;
+
+/**
+ * List every Pin record in one chat, following explicit page_token pagination.
+ * This is a strict read wrapper: non-zero or missing `code`, missing next-page
+ * tokens, and repeated tokens all throw so callers never silently accept a
+ * truncated provenance chain.
+ */
+export async function listChatPins(larkAppId: string, chatId: string): Promise<LarkPinRecord[]> {
+  const c = getBotClient(larkAppId);
+  const out: LarkPinRecord[] = [];
+  const seenPageTokens = new Set<string>();
+  let pageToken: string | undefined;
+
+  for (;;) {
+    const res: any = await c.im.v1.pin.list({
+      params: {
+        chat_id: chatId,
+        page_size: LARK_PIN_LIST_MAX_PAGE,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (typeof res?.code !== 'number') {
+      throw new Error('Failed to list chat pins: missing code');
+    }
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat pins: ${res.msg ?? 'unknown error'} (code: ${res.code})`);
+    }
+
+    for (const item of res.data?.items ?? []) {
+      out.push(normalizeLarkPinRecord(item));
+    }
+
+    if (res.data?.has_more !== true) break;
+    const nextPageToken = res.data?.page_token;
+    if (typeof nextPageToken !== 'string' || nextPageToken.length === 0 || nextPageToken.trim() !== nextPageToken) {
+      throw new Error(`Failed to list chat pins for ${chatId}: malformed pagination token`);
+    }
+    if (seenPageTokens.has(nextPageToken)) {
+      throw new Error(`Failed to list chat pins for ${chatId}: repeated page token ${nextPageToken}`);
+    }
+    seenPageTokens.add(nextPageToken);
+    pageToken = nextPageToken;
+  }
+
+  return out;
+}
+
+/**
+ * Unpin a message in a chat (best-effort QoL). Returns `true` only when Lark
+ * explicitly confirms success (`code === 0`); any other outcome returns `false`
+ * and must not affect session behavior.
+ */
+export async function unpinMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'unpinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.delete({ path: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[unpin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
       return false;
     }
     return true;
   } catch (err) {
-    logger.debug(`Failed to delete message ${messageId}: ${err}`);
+    logger.debug(`[unpin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
     return false;
   }
 }
@@ -826,24 +1123,26 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
-  const c = getBotClient(larkAppId);
-  let card: unknown;
-  try {
-    card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
-  } catch (err) {
-    throw new Error(`Invalid ephemeral card JSON: ${err}`);
-  }
-  const res: any = await (c as any).request({
-    method: 'POST',
-    url: '/open-apis/ephemeral/v1/send',
-    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
+  return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
+    const c = getBotClient(larkAppId);
+    let card: unknown;
+    try {
+      card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
+    } catch (err) {
+      throw new Error(`Invalid ephemeral card JSON: ${err}`);
+    }
+    const res: any = await (c as any).request({
+      method: 'POST',
+      url: '/open-apis/ephemeral/v1/send',
+      data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
+    }
+    const messageId = res.data?.message_id;
+    logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
+    return messageId ?? '';
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
-  }
-  const messageId = res.data?.message_id;
-  logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
-  return messageId ?? '';
 }
 
 /**
@@ -857,43 +1156,167 @@ export async function sendEphemeralCard(
  */
 export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
-  const c = getBotClient(larkAppId);
-  try {
-    const res: any = await (c as any).request({
-      method: 'POST',
-      url: '/open-apis/ephemeral/v1/delete',
-      data: { message_id: messageId },
-    });
-    if (res && typeof res.code === 'number' && res.code !== 0) {
-      logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+  return executeWithLarkGate(larkAppId, 'deleteEphemeralCard', async () => {
+    const c = getBotClient(larkAppId);
+    try {
+      const res: any = await (c as any).request({
+        method: 'POST',
+        url: '/open-apis/ephemeral/v1/delete',
+        data: { message_id: messageId },
+      });
+      if (res && typeof res.code === 'number' && res.code !== 0) {
+        logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
       return false;
     }
-    return true;
-  } catch (err) {
-    logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
-    return false;
-  }
+  });
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   assertLarkTransport(larkAppId, 'updateMessage');
-  const c = getBotClient(larkAppId);
-  let res: any;
-  try {
-    res = await c.im.v1.message.patch({
-      path: { message_id: messageId },
-      data: { content: stampBotmuxCallbackMarkers(cardJson) },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(messageId);
+  return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: stampBotmuxCallbackMarkers(cardJson) },
+      });
+    } catch (err: any) {
+      const code = getLarkErrorCode(err);
+      if (code === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      if (code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) {
+        throw new MessageUpdateExpiredError(messageId);
+      }
+      throw err;
     }
-    throw err;
-  }
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
-    throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
+      throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
+export interface CardStreamingSettings {
+  streamingMode: boolean;
+  sequence: number;
+  uuid: string;
+  summary?: string;
+  /** Applied when opening a stream. Omitted when only finalizing it. */
+  print?: {
+    frequencyMs: number;
+    step: number;
+    strategy: 'fast';
+  };
+}
+
+/** Convert a sent interactive message into its CardKit entity id. */
+export async function resolveCardKitId(larkAppId: string, messageId: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'resolveCardKitId');
+  return executeWithLarkGate(larkAppId, 'resolveCardKitId', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await c.cardkit.v1.card.idConvert({ data: { message_id: messageId } });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
+    }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to resolve CardKit id: ${res.msg} (code: ${res.code})`);
+    }
+    const cardId = res.data?.card_id;
+    if (!cardId) throw new Error('CardKit id conversion returned no card_id');
+    return cardId;
+  });
+}
+
+/** Enable/finalize native CardKit streaming without replacing the whole card. */
+export async function updateCardStreamingSettings(
+  larkAppId: string,
+  cardId: string,
+  settings: CardStreamingSettings,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
+    const c = getBotClient(larkAppId);
+    const config: Record<string, unknown> = {
+      streaming_mode: settings.streamingMode,
+      ...(settings.summary !== undefined ? { summary: { content: settings.summary } } : {}),
+      ...(settings.print ? {
+        streaming_config: {
+          print_frequency_ms: { default: settings.print.frequencyMs },
+          print_step: { default: settings.print.step },
+          print_strategy: settings.print.strategy,
+        },
+      } : {}),
+    };
+    const res: any = await c.cardkit.v1.card.settings({
+      path: { card_id: cardId },
+      data: {
+        settings: JSON.stringify({ config }),
+        sequence: settings.sequence,
+        uuid: settings.uuid,
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to update CardKit streaming settings: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
+/** Replace one text element's full content using CardKit's typewriter API. */
+export async function updateCardStreamElementContent(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  content: string,
+  sequence: number,
+  uuid: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardStreamElementContent');
+  return executeWithLarkGate(larkAppId, 'updateCardStreamElementContent', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: elementId },
+      data: { content, sequence, uuid },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to stream CardKit element content: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
+/** Patch properties on one existing CardKit element without replacing the card. */
+export async function patchCardStreamElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  partialElement: Record<string, unknown>,
+  sequence: number,
+  uuid: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.cardkit.v1.cardElement.patch({
+      path: { card_id: cardId, element_id: elementId },
+      data: { partial_element: JSON.stringify(partialElement), sequence, uuid },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to patch CardKit element: ${res.msg} (code: ${res.code})`);
+    }
+  });
 }
 
 export async function getMessageDetail(
@@ -951,7 +1374,51 @@ export async function getMessageChatId(
   }
 }
 
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+/** Resolve the `omt_...` topic id for an `om_...` topic-root message. Topic
+ *  routing itself keeps using the root message id; this helper is only for
+ *  client AppLinks. */
+export async function getMessageThreadId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
+  try {
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
+    const candidates = [
+      detail?.items?.[0]?.thread_id,
+      detail?.thread_id,
+      detail?.message?.thread_id,
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
+    logger.debug(`[message] failed to resolve thread_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/**
+ * Download an image/file attached to a message.
+ *
+ * App token first, user token only as a fallback — a bot that can already read
+ * the resource needs nobody's personal credentials, so most downloads never
+ * touch a user token at all.
+ *
+ * `senderOpenId` names whose token to use for that fallback. It is the person
+ * who SENT the attachment, which is the naturally correct choice: they can see
+ * what they just posted. Passing nobody keeps the pre-existing behavior (any
+ * token authorized for this bot), which is what the paths without a per-turn
+ * sender still rely on.
+ */
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -980,7 +1447,17 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Fallback: User Token from botmux OAuth (/login)
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+  // Use the SENDER's own token: they posted this attachment, so their
+  // credentials are the right ones and the download is attributed to them.
+  //
+  // Not gated on the policy. Tokens are stored per person now, so the old
+  // no-openId lookup finds nothing once someone re-authorizes — they would have
+  // just run /login, be told it succeeded, and still get "no User Token". The
+  // openId is only ever a lookup key here; with the policy off it simply picks
+  // the same person's token it always meant to.
+  const userToken = await resolveUserToken(
+    bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId,
+  );
   if (!userToken) {
     throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
@@ -1050,38 +1527,42 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadImage');
-  const c = getBotClient(larkAppId);
-  const buf = readFileSync(imagePath);
-  // SDK returns { image_key } directly (not wrapped in { code, data })
-  const res = await c.im.v1.image.create({
-    data: { image_type: 'message', image: buf },
+  return executeWithLarkGate(larkAppId, 'uploadImage', async () => {
+    const c = getBotUploadClient(larkAppId);
+    const buf = readFileSync(imagePath);
+    // SDK returns { image_key } directly (not wrapped in { code, data })
+    const res = await c.im.v1.image.create({
+      data: { image_type: 'message', image: buf },
+    });
+    const imageKey = res?.image_key;
+    if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
+    logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
+    return imageKey;
   });
-  const imageKey = res?.image_key;
-  if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
-  logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
-  return imageKey;
 }
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  const c = getBotClient(larkAppId);
-  const buf = readFileSync(filePath);
-  const ext = extname(filePath).toLowerCase();
-  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-  const fileName = basename(filePath);
-  // `duration` (ms) only applies to opus voice uploads — it sets the length
-  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
-  const duration = fileType === 'opus' && opts?.duration
-    ? Math.max(1000, Math.round(opts.duration))
-    : undefined;
-  // SDK returns { file_key } directly (not wrapped in { code, data })
-  const res = await c.im.v1.file.create({
-    data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+  return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
+    const c = getBotUploadClient(larkAppId);
+    const buf = readFileSync(filePath);
+    const ext = extname(filePath).toLowerCase();
+    const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+    const fileName = basename(filePath);
+    // `duration` (ms) only applies to opus voice uploads — it sets the length
+    // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+    const duration = fileType === 'opus' && opts?.duration
+      ? Math.max(1000, Math.round(opts.duration))
+      : undefined;
+    // SDK returns { file_key } directly (not wrapped in { code, data })
+    const res = await c.im.v1.file.create({
+      data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+    });
+    const fileKey = res?.file_key;
+    if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+    return fileKey;
   });
-  const fileKey = res?.file_key;
-  if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-  logger.info(`Uploaded file ${filePath} → ${fileKey}`);
-  return fileKey;
 }
 
 /**
@@ -1367,6 +1848,20 @@ export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Pro
   return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
 }
 
+/** List a 话题 by its thread id (`omt_…`) directly, skipping the message.get
+ *  round-trip `listThreadMessages` needs to resolve one from a root message.
+ *
+ *  The /quote picker already has the thread id: `im/v1/messages` returns
+ *  `thread_id` on every 话题 message, so grouping the chat tail by that field
+ *  yields the id for free. Going back through `listThreadMessages` would spend
+ *  an extra API call re-deriving what we already know — and would fail for a
+ *  话题 whose root message has been withdrawn (message.get 404s, and the
+ *  by-root_id fallback scan can't see the 话题 either, since its replies carry
+ *  `thread_id` but no `root_id` pointing at the missing root). */
+export async function listMessagesByThreadId(larkAppId: string, threadId: string, pageSize: number = 50): Promise<any[]> {
+  return listByThread(getBotClient(larkAppId), threadId, pageSize);
+}
+
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   const c = getBotClient(larkAppId);
 
@@ -1402,7 +1897,14 @@ function wantsUnlimitedMessages(pageSize: number): boolean {
   return pageSize <= 0 || !Number.isFinite(pageSize);
 }
 
-/** List thread messages using container_id_type="thread" (fast path). */
+/** List thread-container messages, most-recent first but returned chronologically
+ *  (oldest → newest, capped at `pageSize`). Fast path for `botmux history` in a
+ *  topic session — same contract as `listChatMessages` below, and for the same
+ *  reason: the caller asked for `pageSize` messages of *context*, which is the
+ *  tail of the thread, not its head. A thread that has outgrown `pageSize` used
+ *  to come back as its oldest N here while the chat-scope sibling returned its
+ *  newest N — and the two ends are indistinguishable downstream, because both
+ *  are N real messages in chronological order. */
 async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
@@ -1413,7 +1915,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
       container_id_type: 'thread',
       container_id: threadId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeAsc',
+      // Page in Desc order so a long thread yields its TAIL; reversed below.
+      sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -1430,7 +1933,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Cap to pageSize newest, then reverse to chronological for the caller.
+  return (unlimited ? allMessages : allMessages.slice(0, pageSize)).reverse();
 }
 
 /** List chat-container messages, most-recent first but returned chronologically
@@ -1612,7 +2116,22 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
   } while (pageToken);
 
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Take the TAIL, matching `listByThread` above and the chat-scope sibling.
+  // The loop above pages in Desc order and breaks on `>= pageSize`, so a single
+  // 50-item page can overshoot: what we hold is the newest N+k. After the
+  // ascending sort, `slice(0, pageSize)` would hand back the OLDEST N of those
+  // — i.e. silently drop the newest k, which is exactly the end the caller
+  // asked for. `limit > 50` always pages, and the dashboard history popover
+  // defaults to 80 (`src/core/dashboard-ipc-server.ts`), so this is the common
+  // path, not a corner.
+  //
+  // ⚠️ `Math.max(0, …)` is load-bearing, not defensive dressing: when fewer
+  // than `pageSize` messages were collected — a thread shorter than the limit,
+  // which is the NORMAL case — `allMessages.length - pageSize` is negative and
+  // `slice(negative)` counts from the end, dropping the OLDEST messages
+  // instead. Without the guard this trades a rare bug for a common one.
+  // Same idiom as `filterAmbientChatMessages` above.
+  return unlimited ? allMessages : allMessages.slice(Math.max(0, allMessages.length - pageSize));
 }
 
 /**

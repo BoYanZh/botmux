@@ -1,10 +1,14 @@
-import { createRequire } from 'node:module';
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry, normalizeMobileEntry } from '../setup/bot-config-editor.js';
+import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import {
+  detectUnusableOwnerEntries,
+  resolveScannerAllowedUser,
+  resolveSessionEmailAllowedUser,
+} from '../setup/owner-identity.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import {
   validateCredentials,
@@ -14,7 +18,7 @@ import {
   type CriticalScopeReadbackResult,
   type RemainingStep,
 } from '../setup/verify-permissions.js';
-import { resolveSetupAppName } from '../setup/app-name.js';
+import { resolveCloneAppName, resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
@@ -29,12 +33,18 @@ import {
   type OpenPlatformAutomationResult,
 } from '../setup/open-platform-automation.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { type Brand, sdkDomain } from '../im/lark/lark-hosts.js';
-import * as Lark from '@larksuiteoapi/node-sdk';
+import type { Brand } from '../im/lark/lark-hosts.js';
 
-const require = createRequire(import.meta.url);
-const QRCode = require('qrcode-terminal/vendor/QRCode') as any;
-const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel') as Record<string, unknown>;
+// Static default-imports of qrcode-terminal's vendored QRCode class (its public
+// API only prints to a terminal; we need the low-level class to render a QR into
+// a data structure). Explicit `.js` file specifiers — NOT `createRequire(...)`
+// with a bare dir path — so `bun build --compile` traces and EMBEDS them into
+// the single-file binary. The old dynamic require left them unbundled, and the
+// compiled dashboard crashed at runtime with "Cannot find module
+// 'qrcode-terminal/vendor/QRCode' from /$bunfs/…". Both files are `module.exports
+// = …` CJS; ESM default-import interop gives the export on both Node and Bun.
+import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
+import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
 
 export type BotOnboardingStatus =
   | 'starting'
@@ -65,6 +75,14 @@ export interface BotOnboardingPermission {
   eventMode?: number;
   /** Exact baseline event + callback count ACK for MOSA-managed activation. */
   verifiedEventCount?: number;
+  /**
+   * redirect 白名单是否写成功。**独立于 ok**：权限/发版全绿但白名单没写上时，这个
+   * bot 一点授权就 20029（群聊模式 / 会话群标签 / `/login` 全都用不了），前端必须
+   * 能把这一步单独讲出来，不能被一句「权限配置完成」盖过去。
+   */
+  redirectConfigured?: boolean;
+  /** redirect 白名单未配置成功的原因。 */
+  redirectWarning?: string;
   /** 失败原因 / 信息 (失败时给出手动步骤) */
   reason?: string;
   message?: string;
@@ -137,8 +155,9 @@ export interface BotOnboardingSnapshot {
 
 /** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
 export interface BotOnboardingInput {
-  /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
+  /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
+  cloneSourceAppId?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
   registrationMode?: 'web' | 'compat';
   /**
@@ -1521,6 +1540,13 @@ export class BotOnboardingManager {
       subscribedEventCount: MANAGED_VERIFIED_EVENT_COUNT,
       missingVcEvents: [],
       eventModeReady: true,
+      // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
+      // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
+      redirectConfigured: false,
+      // 同上：本次没有读/写「权限可访问的数据范围」。0 + warning 才是诚实的
+      // 「没碰过」，报 0 而不带 warning 会被下游读成「本来就没有待配的」。
+      privilegeRangeCount: 0,
+      privilegeRangeWarning: '本次从权限台账重建，未读写权限数据范围',
       eventMode: managedPermission.eventMode,
       verifiedEventCount: managedPermission.verifiedEventCount,
       versionId: managedPermission.versionId,
@@ -1587,9 +1613,24 @@ export class BotOnboardingManager {
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const cloneSource = input.cloneSourceAppId
+      ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
+      : undefined;
+    if (input.cloneSourceAppId && !cloneSource) {
+      this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
     // Freeze the resolved name before any asynchronous work. Later bot list
     // changes must not make the name drift midway through onboarding.
-    const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+    const appName = cloneSource
+      ? resolveCloneAppName(
+          input.appName,
+          [cloneSource.displayName, cloneSource.name, input.cloneSourceAppId]
+            .find(value => typeof value === 'string' && value.trim()),
+          this.now(),
+        )
+      : resolveSetupAppName(input.appName, configuredBots.length);
     this.patch(id, {
       registrationMode: input.registrationMode ?? 'web',
       ...(input.requireCriticalScopesBeforeActivation
@@ -1669,9 +1710,9 @@ export class BotOnboardingManager {
 
     // CLI / 工作目录 / model 来自前端表单 (dashboard 已用 resolveCliId +
     // invalidWorkingDirs 校验过). 留空回退到 setup 同款默认: claude-code / '~'.
-    const cliId: CliId = input.cliId ?? 'claude-code';
-    const workingDir = input.workingDir?.trim() || '~';
-    const bot: Record<string, any> = {
+    let cliId: CliId = input.cliId ?? 'claude-code';
+    let workingDir = input.workingDir?.trim() || '~';
+    let bot: Record<string, any> = {
       larkAppId: result.appId,
       larkAppSecret: result.appSecret,
       cliId,
@@ -1685,6 +1726,11 @@ export class BotOnboardingManager {
     // brand 落盘：只在国际版写字段，feishu 留空（向后兼容，见 normalizeBrand）。
     if (result.brand === 'lark') {
       bot.brand = 'lark';
+    }
+    if (cloneSource) {
+      bot = cloneBotConfig(cloneSource, bot);
+      cliId = bot.cliId ?? 'claude-code';
+      workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
     }
     // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
     // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open
@@ -1884,6 +1930,8 @@ export class BotOnboardingManager {
           callbacks,
           sessionFilePath,
           meta.requireVerifiedEvents,
+          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
+          true,
         );
       }
       const first = await this.automateOpenPlatform({
@@ -1895,6 +1943,10 @@ export class BotOnboardingManager {
         disableQrLogin: meta.registrationMode === 'web',
         disableBytedcliFallback: meta.registrationMode === 'web',
         requireVerifiedEvents: meta.requireVerifiedEvents,
+        // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
+        // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
+        // runPermissionRecovery，那边不传。
+        appJustCreated: true,
         ...callbacks,
       });
       return first;
@@ -1992,6 +2044,7 @@ export class BotOnboardingManager {
     callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onQrScanConfirmed' | 'onStatus'>,
     sessionFilePath: string,
     requireVerifiedEvents: boolean,
+    appJustCreated = false,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2002,6 +2055,7 @@ export class BotOnboardingManager {
         disableQrLogin: false,
         disableBytedcliFallback: true,
         requireVerifiedEvents,
+        appJustCreated,
         ...callbacks,
       });
     } finally {
@@ -2031,6 +2085,9 @@ export class BotOnboardingManager {
           scopeWarning: auto.scopeWarning,
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
+          // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         }
       : {
           ok: false,
@@ -2039,6 +2096,8 @@ export class BotOnboardingManager {
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
           versionId: auto.versionId,
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         };
     this.patch(id, {
       status,
@@ -2050,113 +2109,4 @@ export class BotOnboardingManager {
     });
     this.requireDurableManagedInitialJobs();
   }
-}
-
-/**
- * 用新应用自身凭证验证扫码链路拿到的 open_id。
- * 能解析 union_id 时写 on_；没有 union_id 但 open_id 对当前 app 有效时写 ou_。
- * 查询失败或用户不在当前 app 视角时返回 undefined，调用方不得 fallback 写入该 ou_。
- */
-async function resolveScannerAllowedUser(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string | undefined> {
-  try {
-    const client = new Lark.Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
-    const res = await (client as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
-    });
-    if (res.code === 0 && res.data?.user) {
-      return res.data.user.union_id ?? openId;
-    }
-  } catch { /* do not trust scanner open_id when verification fails */ }
-  return undefined;
-}
-
-/**
- * 用新应用自身凭证把 Web 登录身份邮箱解析成 owner 条目。
- *   - 解析出 union_id → 落 on_（跨 app 稳定，与扫码链路对齐）。
- *   - 成功响应但查不到任何 user_id → 确凿不在本企业（如个人邮箱）→ undefined,
- *     调用方回落 needs_owner 让用户复核。
- *   - 请求失败 / 无法证伪（contact scope 未生效、网络错误）→ 直接返回邮箱本身:
- *     它来自刚完成登录的开放平台会话本人, 运行时 resolveAllowedUsers 会再解析。
- */
-async function resolveSessionEmailAllowedUser(appId: string, appSecret: string, email: string, brand: Brand = 'feishu'): Promise<string | undefined> {
-  try {
-    const client = new Lark.Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
-    const res = await (client as any).contact.v3.user.batchGetId({
-      params: { user_id_type: 'union_id' },
-      data: { emails: [email], include_resigned: false },
-    });
-    if (res?.code === 0) {
-      const list: any[] = res.data?.user_list ?? [];
-      const hit = list.find(u => typeof u?.user_id === 'string' && u.user_id);
-      return hit ? hit.user_id : undefined;
-    }
-  } catch { /* 无法证伪 → 信任会话邮箱 */ }
-  return email;
-}
-
-// 跨 app open_id 的固定错误码：用本 app 凭证查别的 app 视角的 ou_ 必返这个。
-const CROSS_APP_OPEN_ID_CODE = 99992361;
-
-/**
- * best-effort 找出「确凿不可用」的 owner 条目, 供 submitOwner 拒绝。只在能明确判定时
- * 才判不可用——避免 scope 未生效 / 权限不足 / 网络错误时把合法条目误杀:
- *   - ou_：本 app 查到跨 app 错误码 (99992361) → 不可用 (典型误填别的 app 的 open_id)。
- *   - 邮箱：batchGetId 成功返回但该邮箱没有对应 user → 不可用 (不在本企业)。
- *   - on_：union_id 无法构造确凿的「不属于本 app」信号, 一律放行 (留给运行时解析)。
- * 任何抛错 / 非确定性响应都视为「无法证伪」→ 不计入 unusable。
- */
-async function detectUnusableOwnerEntries(
-  appId: string,
-  appSecret: string,
-  brand: Brand,
-  entries: string[],
-): Promise<string[]> {
-  if (!appSecret) return [];
-  let client: any;
-  try {
-    client = new Lark.Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
-  } catch {
-    return [];
-  }
-  const unusable: string[] = [];
-  for (const entry of entries) {
-    try {
-      if (entry.startsWith('ou_')) {
-        const res = await client.contact.v3.user.get({
-          path: { user_id: entry },
-          params: { user_id_type: 'open_id' },
-        });
-        if (res?.code === CROSS_APP_OPEN_ID_CODE) unusable.push(entry);
-      } else if (entry.startsWith('on_')) {
-        // union_id：无确凿的跨 app 否定信号, 放行。
-        continue;
-      } else if (isMobileEntry(entry)) {
-        // 手机号走 batch_get_id 的 `mobiles` 字段（与运行时 resolver 同口径），
-        // 不能落到下面的 emails 分支——否则手机号被当邮箱查, code 0 + 空 user_list
-        // 会把合法手机号误判为「不在本企业」而拒绝（P2）。判定同 email：成功响应
-        // 里没有任何带 user_id 的条目 → 确凿不在本企业。
-        const res = await client.contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { mobiles: [normalizeMobileEntry(entry)], include_resigned: false },
-        });
-        if (res?.code === 0) {
-          const list: any[] = res.data?.user_list ?? [];
-          if (!list.some(u => u?.user_id)) unusable.push(entry);
-        }
-      } else {
-        const res = await client.contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { emails: [entry], include_resigned: false },
-        });
-        // 单封邮箱查询：成功响应里没有任何带 user_id 的条目 → 确凿不在本企业。
-        // 用「是否存在 user_id」而非「邮箱精确匹配」判定, 避开 API 侧邮箱规范化误杀。
-        if (res?.code === 0) {
-          const list: any[] = res.data?.user_list ?? [];
-          if (!list.some(u => u?.user_id)) unusable.push(entry);
-        }
-      }
-    } catch { /* 无法证伪：不计入 unusable */ }
-  }
-  return unusable;
 }

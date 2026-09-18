@@ -5,6 +5,7 @@
  * 且解析 target 时排除 bot 自身。
  */
 import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
+import { isBotAdmin } from './grant-owner.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
@@ -114,9 +115,9 @@ export async function tryHandleGrantCommand(
   const messageId = message.message_id;
   const chatId = message.chat_id;
 
-  // owner 强闸门
+  // owner / admin 强闸门
   const owner = getOwnerOpenId(larkAppId);
-  if (!senderOpenId || senderOpenId !== owner) {
+  if (!senderOpenId || !isBotAdmin(larkAppId, senderOpenId)) {
     await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc))
       .catch(err => logger.debug(`grant owner_only reply failed: ${err}`));
     return true;
@@ -199,14 +200,17 @@ export async function tryHandleGrantCommand(
     return true;
   }
 
-  // 解析可选额度：`/grant @x 5`（多目标时对每人各 N 条）。显式数字恒生效；无数字取 messageQuota.defaultLimit（未配=无限）。
+  // 解析可选额度：`/grant @x 5`（多目标时对每人各 N 条）。显式数字恒生效；
+  // 无数字优先取 per-bot 覆盖值，未配置时使用卡片内置 3 条。
   const pq = parseGrantQuota(text, message?.mentions ?? []);
   if (!pq.ok) {
     await replyMessage(larkAppId, messageId, t('cmd.grant.bad_quota', undefined, loc))
       .catch(err => logger.debug(`grant bad_quota reply failed: ${err}`));
     return true;
   }
-  const quota = pq.quota ?? getBot(larkAppId).config.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const botConfig = getBot(larkAppId).config;
+  const quota = pq.quota ?? botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
   const nonce = openPendingMulti(
@@ -215,17 +219,17 @@ export async function tryHandleGrantCommand(
     targets.map(tgt => tgt.openId),
     quota,
     undefined,
-    DEFAULT_GRANT_DURATION_MS,
+    durationMs,
   );
   const card = buildGrantCard(
     {
-      ownerOpenId: owner!,
+      ownerOpenId: senderOpenId ?? owner!,
       targets,
       chatId,
       nonce,
       mode: 'owner',
       quota,
-      durationMs: DEFAULT_GRANT_DURATION_MS,
+      durationMs,
     },
     loc,
   );

@@ -3,13 +3,14 @@
  * isolation, where dashboard-daemons is deliberately masked. The hook must use
  * BOTMUX_DAEMON_IPC_PORT and carry the rotating relay capability.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -38,11 +39,11 @@ function runSessionReady(
     delete env.BOTMUX_TURN_ID;
     delete env.BOTMUX_DISPATCH_ATTEMPT;
 
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'session-ready'],
+    const child = spawnTsScript(
+      CLI_PATH,
+      ['session-ready'],
       { env, stdio: ['pipe', 'pipe', 'pipe'] },
-    );
+    ) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -65,6 +66,7 @@ describe('botmux session-ready — isolated CLI fallback', () => {
     writeFileSync(
       join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
       JSON.stringify({ token: capability }),
+      { mode: 0o600 },
     );
 
     let receivedBody = '';

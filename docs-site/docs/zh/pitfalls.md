@@ -8,13 +8,14 @@
 
 ## 环境 / 安装
 
-- **Node 太老**：v18 等没内置全局 `fetch`，`botmux setup` 会报 `fetch is not defined` / `fetch failed` 且不写 `bots.json`。→ 升级到 **Node ≥ 22**。
+- **装完 `botmux: command not found`**：`~/.botmux/bin` 没进 PATH。两种安装方式都会写你当前 shell 的启动文件，但**要开个新终端（或 source 一下）才生效**。⚠️ 已知限制：如果执行安装时 `~/.botmux/bin` 恰好已在当前进程的 PATH 里（**在 botmux 自己的 CLI 会话里装就是这种情况**——daemon 会把它注入每个会话的 PATH），`install.sh` 会认为无需处理而**不写启动文件**，于是新终端里仍然找不到。→ 在**普通终端**里装，或手动把 `export PATH="$HOME/.botmux/bin:$PATH"` 加进启动文件。
+- **Node 太老**（仅 npm 安装路径）：v18 等没内置全局 `fetch`，`npm i -g botmux` 的 postinstall 或 `botmux setup` 会报 `fetch is not defined` / `fetch failed`。→ 升级到 **Node ≥ 22**，或改用 curl 安装方式（自包含二进制，不需要 Node）。
 - **首次启动卡在人工确认**：CLI（如 Claude Code）首次会弹"信任目录 / bypass 权限"确认，没人工点过会卡住、报 `tmux send-keys` 错。→ 首次手动确认一次，之后不再出现。
 
 ## 环境变量丢失（高频）
 
-- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`）。这是 `API Error 403` / 网关 token 报错的常见根因。
-- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
+- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`，fish 用户写 `~/.config/fish/config.fish`）。这是 `API Error 403` / 网关 token 报错的常见根因。
+- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`、fish 写 `~/.config/fish/config.fish`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
 
 ## 自定义 wrapper / 网关接入
 
@@ -47,7 +48,7 @@
 
 ## Dashboard / 安全
 
-- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 一次性，每跑一次 `botmux dashboard` 重新生成、旧链接立即失效。
+- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 是轮换式而非单次消费：轮换前同一 URL 可重复使用；只有 `botmux dashboard rotate` 会生成新 token、让旧链接立即失效，裸命令和 `botmux dashboard current` 都不会轮换。
 - **dashboard 打不开**：先 `curl http://<host>:<port>/__health`，返回 `{"ok":true}` 说明服务正常；问题多在浏览器代理 / host 不对（mac 连内网 IP 会变）/ 打开了旧 token 链接。
 
 ## 排查通用手法

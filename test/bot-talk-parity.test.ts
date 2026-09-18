@@ -111,8 +111,10 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       + '否则恶意成员把真人 union 报成 bot 就能继承 bot 信任。所以人侧不命中不是 parity 缺口，而是这条腿的定义。',
   },
   teamMember: {
-    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（CHAT 是其协作群、
-    // MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中 reason:'teamMember'。
+    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（本 bot APP 在其 bots
+    // roster、MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中
+    // reason:'teamMember'。teamMember 腿现在锚在「本 bot ∈ 同队 bots」，不看 chatId，
+    // 所以 CHAT 在不在 groupChatIds 都免 grant（此处仍列 CHAT 是为了 bot 侧的团队拉群腿）。
     //
     // bot 侧同样放行，但走的是**另一条腿**：平台协作群会被镜像成团队拉群
     // （applyPlatformTeamSync → team-groups），故 evaluateBotTalk 经团队拉群腿命中
@@ -122,7 +124,7 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       restricted();
       applyPlatformTeamSync(tempDir, {
         rev: 'rev-1',
-        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [] }],
+        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [{ appId: APP }] }],
       });
     },
     humanMemberUnionId: MEMBER_UNION,
@@ -165,6 +167,17 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
     chatType: 'p2p',
     human: true, bot: false,
     why: 'evaluateBotTalk 不传 chatType → p2pOpen 腿 fail-closed。飞书里 bot 之间不存在私聊，开着只是白扩边界。',
+  },
+  blocked: {
+    // 否决腿（不是放行源）：在 allowedUser 命中之后、其余所有腿之前按 sender open_id 否决。
+    // 这里不布置任何放行腿——open 模式下它仍必须被拒，证明黑名单不依赖限制态；其余
+    // 放行腿 × blocked 的完整优先级矩阵见 test/blocked-users-talk.test.ts。
+    arrange: () => {
+      getBot(APP).resolvedBlockedUsers = [SENDER];
+    },
+    human: false, bot: false,
+    why: 'blocked 是纯增量否决腿：人/bot 同拒（sender open_id 维度，与 union / chat 均无关）；'
+      + 'evaluateBotTalk 独有的团队拉群 chat 维度腿在 reason===\'blocked\' 时也不复活（见 evaluateBotTalk）。',
   },
 };
 

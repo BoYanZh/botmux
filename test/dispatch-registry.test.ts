@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import { recordDispatchRegistryEntry } from '../src/core/dispatch-registry.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
 const registryModuleUrl = pathToFileURL(fileURLToPath(new URL('../src/core/dispatch-registry.ts', import.meta.url))).href;
 
@@ -37,7 +39,10 @@ function spawnWriter(registryPath: string, seed: string, holdMs: number): ChildP
       await new Promise(resolve => setTimeout(resolve, ${holdMs}));
     });
   `;
-  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+  // Node still needs `--import tsx` on top of the eval args because the snippet
+  // imports a repo .ts module; Bun runs TypeScript natively.
+  const { command, prefixArgs } = tsRunnerPrefix();
+  return spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -62,6 +67,57 @@ describe('dispatch registry persistence', () => {
       seed_old: { orchSessionId: 'session-old' },
       seed_new: { orchSessionId: 'session-new' },
     });
+  });
+
+  it('rejects replacing an existing dispatch report binding with another target', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-registry-'));
+    roots.push(root);
+    const registryPath = join(root, 'orchestrate-dispatch.json');
+    const existing = {
+      orchSessionId: 'session-owner',
+      reportBinding: createDispatchReportBinding('secret', {
+        dispatchRoot: 'om_seed',
+        targetLarkAppId: 'cli_owner',
+        targetSessionId: 'session-owner',
+        sourceName: 'owner task',
+        issuedAt: '2026-08-10T00:00:00.000Z',
+      }),
+    };
+    writeFileSync(registryPath, JSON.stringify({ om_seed: existing }));
+
+    await expect(recordDispatchRegistryEntry(registryPath, 'om_seed', {
+      orchSessionId: 'session-attacker',
+      reportBinding: createDispatchReportBinding('secret', {
+        dispatchRoot: 'om_seed',
+        targetLarkAppId: 'cli_owner',
+        targetSessionId: 'session-attacker',
+        sourceName: 'attacker task',
+        issuedAt: '2026-08-10T00:00:01.000Z',
+      }),
+    })).rejects.toThrow('dispatch registry entry already exists');
+
+    expect(JSON.parse(readFileSync(registryPath, 'utf-8'))).toEqual({ om_seed: existing });
+  });
+
+  it('allows an exact idempotent rewrite for the same dispatch report binding', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-registry-'));
+    roots.push(root);
+    const registryPath = join(root, 'orchestrate-dispatch.json');
+    const entry = {
+      orchSessionId: 'session-owner',
+      reportBinding: createDispatchReportBinding('secret', {
+        dispatchRoot: 'om_seed',
+        targetLarkAppId: 'cli_owner',
+        targetSessionId: 'session-owner',
+        sourceName: 'owner task',
+        issuedAt: '2026-08-10T00:00:00.000Z',
+      }),
+    };
+    writeFileSync(registryPath, JSON.stringify({ om_seed: entry }));
+
+    await recordDispatchRegistryEntry(registryPath, 'om_seed', entry);
+
+    expect(JSON.parse(readFileSync(registryPath, 'utf-8'))).toEqual({ om_seed: entry });
   });
 
   it('keeps both seeds when two CLI processes overlap their writes', async () => {

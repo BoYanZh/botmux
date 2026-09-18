@@ -8,6 +8,10 @@ import {
   type ConnectorDefinition,
 } from '../services/connector-store.js';
 import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../services/connector-lifecycle-group-name.js';
+import {
   createWebhookSecret,
   deleteWebhookSecret,
   generateWebhookSecretPlaintext,
@@ -103,21 +107,124 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   return { dedupKey: r.dedupKey.trim() };
 }
 
+function normalizeLifecycleGroupName(
+  value: unknown,
+  prior: ConnectorDefinition['lifecycleGroupName'] | undefined,
+): { ok: true; value?: ConnectorDefinition['lifecycleGroupName'] } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'fixed', 'template'].includes(mode)) {
+    return { ok: false, error: 'bad_lifecycle_group_name_mode' };
+  }
+  if (mode === 'default') return { ok: true };
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: 'lifecycle_group_name_required' };
+  if (Array.from(text).length > CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH) {
+    return { ok: false, error: 'lifecycle_group_name_too_long' };
+  }
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'lifecycle_group_name_template_invalid' };
+  }
+  return { ok: true, value: { mode: mode as 'fixed' | 'template', text } };
+}
+
+/** Inbound idempotency config. Both knobs are optional and the whole object is
+ *  omitted when neither is set, so existing stores stay byte-identical (and
+ *  header/query carriage needs no config at all — it is always honoured). An
+ *  invalid `keyPath` is dropped rather than rejected: the field only ADDS a
+ *  carriage option, so a typo must not make an otherwise-valid connector
+ *  unsavable. Path syntax matches the dedupKey extractor's own grammar. */
+function normalizeIdempotency(v: unknown): ConnectorDefinition['idempotency'] | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const rawPath = typeof r.keyPath === 'string' ? r.keyPath.trim() : '';
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafeSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const keyPath = rawPath && pathPattern.test(rawPath)
+    && (rawPath.startsWith('$.') ? rawPath.slice(2) : rawPath).split('.').every(s => !unsafeSegments.has(s))
+    ? rawPath
+    : undefined;
+  const disabled = r.disabled === true;
+  if (!keyPath && !disabled) return undefined;
+  return { ...(keyPath ? { keyPath } : {}), ...(disabled ? { disabled: true } : {}) };
+}
+
 function normalizeTopicMessage(
   value: unknown,
   prior: ConnectorDefinition['topicMessage'] | undefined,
 ): { ok: true; value: NonNullable<ConnectorDefinition['topicMessage']> } | { ok: false; error: string } {
   const raw = record(value ?? prior);
   const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
-  if (!['default', 'custom', 'none'].includes(mode)) {
+  if (!['default', 'custom', 'template', 'none'].includes(mode)) {
     return { ok: false, error: 'bad_topic_message_mode' };
   }
-  if (mode !== 'custom') return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  if (mode !== 'custom' && mode !== 'template') {
+    return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  }
 
   const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
-  if (!text) return { ok: false, error: 'topic_message_required' };
-  if (Array.from(text).length > 200) return { ok: false, error: 'topic_message_too_long' };
-  return { ok: true, value: { mode: 'custom', text } };
+  if (!text) return { ok: false, error: mode === 'template' ? 'topic_message_template_required' : 'topic_message_required' };
+  if (Array.from(text).length > 200) {
+    return { ok: false, error: mode === 'template' ? 'topic_message_template_too_long' : 'topic_message_too_long' };
+  }
+  if (mode === 'custom') return { ok: true, value: { mode: 'custom', text } };
+
+  const extractorsInput = raw.extractors ?? (prior?.mode === 'template' ? prior.extractors : undefined) ?? {};
+  if (!extractorsInput || typeof extractorsInput !== 'object' || Array.isArray(extractorsInput)) {
+    return { ok: false, error: 'topic_message_template_extractors_invalid' };
+  }
+  const extractorEntries = Object.entries(extractorsInput as Record<string, unknown>);
+  if (extractorEntries.length > 20) return { ok: false, error: 'topic_message_template_extractors_too_many' };
+
+  const extractors: NonNullable<ConnectorDefinition['topicMessage']>['extractors'] = {};
+  const aliasPattern = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafePathSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const validPath = (path: string): boolean => {
+    if (!pathPattern.test(path)) return false;
+    const normalized = path.startsWith('$.') ? path.slice(2) : path;
+    return normalized.split('.').every(segment => !unsafePathSegments.has(segment));
+  };
+
+  for (const [alias, value] of extractorEntries) {
+    if (!aliasPattern.test(alias) || !value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    const extractor = value as Record<string, unknown>;
+    const path = typeof extractor.path === 'string' ? extractor.path.trim() : '';
+    const kind = extractor.kind;
+    const identityPath = typeof extractor.identityPath === 'string' ? extractor.identityPath.trim() : undefined;
+    const namePath = typeof extractor.namePath === 'string' ? extractor.namePath.trim() : undefined;
+    if (!validPath(path) || (kind !== 'text' && kind !== 'mention')) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if (kind === 'text' && (identityPath || namePath)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if ((identityPath && !validPath(identityPath)) || (namePath && !validPath(namePath))) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    extractors[alias] = {
+      path,
+      kind,
+      ...(identityPath ? { identityPath } : {}),
+      ...(namePath ? { namePath } : {}),
+    };
+  }
+
+  const tokenPattern = /{{\s*(?:(mention)\s+)?([A-Za-z][A-Za-z0-9_.-]{0,63})\s*}}/g;
+  const stripped = text.replace(tokenPattern, (_token, mention: string | undefined, alias: string) => {
+    if (alias === 'source') return mention ? '{{invalid}}' : '';
+    const extractor = extractors[alias];
+    if (!extractor) return '{{missing}}';
+    if ((mention ? 'mention' : 'text') !== extractor.kind) return '{{mismatch}}';
+    return '';
+  });
+  if (stripped.includes('{{') || stripped.includes('}}')) {
+    return { ok: false, error: 'topic_message_template_token_invalid' };
+  }
+  return { ok: true, value: { mode: 'template', text, extractors } };
 }
 
 function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
@@ -179,6 +286,10 @@ function normalizeConnectorInput(
       ? (prior?.lifecycleExtractors ?? null)
       : normalizeLifecycleExtractors(c.lifecycleExtractors))
     : null;
+  const lifecycleGroupName = targetMode === 'new-group'
+    ? normalizeLifecycleGroupName(c.lifecycleGroupName, prior?.lifecycleGroupName)
+    : null;
+  if (lifecycleGroupName && !lifecycleGroupName.ok) return lifecycleGroupName;
 
   const secretRef =
     opts.secretRef ||
@@ -246,6 +357,13 @@ function normalizeConnectorInput(
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
     lifecycleExtractors,
+    ...(lifecycleGroupName?.ok && lifecycleGroupName.value ? { lifecycleGroupName: lifecycleGroupName.value } : {}),
+    // Absent in the request → keep whatever the stored connector had (a PATCH
+    // that doesn't mention idempotency must not silently turn it off).
+    ...(() => {
+      const idempotency = c.idempotency === undefined ? prior?.idempotency : normalizeIdempotency(c.idempotency);
+      return idempotency ? { idempotency } : {};
+    })(),
     ...(rateLimitCleared ? {} : rateLimit && Object.keys(rateLimit).length > 0 ? {
       rateLimit: {
         windowSeconds: positiveInt(rateLimit.windowSeconds, prior?.rateLimit?.windowSeconds ?? 60, 1, 86_400),

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
@@ -12,15 +12,229 @@ const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } ca
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
 beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
-function makeEngine(over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0]> = {}) {
+type EngineDependencies = NonNullable<ConstructorParameters<typeof CodexRpcEngine>[1]>;
+
+function makeEngine(
+  over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0]> = {},
+  dependencies?: EngineDependencies,
+) {
   return new CodexRpcEngine({
-    cliBin: FIXTURE, cwd: '/tmp', env: process.env,
+    cliBin: FIXTURE, cwd: tmpdir(), env: process.env,
     sessionId: `test-${Math.round(performance.now())}-${over.sessionId ?? ''}`,
     ...over,
-  });
+  }, dependencies);
 }
+const owner = (turnId: string, dispatchAttempt?: number) => ({
+  turnId,
+  ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+});
+const readonlyOwner = (turnId: string, dispatchAttempt: number) => ({
+  turnId,
+  dispatchAttempt,
+  readonlyContinuation: true as const,
+});
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
+  it('passes exact argv and env to the model-owning app-server through a portable spawn seam', async () => {
+    const launches: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+    const childEnv = { ...process.env, BOTMUX_SESSION_ID: 'rpc-spawn-capture' };
+    const cwd = tmpdir();
+    const engine = makeEngine({
+      cwd,
+      env: childEnv,
+      appServerFeatures: ['feature-a', 'feature-b'],
+      appServerConfig: ['config-a', 'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]'],
+    }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        launches.push({ command, args: [...args], options });
+        return spawn(command, args, options);
+      },
+    });
+    try {
+      await engine.start();
+      expect(launches).toHaveLength(1);
+      expect(launches[0]).toEqual({
+        command: FIXTURE,
+        args: [
+          'app-server',
+          '--enable', 'feature-a',
+          '--enable', 'feature-b',
+          '-c', 'config-a',
+          '-c', 'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]',
+          '--listen', engine.wsUrl,
+        ],
+        options: {
+          cwd,
+          env: childEnv,
+          stdio: ['ignore', 'ignore', 'pipe'],
+          detached: true,
+        },
+      });
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('does not weaken ordinary turns with process-wide multi-agent overrides', async () => {
+    const launches: Array<{ args: string[] }> = [];
+    const engine = makeEngine({ readonlyContinuationHardened: true }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        launches.push({ args: [...args] });
+        return spawn(command, args, options);
+      },
+    });
+    try {
+      await engine.start();
+      expect(launches[0]?.args).not.toContain('features.multi_agent=false');
+      expect(launches[0]?.args).not.toContain('features.multi_agent_v2=false');
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('uses turn-scoped read-only restrictions without changing thread capability selections', async () => {
+    const turnFile = join(tmpdir(), `fake-turn-cfg-${Math.round(performance.now())}.jsonl`);
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: { ...process.env, FAKE_TURN_CONFIG_FILE: turnFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('continue safely', readonlyOwner('readonly-1', 1));
+    await engine.sendTurn('ordinary user turn', owner('ordinary-2', 2));
+    engine.stop();
+    const turns = readFileSync(turnFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    rmSync(turnFile, { force: true });
+    expect(turns[0]).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      environments: [],
+      runtimeWorkspaceRoots: [],
+    });
+    expect(turns[0].capabilities).toBeUndefined();
+    expect(turns[0].multiAgentMode).toBeUndefined();
+    expect(turns[1]).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+    expect(turns[1].environments).toBeUndefined();
+    expect(turns[1].runtimeWorkspaceRoots).toBeUndefined();
+    expect(turns[1].capabilities).toBeUndefined();
+    expect(turns[1].multiAgentMode).toBeUndefined();
+  }, 20_000);
+
+  it('fails capability proof closed for provider tools, external MCP, enabled tool skills, or unhardened runtime', async () => {
+    const unhardened = makeEngine();
+    expect(await unhardened.checkReadonlyContinuationCapabilities()).toEqual({
+      ok: false, reason: 'readonly_continuation_runtime_not_hardened',
+    });
+    unhardened.stop();
+
+    for (const [env, reason] of [
+      [{ FAKE_PROVIDER_CAPABILITY: 'web-search' }, 'readonly_continuation_provider_external_capability'],
+      [{ FAKE_PROVIDER_CAPABILITY: 'image-generation' }, 'readonly_continuation_provider_external_capability'],
+      [{ FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'future-enabled' }, 'readonly_continuation_provider_external_capability'],
+      [{ FAKE_MCP_CAPABILITY: 'tools' }, 'readonly_continuation_external_mcp_capability'],
+      [{ FAKE_MCP_CAPABILITY: 'empty' }, 'readonly_continuation_external_mcp_capability'],
+      [{ FAKE_SKILL_TOOL_DEPENDENCY: '1' }, 'readonly_continuation_skill_tool_dependency'],
+    ] as const) {
+      const engine = makeEngine({
+        readonlyContinuationHardened: true,
+        env: { ...process.env, ...env },
+      });
+      await engine.start();
+      await engine.startThread();
+      expect(await engine.checkReadonlyContinuationCapabilities()).toEqual({ ok: false, reason });
+      engine.stop();
+    }
+
+    const eligible = makeEngine({ readonlyContinuationHardened: true });
+    await eligible.start();
+    await eligible.startThread();
+    expect(await eligible.checkReadonlyContinuationCapabilities()).toEqual({ ok: true });
+    eligible.stop();
+  }, 20_000);
+
+  it.each([
+    { FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'missing-field' },
+    { FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'malformed-field' },
+    { FAKE_MCP_RESPONSE: 'missing-data' },
+    { FAKE_MCP_RESPONSE: 'malformed-data' },
+    { FAKE_MCP_RESPONSE: 'malformed-cursor' },
+    { FAKE_SKILLS_RESPONSE: 'missing-data' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-data' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-entry' },
+    { FAKE_SKILLS_RESPONSE: 'errors' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-skill' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-dependencies' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-tool-dependency' },
+  ])('fails malformed capability inventory closed: %o', async env => {
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: { ...process.env, ...env },
+    });
+    try {
+      await engine.start();
+      await engine.startThread();
+      expect(await engine.checkReadonlyContinuationCapabilities()).toEqual({
+        ok: false, reason: 'readonly_continuation_capability_probe_failed',
+      });
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('fails every restricted server request closed even when it precedes turn/start ack', async () => {
+    const methods = [
+      'item/commandExecution/requestApproval',
+      'item/fileChange/requestApproval',
+      'execCommandApproval',
+      'applyPatchApproval',
+      'mcpServer/elicitation/request',
+      'item/tool/call',
+      'item/tool/requestUserInput',
+      'item/permissions/requestApproval',
+      'future/unknown/request',
+    ];
+    const responseFile = join(tmpdir(), `fake-server-response-${Math.round(performance.now())}.jsonl`);
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: {
+        ...process.env,
+        FAKE_SERVER_REQUEST_METHODS: methods.join(','),
+        FAKE_SERVER_RESPONSE_FILE: responseFile,
+      },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    for (let index = 0; index < methods.length; index++) {
+      await engine.sendTurn(`restricted ${index}`, readonlyOwner(`restricted-${index}`, index + 1));
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+    engine.stop();
+    const responses = readFileSync(responseFile, 'utf8').trim().split('\n')
+      .filter(Boolean).map(line => JSON.parse(line));
+    rmSync(responseFile, { force: true });
+    expect(responses.map(response => response.result ?? response.error)).toEqual([
+      { decision: 'cancel' },
+      { decision: 'cancel' },
+      { decision: 'abort' },
+      { decision: 'abort' },
+      { action: 'cancel', content: null, _meta: null },
+      { contentItems: [], success: false },
+      // requestUserInput is cancelled by turn/interrupt without a direct reply.
+      { code: -32000, message: 'server request denied in read-only continuation: item/permissions/requestApproval' },
+      { code: -32000, message: 'server request denied in read-only continuation: future/unknown/request' },
+    ]);
+    expect(terminals).toHaveLength(methods.length);
+    expect(terminals.every(terminal => terminal.status === 'aborted')).toBe(true);
+    expect((engine as any).readonlyNativeTurns.size).toBe(0);
+    expect((engine as any).pendingReadonlyTurnOwners.size).toBe(0);
+    expect((engine as any).deferredPreResponseServerRequests.size).toBe(0);
+  }, 20_000);
+
   it('start (spawn → /readyz → connect → initialize) then startThread → sendTurn → stop', async () => {
     const engine = makeEngine();
     await engine.start();
@@ -28,7 +242,8 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(tid).toBe('thread-fake-1');
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
-    await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await expect(engine.sendTurn('hello world', owner('turn-1', 1)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
     await engine.waitForThreadPreview();
     await engine.setThreadName('[BotMux·Lark] hello world');
     engine.stop();
@@ -59,15 +274,15 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   }, 20_000);
 
-  it('forwards model + reasoningEffort (xhigh verbatim) into thread/start config', async () => {
+  it('forwards model + reasoningEffort (ultra verbatim) into thread/start config', async () => {
     // Guards the PR-A consumption gap codex caught: the engine must actually put
-    // model + model_reasoning_effort on thread/start config, and xhigh must NOT
-    // be downgraded (codex 0.145 accepts it).
+    // model + model_reasoning_effort on thread/start config, and the new highest
+    // menu value must not be downgraded.
     const cfgFile = join(tmpdir(), `fake-thread-cfg-${Math.round(performance.now())}.json`);
     const engine = makeEngine({
       sessionId: 'effort-wiring',
       model: 'gpt-5.6-terra',
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'ultra',
       env: { ...process.env, FAKE_THREAD_CONFIG_FILE: cfgFile },
     });
     await engine.start();
@@ -76,7 +291,27 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const params = JSON.parse(readFileSync(cfgFile, 'utf8'));
     rmSync(cfgFile, { force: true });
     expect(params.config?.model).toBe('gpt-5.6-terra');
-    expect(params.config?.model_reasoning_effort).toBe('xhigh');
+    expect(params.config?.model_reasoning_effort).toBe('ultra');
+  }, 20_000);
+
+  it('forwards backend variant on fresh thread/start and suppresses it on resume', async () => {
+    const startFile = join(tmpdir(), `fake-variant-start-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-variant-resume-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'variant-wiring',
+      modelBackendVariant: 'max',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    expect(startParams.config?.model_backend_variant).toBe('max');
+    expect(resumeParams.config?.model_backend_variant).toBeUndefined();
   }, 20_000);
 
   it('SUPPRESSES model + reasoningEffort on thread/resume (start keeps both) — no resume drift', async () => {
@@ -199,7 +434,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     });
     await engine.start();
     await engine.startThread();
-    await engine.sendTurn('ask me');
+    await engine.sendTurn('ask me', owner('request-user-input', 1));
     await receivedPromise;
     expect(received).toMatchObject({
       questions: [{ id: 'choice', question: 'Continue?' }],
@@ -225,7 +460,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.startThread();
     // turn/start resolves (interrupted), so sendTurn does not throw here; the
     // point is that the turn was stopped, not silently completed.
-    await engine.sendTurn('ask me');
+    await engine.sendTurn('ask me', owner('request-user-input-rejected', 1));
     // Give the async interrupt round-trip a moment to log its result.
     await new Promise(resolve => setTimeout(resolve, 200));
     expect(logs.some(l => l.includes('interrupting turn'))).toBe(true);
@@ -249,9 +484,99 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.startThread();
     // failAll rejects the still-pending turn/start, so sendTurn rejects here —
     // that is the visible failure, not a silent hang. We only care that onDead fired.
-    await engine.sendTurn('ask me').catch(() => {});
+    await engine.sendTurn('ask me', owner('request-user-input-interrupt-failed', 1)).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(deadCount).toBe(1);
+    engine.stop();
+  }, 20_000);
+
+  it('maps an ultra-fast turn/completed to the exact Botmux attempt', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-map',
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('fast', owner('botmux-fast', 7));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'botmux-fast', dispatchAttempt: 7 },
+      nativeTurnId: 'turn-fake-1',
+      status: 'completed',
+    })]);
+    engine.stop();
+  }, 20_000);
+
+  it('maps turn/completed that arrives before turn/start response without resurrecting the turn', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-before-response',
+      env: { ...process.env, FAKE_TERMINAL_BEFORE_RESPONSE: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('fastest', owner('before-response', 8)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'before-response', dispatchAttempt: 8 },
+      nativeTurnId: 'turn-fake-1',
+      status: 'completed',
+    })]);
+
+    // If response binding resurrected the already-terminal native id, stop()
+    // would attempt another terminal callback. Native-terminal de-dupe masks
+    // that callback, so assert the internal active ownership is actually empty.
+    expect((engine as any).turnOwners.size).toBe(0);
+    engine.stop();
+  }, 20_000);
+
+  it('deduplicates duplicate native terminal notifications', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'duplicate-terminal',
+      env: { ...process.env, FAKE_DUPLICATE_TERMINAL: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('once', owner('dedupe', 9));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toEqual(expect.objectContaining({
+      identity: { turnId: 'dedupe', dispatchAttempt: 9 },
+      status: 'completed',
+    }));
+    engine.stop();
+  }, 20_000);
+
+  it('keeps the first terminal buffered for an unowned native turn', () => {
+    const engine = makeEngine({ sessionId: 'unowned-first-terminal-wins' });
+    (engine as any).emitTurnTerminal('unowned-native', 'failed', 'first_failure');
+    (engine as any).emitTurnTerminal('unowned-native', 'completed');
+    expect((engine as any).deferredUnownedTerminals.get('unowned-native')).toEqual({
+      status: 'failed',
+      errorCode: 'first_failure',
+    });
+    engine.stop();
+  });
+
+  it('keeps sequential resume/typeahead attempts isolated by native turn id', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-sequential',
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.resumeThread('thread-persisted');
+    await engine.sendTurn('one', owner('same-logical', 1));
+    await engine.sendTurn('two', owner('same-logical', 2));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals.map(t => [t.nativeTurnId, t.identity.dispatchAttempt])).toEqual([
+      ['turn-fake-1', 1],
+      ['turn-fake-2', 2],
+    ]);
     engine.stop();
   }, 20_000);
 });
@@ -267,8 +592,49 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     });
     await engine.start();
     await engine.startThread();
-    await expect(engine.sendTurn('never answered')).rejects.toThrow(/timed out/);
+    await expect(engine.sendTurn('never answered', owner('turn-hang', 1))).rejects.toThrow(/timed out/);
     expect(deadCount).toBe(1); // failAll → onDead exactly once
+    engine.stop();
+  }, 20_000);
+
+  it('does not guess a lost follow-up response from an unowned native terminal', async () => {
+    let deadCount = 0;
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'followup-lost-ack-terminal',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+      },
+      requestTimeoutMs: 400,
+      onDead: () => { deadCount++; },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('completed despite lost ack', owner('followup-proof', 4)))
+      .rejects.toThrow(/timed out/);
+    expect(deadCount).toBe(1);
+    expect(terminals).toEqual([]);
+    engine.stop();
+  }, 20_000);
+
+  it('does not bind an unrelated pre-response turn/started when the request response rejects', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'followup-response-error-after-started',
+      env: { ...process.env, FAKE_ERROR_AFTER_STARTED: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('started before response error', owner('started-proof', 5)))
+      .rejects.toThrow(/fake response failure/);
+    expect((engine as any).turnOwners.size).toBe(0);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(terminals).toEqual([]);
+    expect((engine as any).turnOwners.size).toBe(0);
     engine.stop();
   }, 20_000);
 
@@ -311,8 +677,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     const engine = makeEngine({ sessionId: 'first-ok' });
     await engine.start();
     await engine.startThread();
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => { probed = true; return false; });
-    expect(outcome).toBe('accepted');
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => { probed = true; return false; });
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: 'turn-fake-1' });
     expect(probed).toBe(false); // ack answered → no need to consult the rollout
     engine.stop();
   }, 20_000);
@@ -322,8 +688,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await engine.start();
     await engine.startThread();
     (engine as any).ws = undefined; // simulate ws not open → send() throws before the frame leaves
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => true);
-    expect(outcome).toBe('not-sent');
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => true);
+    expect(outcome).toEqual({ outcome: 'not-sent' });
     engine.stop();
   }, 20_000);
 
@@ -332,8 +698,102 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await engine.start();
     await engine.startThread();
     // frame dispatched, no ack within 400ms, but the rollout shows the user turn.
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => true);
-    expect(outcome).toBe('accepted'); // positive evidence → never resend
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => true);
+    expect(outcome).toEqual({ outcome: 'accepted' }); // positive evidence → never resend
+    engine.stop();
+  }, 20_000);
+
+  it('uses rollout evidence, not a sole pending request, when first-turn response is lost', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'first-lost-ack-native',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+      },
+      requestTimeoutMs: 400,
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('first-native', 3),
+      async () => true,
+    );
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: undefined });
+    expect(terminals).toEqual([]);
+    engine.stop();
+  }, 20_000);
+
+  it('does not treat an uncorrelated turn/started as first-turn delivery evidence', async () => {
+    let probed = false;
+    const engine = makeEngine({
+      sessionId: 'first-lost-ack-started',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+        FAKE_NO_TURN_TERMINAL: '1',
+      },
+      requestTimeoutMs: 400,
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('first-started', 5),
+      async () => { probed = true; return false; },
+    );
+    expect(outcome).toEqual({ outcome: 'ambiguous' });
+    expect(probed).toBe(true);
+    engine.stop();
+  }, 20_000);
+
+  it.each([
+    ['aborted', 'aborted', undefined],
+    ['failed', 'failed', 'fake_failed'],
+  ] as const)('maps native %s completion to worker terminal %s', async (nativeStatus, expectedStatus, errorCode) => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: `terminal-${nativeStatus}`,
+      env: { ...process.env, FAKE_TURN_STATUS: nativeStatus },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn(nativeStatus, owner(`turn-${nativeStatus}`, 6));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: `turn-${nativeStatus}`, dispatchAttempt: 6 },
+      status: expectedStatus,
+      ...(errorCode ? { errorCode } : {}),
+    })]);
+    engine.stop();
+  }, 20_000);
+
+  it('recognises the exact output-limit message even when a generic code is also present', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-output-limit',
+      env: {
+        ...process.env,
+        FAKE_TURN_STATUS: 'failed',
+        FAKE_TURN_ERROR_CODE: 'generic_turn_failed',
+        FAKE_TURN_ERROR_MESSAGE: 'model output limit exceeded: max_output_tokens',
+      },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('output limit', owner('turn-output-limit', 7));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'turn-output-limit', dispatchAttempt: 7 },
+      status: 'failed',
+      errorCode: 'codex_output_limit_exceeded',
+    })]);
     engine.stop();
   }, 20_000);
 
@@ -341,8 +801,25 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     const engine = makeEngine({ sessionId: 'first-amb', env: { ...process.env, FAKE_HANG_TURN: '1' }, requestTimeoutMs: 400 });
     await engine.start();
     await engine.startThread();
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => false);
-    expect(outcome).toBe('ambiguous'); // absence of evidence stays ambiguous → 0 auto-paste
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => false);
+    expect(outcome).toEqual({ outcome: 'ambiguous' }); // absence of evidence stays ambiguous → 0 auto-paste
+    engine.stop();
+  }, 20_000);
+
+  it('P1-1 sendFirstTurn: rollout probe failure stays ambiguous instead of falling back to paste', async () => {
+    const engine = makeEngine({
+      sessionId: 'first-probe-error',
+      env: { ...process.env, FAKE_HANG_TURN: '1' },
+      requestTimeoutMs: 400,
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('turn-probe-error', 2),
+      async () => { throw new Error('rollout unavailable'); },
+    );
+    expect(outcome).toEqual({ outcome: 'ambiguous' });
     engine.stop();
   }, 20_000);
 
@@ -371,5 +848,43 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
     await new Promise((r) => setTimeout(r, 300));
     expect(dead).toBe(false);
+  }, 20_000);
+
+  it('stop releases every still-active native turn with its exact owner', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'stop-active',
+      env: { ...process.env, FAKE_NO_TURN_TERMINAL: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('keep running', owner('active-stop', 11));
+    engine.stop();
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'active-stop', dispatchAttempt: 11 },
+      status: 'stopped',
+      errorCode: 'rpc_engine_stopped',
+    })]);
+  }, 20_000);
+
+  it('engine death releases every still-active native turn before onDead recovery', async () => {
+    const order: string[] = [];
+    const engine = makeEngine({
+      sessionId: 'death-active',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_DIE_AFTER_MS: '600',
+      },
+      onTurnTerminal: terminal => order.push(`terminal:${terminal.identity.turnId}:${terminal.status}`),
+      onDead: () => order.push('dead'),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('active on crash', owner('active-dead', 12));
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    expect(order).toEqual(['terminal:active-dead:engine-dead', 'dead']);
+    engine.stop();
   }, 20_000);
 });

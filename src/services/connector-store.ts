@@ -6,7 +6,19 @@ import { config } from '../config.js';
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
-export type ConnectorTopicMessageMode = 'default' | 'custom' | 'none';
+export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
+export type ConnectorLifecycleGroupNameMode = 'default' | 'fixed' | 'template';
+
+export interface ConnectorTopicMessageExtractor {
+  path: string;
+  kind: 'text' | 'mention';
+  /** Relative path within each extracted mention object. Omit when the
+   *  extracted value itself is the identity string. */
+  identityPath?: string;
+  /** Optional relative path for the display name used inside/fallback from a
+   *  native Lark mention. */
+  namePath?: string;
+}
 
 export interface ConnectorDefinition {
   id: string;
@@ -46,6 +58,9 @@ export interface ConnectorDefinition {
     mode: ConnectorTopicMessageMode;
     /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
     text?: string;
+    /** Connector-owner allowlist used only by `template` mode. Aliases become
+     *  `{{alias}}` or `{{mention alias}}` tokens in `text`. */
+    extractors?: Record<string, ConnectorTopicMessageExtractor>;
   };
   /** When true, the daemon drops the trailing final_output reply for turns this
    *  webhook fires (the live streaming card / start notice still show). Lets a
@@ -62,6 +77,30 @@ export interface ConnectorDefinition {
   // = events whose payload yields the same value at `dedupKey` share one group.
   lifecycleExtractors: null | {
     dedupKey: string;
+  };
+  /** Feishu chat name for `target.mode === 'new-group'`. Missing means the
+   *  historical default: `<connector name>: <dedup key or request id>`. */
+  lifecycleGroupName?: {
+    mode: ConnectorLifecycleGroupNameMode;
+    /** Fixed name, or a template using `{{source}}`, `{{dedupKey}}`,
+     *  `{{requestId}}`, or JSON body paths such as `{{alert.title}}`. */
+    text?: string;
+  };
+  /** Inbound duplicate-delivery suppression for an at-least-once upstream.
+   *
+   *  Header/query carriage needs NO config — a key presented by the sender is
+   *  always honoured (sending it IS the declaration that the delivery is
+   *  uniquely identified), which is what makes this fix land on existing
+   *  connectors without an edit. These two knobs only cover what can't be
+   *  inferred:
+   *  - `keyPath`: dotted body path for senders that can't set a header (they can
+   *    only paste a URL), so the unique id lives inside the event JSON.
+   *  - `disabled`: escape hatch for an upstream that reuses one id across
+   *    genuinely distinct events, where suppression would lose real events.
+   *  Absent (older stores) = header/query honoured, no body path. */
+  idempotency?: {
+    keyPath?: string;
+    disabled?: boolean;
   };
   rateLimit?: {
     windowSeconds: number;

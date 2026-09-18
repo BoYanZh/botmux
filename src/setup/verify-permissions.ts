@@ -76,6 +76,29 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
   { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
+  // 「话题群新话题自动开工」(autoStartOnNewTopic) 要覆盖到「其他机器人开的新话题」时，
+  // 飞书只有开了这个 scope 才会把「其他用户和机器人发送的、未 @ 本 bot 的群消息」推到
+  // WSClient（官方 im.message.receive_v1 文档：「接收群聊中所有用户和其他机器人发送的
+  // 消息」= im:message.group_msg.include_bot:read；im:message.group_msg 只含用户、不含
+  // 机器人）。它是 opt-in 特性专用，故标 non-critical：没开该功能的 bot 缺它不该被启动
+  // 自检 DM 打扰；只有当同时缺别的 critical 项时才顺带在提示里列出。开了功能却缺它 →
+  // bot 开的新话题收不到事件、自动开工静默不触发（预期降级，非崩溃）。
+  { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
+  // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
+  // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
+  // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
+  // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
+  { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
+  { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
+  { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
+  { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
+  // `botmux send --urgent[=app|sms|phone]`. Keep these non-critical: ordinary
+  // messaging must continue when a tenant declines disruptive/quota-bearing
+  // Buzz channels. New apps import them from the default manifest; existing
+  // apps are silently topped up from the cached Open Platform session.
+  { name: 'im:message.urgent', desc: '应用内加急消息', critical: false },
+  { name: 'im:message.urgent:sms', desc: '短信加急消息（消耗租户额度）', critical: false },
+  { name: 'im:message.urgent:phone', desc: '电话加急消息（消耗租户额度）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 
@@ -456,9 +479,14 @@ export async function applyScopesUnverified(
 
 /**
  * setup 后 "还要手动点的步骤" 结构化数据. 跟 cli.ts 的 printRemainingSteps + README
- * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 按需重定向 URL); PersonalAgent
+ * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 重定向 URL); PersonalAgent
  * 应用默认订阅事件 + bot 能力, 不在主线提示, 收不到消息时见 README 的 fallback
  * 自查清单.
+ *
+ * 重定向 URL 曾被写成 "按需, 可跳过" —— 那是误导. 群聊模式 (p2pMode=group)、
+ * 会话群标签 (feed-group) 和 /login 都要走 OAuth 拿用户 token, 白名单里没有回调
+ * 地址时 authorize 直接报 20029, 用户连飞书授权页都打不开. 只有纯话题模式且从不
+ * 用 /login 才真的用不上它.
  */
 export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): RemainingStep[] {
   return [
@@ -469,8 +497,48 @@ export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): Rem
     },
     {
       title:
-        '添加重定向 URL http://127.0.0.1:9768/callback (按需, 用于 botmux 内 /login 跨用户调 API)',
+        `添加重定向 URL ${remainingStepRedirectUrls().join(' 和 ')} `
+        + '(群聊模式 p2pMode=group / 会话群标签 feed-group / /login 必需, 用于跨用户调 API; 缺了会报 20029)',
       url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
     },
   ];
+}
+
+/**
+ * 提示里要让用户填的重定向 URL 实际列表。
+ *
+ * 写死 `http://127.0.0.1:9768/callback` 会误导：配了 `oauthRedirectBase` / 接了中心
+ * 平台 / 自建反代的机器，真正发起授权用的是 `<base>/oauth/callback`，只填 loopback
+ * 那条照样 20029。
+ *
+ * ⚠️ 这里必须用**动态 import**，不能在文件头静态 import：
+ * `open-platform-automation.ts` 反过来 import 本模块的 `VC_MEETING_BOT_EVENTS`，
+ * 而且是在它自己的**模块顶层 const 初始化**里用。静态互引会让「先加载
+ * verify-permissions」的入口在对方模块体执行时撞上 TDZ（`Cannot access
+ * 'VC_MEETING_BOT_EVENTS' before initialization`）而整个进程起不来。
+ *
+ * `buildRemainingSteps` 是同步函数（onboarding 落终态时直接调），所以用同步可用的
+ * 已加载模块缓存：`automateOpenPlatformSetup` 这条链路一定先加载过对方模块，缓存
+ * 就有值；缓存没命中（例如 dashboard 在没跑过自动化的上下文里落 remainingSteps）
+ * 就回落到 loopback 单条 —— 保守但绝不炸。
+ */
+function remainingStepRedirectUrls(): string[] {
+  try {
+    const urls = loadedCollectBotmuxRedirectUrls?.();
+    if (urls && urls.length > 0) return urls;
+  } catch { /* 配置读不动：回落到最核心的那一条 */ }
+  return [DEFAULT_BOTMUX_REDIRECT_URL];
+}
+
+const DEFAULT_BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
+
+/** 由 {@link registerBotmuxRedirectUrlCollector} 注入，见上方注释解释为何不能静态 import。 */
+let loadedCollectBotmuxRedirectUrls: (() => string[]) | undefined;
+
+/**
+ * 让 `open-platform-automation.ts` 在自己加载完成后把 `collectBotmuxRedirectUrls`
+ * 注册进来。单向依赖（automation → verify-permissions）保持不变，不引入新的环。
+ */
+export function registerBotmuxRedirectUrlCollector(collect: () => string[]): void {
+  loadedCollectBotmuxRedirectUrls = collect;
 }

@@ -6,8 +6,19 @@
  * platform-sensitive bits (PATH delimiter, Windows `.cmd` wrapper) live in one
  * pure, unit-tested place instead of being duplicated as inline string concat.
  */
+import { realpathSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
+
+const BOTMUX_WRAPPER_BASENAME = 'botmux';
+const NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME = 'botmux-native-subagent-runtime-hook';
+
+function wrapperFilename(
+  basenameWithoutExtension: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32' ? `${basenameWithoutExtension}.cmd` : basenameWithoutExtension;
+}
 
 /**
  * SINGLE SOURCE OF TRUTH for the `botmux` wrapper bin dir (codex P1). The daemon
@@ -31,6 +42,33 @@ export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env)
     return join(env.SESSION_DATA_DIR, 'bin');
   }
   return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
+}
+
+/**
+ * Stable daemon-updated wrapper path. Derive it from the same single source of
+ * truth used by daemon.writePidFile(), including the dedicated core-only bin.
+ * Canonicalize the directory so a symlinked lexical HOME still lands on the path
+ * that a full bwrap session actually binds. BOTMUX_BIN_PATH is an MCP gateway
+ * override, not a wrapper-write location, and therefore is intentionally ignored.
+ */
+export function resolveStableBotmuxWrapperPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const lexicalDir = resolveBotmuxWrapperBinDir(env);
+  let canonicalDir = lexicalDir;
+  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
+  return join(canonicalDir, wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform));
+}
+
+export function resolveNativeSubagentRuntimeHookWrapperPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const lexicalDir = resolveBotmuxWrapperBinDir(env);
+  let canonicalDir = lexicalDir;
+  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
+  return join(canonicalDir, wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform));
 }
 
 /**
@@ -58,22 +96,97 @@ export interface BotmuxWrapperFile {
  * The wrapper files to materialize in ~/.botmux/bin. Always a POSIX `sh`
  * wrapper (used by macOS/Linux and Git Bash/WSL); on Windows additionally a
  * `botmux.cmd` so native shells (cmd.exe / PowerShell) resolve `botmux` —
- * without it `botmux send` from a Windows-native CLI session fails. The `.cmd`
- * pins the daemon's current Node binary so it never depends on a PATH-resolved
- * `node`. Both wrappers point at THIS daemon's dist/cli.js.
+ * without it `botmux send` from a Windows-native CLI session fails. BOTH the `sh`
+ * and `.cmd` wrappers pin the daemon's current interpreter (`process.execPath`)
+ * so neither depends on a PATH-resolved `node` — see the pinning note in the
+ * function body for the outage that proved the bare name unsafe. Both wrappers
+ * point at THIS daemon's dist/cli.js.
+ *
+ * ⚠️ COMPILED-BINARY MODE (`standalone: true`) — do not collapse these branches.
+ * Under a `bun build --compile` executable there is no `cli.js` on disk: the
+ * module graph lives in the virtual, process-private `/$bunfs/` root, so
+ * `__dirname` is `/$bunfs/root` and `cliScript` is `/$bunfs/root/cli.js`. Emitting
+ * the Node form there produced a wrapper that was broken three ways over, and it
+ * shipped: (1) the path does not exist outside the process; (2) it re-introduces a
+ * hard `node` dependency, defeating the entire point of the self-contained binary;
+ * and (3) `sh` expands the unescaped `$bunfs` inside the double quotes to the empty
+ * string, so the wrapper actually resolved `//root/cli.js` — not even the literal
+ * path. Worse, install.sh puts the BINARY at `~/.botmux/bin/botmux`, the very path
+ * this wrapper targets, so writing it overwrote the running executable (verified:
+ * a 94,582,912-byte ELF replaced by a 47-byte script, inode changed).
+ *
+ * The compiled form instead re-execs the binary itself, forwarding the user's
+ * arguments verbatim. No hidden subcommand is involved: the compiled binary's
+ * normal CLI dispatch already handles ordinary commands (`send`, `schedule`, …) —
+ * the `__daemon`/`__worker`/… tokens exist only so internal spawners can reach
+ * entry modules that have no `dist/*.js` on disk (see src/cli.ts's entry-token
+ * block and src/core/self-spawn.ts). `exec` replaces the shell, so signals and
+ * exit codes pass through unchanged.
  */
 export function botmuxWrapperFiles(
   cliScript: string,
   nodePath: string,
   platform: NodeJS.Platform = process.platform,
+  standalone = false,
 ): BotmuxWrapperFile[] {
+  // Compiled binary: `exec <the binary> "$@"`. `binaryPath` is process.execPath —
+  // the real on-disk executable, NOT a /$bunfs/ path.
+  if (standalone) {
+    const binaryPath = nodePath;
+    const files: BotmuxWrapperFile[] = [
+      { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec "${binaryPath}" "$@"\n`, mode: 0o755 },
+      {
+        name: NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME,
+        content: `#!/bin/sh\nexec "${binaryPath}" native-subagent-runtime-hook "$@"\n`,
+        mode: 0o755,
+      },
+    ];
+    if (platform === 'win32') {
+      files.push({
+        name: wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform),
+        content: `@echo off\r\n"${binaryPath}" %*\r\n`,
+        mode: 0o755,
+      });
+      files.push({
+        name: wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform),
+        content: `@echo off\r\n"${binaryPath}" native-subagent-runtime-hook %*\r\n`,
+        mode: 0o755,
+      });
+    }
+    return files;
+  }
+  // Pin the interpreter to THIS daemon's own `process.execPath` instead of a bare
+  // `node`. A bare name is resolved by PATH at exec time, in whatever environment
+  // happens to invoke the wrapper — which is NOT the environment that wrote it.
+  // MEASURED failure (2026-09-08): a restart whose PATH put /usr/bin ahead of the
+  // fnm shims resolved `node` to v18.20.4, which has no `node:sqlite`; the session
+  // store's hard gate then killed all 55 bot daemons at boot (10 restarts each,
+  // then parked `errored`), and every Lark topic looked wiped even though all 57
+  // SQLite stores were intact. The supervisor survived, so it reported success
+  // while every child died. Pinning removes the PATH variable entirely: the
+  // interpreter that wrote the wrapper is the one that runs it.
+  //
+  // This also makes Bun a first-class host: under `bun dist/cli.js` execPath is
+  // the bun binary, and Bun runs dist/*.js plus provides bun:sqlite, so the very
+  // same wrapper shape works with no runtime-specific branch here.
+  const interpreter = nodePath;
   const files: BotmuxWrapperFile[] = [
-    { name: 'botmux', content: `#!/bin/sh\nexec node "${cliScript}" "$@"\n`, mode: 0o755 },
+    { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec "${interpreter}" "${cliScript}" "$@"\n`, mode: 0o755 },
+    {
+      name: NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME,
+      content: `#!/bin/sh\nexec "${interpreter}" "${cliScript}" native-subagent-runtime-hook "$@"\n`,
+      mode: 0o755,
+    },
   ];
   if (platform === 'win32') {
     files.push({
-      name: 'botmux.cmd',
+      name: wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform),
       content: `@echo off\r\n"${nodePath}" "${cliScript}" %*\r\n`,
+      mode: 0o755,
+    });
+    files.push({
+      name: wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform),
+      content: `@echo off\r\n"${nodePath}" "${cliScript}" native-subagent-runtime-hook %*\r\n`,
       mode: 0o755,
     });
   }

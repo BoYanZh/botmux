@@ -10,13 +10,31 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Mock @larksuiteoapi/node-sdk — we don't want real Lark connections.
 // The Client constructor just stores whatever it receives.
 vi.mock('@larksuiteoapi/node-sdk', () => {
+  // Mirror the real SDK's separable http instance so the upload-client path is
+  // exercised (create() → own instance + copyable interceptor registry).
+  const makeInstance = (): any => ({
+    defaults: { timeout: 0 },
+    create: (cfg: { timeout?: number }) => {
+      const inst = makeInstance();
+      if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
+      return inst;
+    },
+    interceptors: {
+      request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+      response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+    },
+  });
+  const sharedDefault = makeInstance();
   class FakeClient {
     opts: Record<string, unknown>;
+    httpInstance: any;
     constructor(opts: Record<string, unknown>) {
       this.opts = opts;
+      // Real Client: `params.httpInstance || defaultHttpInstance`.
+      this.httpInstance = (opts?.httpInstance as any) ?? sharedDefault;
     }
   }
-  return { Client: FakeClient };
+  return { Client: FakeClient, defaultHttpInstance: sharedDefault };
 });
 
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
@@ -61,6 +79,61 @@ describe('registerBot', () => {
     const cfg = makeCfg();
     const state = mod.registerBot(cfg);
     expect(state.config).toBe(cfg);
+    expect(state.nativeSubagentRuntimeState).toEqual({ status: 'absent' });
+  });
+
+  it('normalizes direct registrations into one authoritative native-subagent snapshot', () => {
+    const valid = mod.registerBot(makeCfg({
+      larkAppId: 'direct-valid',
+      cliId: 'traex',
+      nativeSubagentRuntime: { model: { mode: 'custom', value: '  GPT-5.6-Sol  ' } },
+    }) as any);
+    expect(valid.config.nativeSubagentRuntime).toEqual({
+      model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+    });
+    expect(valid.nativeSubagentRuntimeState).toEqual({
+      status: 'valid',
+      policy: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
+    });
+
+    const invalid = mod.registerBot(makeCfg({
+      larkAppId: 'direct-invalid',
+      cliId: 'traex',
+      nativeSubagentRuntime: { reasoningEffort: { mode: 'custom', value: 'impossible' } },
+    }) as any);
+    expect(invalid.config.nativeSubagentRuntime).toBeUndefined();
+    expect(invalid.nativeSubagentRuntimeState).toEqual({ status: 'invalid' });
+  });
+
+  it('keeps invalid provenance when the same direct config object is registered again', () => {
+    const cfg = makeCfg({
+      larkAppId: 'direct-invalid-repeat',
+      cliId: 'traex',
+      nativeSubagentRuntime: { reasoningEffort: { mode: 'custom', value: 'impossible' } },
+    }) as any;
+
+    expect(mod.registerBot(cfg).nativeSubagentRuntimeState).toEqual({ status: 'invalid' });
+    expect(mod.registerBot(cfg).nativeSubagentRuntimeState).toEqual({ status: 'invalid' });
+  });
+
+  it('publishes live policy and metadata together through the narrow registry updater', () => {
+    const state = mod.registerBot(makeCfg({ larkAppId: 'live-policy', cliId: 'traex' }) as any);
+
+    mod.updateBotNativeSubagentRuntime('live-policy', {
+      status: 'valid',
+      policy: { model: { mode: 'custom', value: '  GPT-5.5  ' } },
+    });
+    expect(state.config.nativeSubagentRuntime).toEqual({
+      model: { mode: 'custom', value: 'GPT-5.5' },
+    });
+    expect(state.nativeSubagentRuntimeState).toEqual({
+      status: 'valid',
+      policy: { model: { mode: 'custom', value: 'GPT-5.5' } },
+    });
+
+    mod.updateBotNativeSubagentRuntime('live-policy', { status: 'absent' });
+    expect(state.config.nativeSubagentRuntime).toBeUndefined();
+    expect(state.nativeSubagentRuntimeState).toEqual({ status: 'absent' });
   });
 
   it('should create a Lark Client with appId and appSecret', () => {
@@ -70,6 +143,25 @@ describe('registerBot', () => {
     const client = state.client as unknown as { opts: Record<string, unknown> };
     expect(client.opts.appId).toBe('app_test_001');
     expect(client.opts.appSecret).toBe('secret_001');
+  });
+
+  it('bounds the SDK HTTP transport timeout when the client exposes axios defaults', () => {
+    const client = { httpInstance: { defaults: { timeout: 0 } } };
+    mod.configureLarkClientHttpTimeout(client);
+    expect(client.httpInstance.defaults.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+  });
+
+  it('gives media uploads a dedicated http instance with the looser upload timeout', () => {
+    const state = mod.registerBot(makeCfg());
+    const interactive = state.client as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    const upload = state.uploadClient as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    // Interactive client keeps the tight bound; upload client is separate + looser.
+    expect(interactive.httpInstance?.defaults?.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+    expect(upload.httpInstance?.defaults?.timeout).toBe(mod.LARK_UPLOAD_TIMEOUT_MS);
+    expect(state.uploadClient).not.toBe(state.client);
+    expect(mod.getBotUploadClient('app_test_001')).toBe(state.uploadClient);
+    // The shared SDK default must NOT be mutated to the upload bound.
+    expect(mod.LARK_UPLOAD_TIMEOUT_MS).toBeGreaterThan(mod.LARK_REQUEST_TIMEOUT_MS);
   });
 
   it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {
@@ -176,6 +268,52 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(cfg.maxLiveWorkers).toBeUndefined();
     }
+  });
+
+  // allowArbitraryMention is a SAFETY switch (gates whether an agent may @
+  // arbitrary group members via email). Default MUST be off, and only a literal
+  // boolean `true` may turn it on — a mutation that flips normalization to
+  // `!== false` (default-open) or accepts the string "true" must fail here.
+  it('sets allowArbitraryMention only for a literal boolean true', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: true },
+    ]));
+    expect(cfg.allowArbitraryMention).toBe(true);
+  });
+
+  it('defaults allowArbitraryMention to NOT-true (undefined) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.allowArbitraryMention).not.toBe(true);
+    expect(cfg.allowArbitraryMention).toBeUndefined();
+  });
+
+  it('keeps allowArbitraryMention NOT-true for false / "true" / 1 / {} (never default-open)', () => {
+    for (const val of [false, 'true', 1, {}] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: val },
+      ]));
+      expect(cfg.allowArbitraryMention).not.toBe(true);
+    }
+  });
+
+  it('keeps only a valid sessionOwnerReminder configuration', () => {
+    const reminder = {
+      enabled: true,
+      intervalMinutes: 45,
+      text: '请处理当前会话。',
+      states: ['idle', 'agent_attention'],
+    };
+    const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', sessionOwnerReminder: reminder },
+    ]));
+    expect(valid.sessionOwnerReminder).toEqual(reminder);
+
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', sessionOwnerReminder: { ...reminder, intervalMinutes: 0 } },
+    ]));
+    expect(invalid.sessionOwnerReminder).toBeUndefined();
   });
 
   it('keeps a trimmed displayName and drops blank/non-string values', () => {
@@ -290,6 +428,49 @@ describe('parseBotConfigsFromText — brand', () => {
       wrapperCli: 'gateway codex',
       cliRuntime: runtime,
     }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
+    const endpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-share',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      existingAppServer: { endpoint },
+    }]));
+    expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.existingAppServer).toEqual({ endpoint });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-app-server-cli',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      existingAppServer: { endpoint },
+    }]))).toThrow(/only for cliId "codex" or "codex-app"/);
+  });
+
+  it('keeps the Codex browser bridge opt-in and restricted to owned Codex App sessions', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+    }]));
+    expect(cfg.codexBrowser).toEqual({ enabled: true, family: 'chrome' });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-browser-cli',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      codexBrowser: true,
+    }]))).toThrow(/only for cliId "codex-app"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'isolated-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+      sandbox: true,
+    }]))).toThrow(/sandbox or readIsolation/);
   });
 
   it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
@@ -456,8 +637,48 @@ describe('parseBotConfigsFromText — brand', () => {
     });
   });
 
-  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {
+  it('parses meetingConsumer in/out policies', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          realtimeVoice: { enabled: true },
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'approval',
+            voiceOutputPolicy: 'allow',
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBe('approval');
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBe('allow');
+  });
+
+  it('drops invalid in/out policy values', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'sometimes', // invalid → dropped
+            voiceOutputPolicy: 42, // invalid → dropped
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBeUndefined();
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBeUndefined();
+  });
+
+  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
@@ -919,6 +1140,199 @@ describe('parseBotConfigsFromText — brand', () => {
   });
 });
 
+describe('parseBotConfigsFromText — native subagent runtime policy', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('normalizes a valid TraeCode policy and canonicalizes an empty policy away', () => {
+    const [configured, empty] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'policy-app',
+        larkAppSecret: 's',
+        cliId: 'traex',
+        nativeSubagentRuntime: {
+          model: { mode: 'custom', value: '  GPT-5.6-Sol  ' },
+          reasoningEffort: { mode: 'custom', value: 'xhigh' },
+        },
+      },
+      {
+        larkAppId: 'empty-policy-app',
+        larkAppSecret: 's',
+        cliId: 'traex',
+        nativeSubagentRuntime: {},
+      },
+    ]));
+
+    expect(configured.nativeSubagentRuntime).toEqual({
+      model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom', value: 'xhigh' },
+    });
+    expect(empty.nativeSubagentRuntime).toBeUndefined();
+    expect(mod.registerBot(configured).nativeSubagentRuntimeState).toEqual({
+      status: 'valid',
+      policy: {
+        model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+        reasoningEffort: { mode: 'custom', value: 'xhigh' },
+      },
+    });
+    expect(mod.registerBot(empty).nativeSubagentRuntimeState).toEqual({ status: 'absent' });
+  });
+
+  it('drops legacy inherit policies and emits a bounded diagnostic for each invalid dimension', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const configs = mod.parseBotConfigsFromText(JSON.stringify([
+        {
+          larkAppId: 'legacy-model-inherit',
+          larkAppSecret: 's',
+          cliId: 'traex',
+          nativeSubagentRuntime: { model: { mode: 'inherit' } },
+        },
+        {
+          larkAppId: 'legacy-effort-inherit',
+          larkAppSecret: 's',
+          cliId: 'traex',
+          nativeSubagentRuntime: { reasoningEffort: { mode: 'inherit' } },
+        },
+      ]));
+
+      expect(configs.map(config => config.nativeSubagentRuntime)).toEqual([undefined, undefined]);
+      const diagnostics = stderr.mock.calls.map(([message]) => String(message)).join('');
+      expect(diagnostics).toContain(
+        '[bot-registry:legacy-model-inherit] nativeSubagentRuntime ignored: '
+          + 'nativeSubagentRuntime.model.mode must be custom',
+      );
+      expect(diagnostics).toContain(
+        '[bot-registry:legacy-effort-inherit] nativeSubagentRuntime ignored: '
+          + 'nativeSubagentRuntime.reasoningEffort.mode must be custom',
+      );
+      expect(diagnostics).not.toContain('\"mode\":\"inherit\"');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('drops a valid policy after normalization when the bot is not TraeCode', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'claude-policy-app',
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        nativeSubagentRuntime: {
+          model: { mode: 'custom', value: '  GPT-5.6-Sol  ' },
+          reasoningEffort: { mode: 'custom', value: 'high' },
+        },
+      },
+    ]));
+
+    expect(cfg.nativeSubagentRuntime).toBeUndefined();
+  });
+
+  it('drops malformed persisted policy state without affecting the rest of the bot config', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'malformed-policy-app',
+        larkAppSecret: 's',
+        cliId: 'traex',
+        model: 'GPT-5.4',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: '' } },
+      },
+    ]));
+
+    expect(cfg.nativeSubagentRuntime).toBeUndefined();
+    expect(cfg.model).toBe('GPT-5.4');
+    expect(mod.registerBot(cfg).nativeSubagentRuntimeState).toEqual({ status: 'invalid' });
+  });
+});
+
+// ─── parseBotConfigsFromText — autoStartOnGroupJoinSeed ────────────────────
+
+describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps a configured seed verbatim', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinSeed: '👋 已到岗，待命中' },
+    ]));
+    expect(cfg.autoStartOnGroupJoinSeed).toBe('👋 已到岗，待命中');
+  });
+
+  it('normalizes blank seed to undefined (falls back to built-in i18n text)', () => {
+    for (const bad of ['', '   ', 42, null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinSeed: bad },
+      ]));
+      expect(cfg.autoStartOnGroupJoinSeed).toBeUndefined();
+    }
+  });
+
+  it('leaves seed undefined when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.autoStartOnGroupJoinSeed).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — replyStyle', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps a normalized sparse replyStyle without freezing theme defaults', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      replyStyle: {
+        recipes: false,
+        layout: true,
+        theme: 'vivid',
+        recipePrompt: '  自定义配方  ',
+        layoutColors: { progress: 'wathet', handoff: 'grey' },
+        layoutTags: { result: '', blocked: '  等你拍板  ' },
+      },
+    }]));
+
+    expect(cfg.replyStyle).toEqual({
+      recipes: false,
+      layout: true,
+      theme: 'vivid',
+      recipePrompt: '自定义配方',
+      layoutColors: { progress: 'wathet' },
+      layoutTags: { result: '', blocked: '等你拍板' },
+    });
+  });
+
+  it('drops malformed replyStyle fields independently instead of rejecting the bot', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      replyStyle: {
+        recipes: 'yes',
+        layout: false,
+        theme: 'rainbow',
+        layoutColors: { risk: 'not-a-color', progress: 'blue' },
+        layoutTags: { blocked: 1, risk: '需要你' },
+      },
+    }]));
+
+    expect(cfg.replyStyle).toEqual({
+      layout: false,
+      layoutColors: { progress: 'blue' },
+      layoutTags: { risk: '需要你' },
+    });
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -985,6 +1399,92 @@ describe('parseBotConfigsFromText — apiOnly', () => {
       { larkAppId: 'a', larkAppSecret: 's', apiOnly: 'yes' },
     ]));
     expect(cfg.apiOnly).toBeUndefined();
+  });
+});
+
+// ─── pricing / budget (cost governance wiring) ───────────────────────────────
+// 这两块是「成本金额化 + 月度预算」功能的入口：不在这里解析，daemon 的
+// pricingResolver / budget sink 就永远拿不到配置，金额与告警静默失效（且
+// 因为字段缺省是合法状态，不会有任何报错）。所以解析这一步必须有回归网。
+
+describe('parseBotConfigsFromText — pricing / budget', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('parses a pricing block (usdCny + per-model overrides) onto the config', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        pricing: { usdCny: 7.3, models: { 'claude-sonnet-4': { input: 3, output: 15 } } },
+      },
+    ]));
+    expect(cfg.pricing).toEqual({
+      usdCny: 7.3,
+      models: { 'claude-sonnet-4': { input: 3, output: 15 } },
+    });
+  });
+
+  it('parses a budget block and fills the threshold/hardStop defaults', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', budget: { monthlyCny: 200 } },
+    ]));
+    expect(cfg.budget).toEqual({
+      monthlyCny: 200,
+      alertThresholdPercent: [80],
+      hardStop: false,
+    });
+  });
+
+  it('keeps explicit budget thresholds and hardStop', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        budget: { monthlyCny: 500, alertThresholdPercent: [50, 90], hardStop: true },
+      },
+    ]));
+    expect(cfg.budget).toEqual({
+      monthlyCny: 500,
+      alertThresholdPercent: [50, 90],
+      hardStop: true,
+    });
+  });
+
+  it('leaves both undefined when unconfigured (cost estimation stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.pricing).toBeUndefined();
+    expect(cfg.budget).toBeUndefined();
+  });
+
+  it('drops garbage blocks instead of throwing (feature off, never crash startup)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        // pricing 非对象 → undefined；budget 缺 monthlyCny → null → undefined
+        pricing: 'nope',
+        budget: { alertThresholdPercent: [80] },
+      },
+    ]));
+    expect(cfg.pricing).toBeUndefined();
+    expect(cfg.budget).toBeUndefined();
+  });
+
+  it('normalizes budget: undefined (not null) so the field is omitted downstream', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', budget: { monthlyCny: -5 } },
+    ]));
+    // parseBudgetConfig returns null for a non-positive budget; the registry
+    // must map that to undefined so `bot.config.budget` is falsy-and-absent
+    // rather than a null that a `?? {}` style read could mistake for config.
+    expect(cfg.budget).toBeUndefined();
+    expect('budget' in cfg ? cfg.budget : undefined).toBeUndefined();
   });
 });
 
@@ -1109,16 +1609,22 @@ describe('getBot / getBotClient', () => {
 describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   const saved = {
+    session: process.env.BOTMUX_SESSION_ID,
     app: process.env.BOTMUX_LARK_APP_ID,
     brand: process.env.BOTMUX_BRAND_LABEL,
     usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
+    replyStyle: process.env.BOTMUX_REPLY_STYLE,
   };
   beforeEach(async () => { mod = await freshImport(); });
   afterEach(() => {
+    if (saved.session === undefined) delete process.env.BOTMUX_SESSION_ID;
+    else process.env.BOTMUX_SESSION_ID = saved.session;
     if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
     if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
     if (saved.usageDisplay === undefined) delete process.env.BOTMUX_USAGE_DISPLAY;
     else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
+    if (saved.replyStyle === undefined) delete process.env.BOTMUX_REPLY_STYLE;
+    else process.env.BOTMUX_REPLY_STYLE = saved.replyStyle;
   });
 
   it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
@@ -1182,6 +1688,70 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     process.env.BOTMUX_USAGE_DISPLAY = 'off';
     mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
     expect(mod.resolveUsageDisplay('app_hot')).toBe('streaming');
+  });
+
+  it('prefers the frozen replyStyle env for its own app but never leaks it across apps', () => {
+    process.env.BOTMUX_SESSION_ID = 'session_frozen';
+    process.env.BOTMUX_LARK_APP_ID = 'app_frozen';
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ layout: false, theme: 'minimal' });
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_frozen',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_other',
+      replyStyle: { recipes: false },
+    }));
+
+    expect(mod.resolveReplyStyleConfig('app_frozen')).toEqual({
+      layout: false,
+      theme: 'minimal',
+    });
+    expect(mod.resolveReplyStyleConfig('app_other')).toEqual({ recipes: false });
+  });
+
+  it('uses the live registry when an adopt/global send has no worker snapshot', () => {
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    delete process.env.BOTMUX_REPLY_STYLE;
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: true,
+      theme: 'vivid',
+    });
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: false, theme: 'minimal' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: false,
+      theme: 'minimal',
+    });
+  });
+
+  it('ignores stale ambient style outside a BotMux session and uses live config', () => {
+    delete process.env.BOTMUX_SESSION_ID;
+    process.env.BOTMUX_LARK_APP_ID = 'app_adopt_live';
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ layout: false, theme: 'minimal' });
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: true,
+      theme: 'vivid',
+    });
+  });
+
+  it('fails soft to the default replyStyle when the injected snapshot is malformed', () => {
+    process.env.BOTMUX_SESSION_ID = 'session_frozen';
+    process.env.BOTMUX_LARK_APP_ID = 'app_frozen';
+    process.env.BOTMUX_REPLY_STYLE = '{broken';
+    expect(mod.resolveReplyStyleConfig('app_frozen')).toBeUndefined();
   });
 });
 
@@ -1271,6 +1841,85 @@ describe('isChatOncallBoundForAnyBot', () => {
     ]));
     expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_new')?.workingDir).toBe('/repo');
+  });
+});
+
+// ─── findOncallChat cross-process refresh ─────────────────────────────────
+
+describe('findOncallChat cross-process refresh', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    mod = await freshImport();
+    const fs = await import('node:fs');
+    fsMock = {
+      existsSync: fs.existsSync as unknown as ReturnType<typeof vi.fn>,
+      readFileSync: fs.readFileSync as unknown as ReturnType<typeof vi.fn>,
+      statSync: fs.statSync as unknown as ReturnType<typeof vi.fn>,
+    };
+    fsMock.existsSync.mockReset();
+    fsMock.readFileSync.mockReset();
+    fsMock.statSync.mockReset();
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    delete process.env.BOTS_CONFIG;
+  });
+
+  it('observes externally added, updated, and removed bindings for the registered bot', () => {
+    const initial = JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa' },
+    ]);
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    const configs = mod.loadBotConfigs();
+    mod.registerBot(configs[0]);
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 1 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_new')).toBeUndefined();
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo/a' }] },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_new')).toEqual({ chatId: 'oc_new', workingDir: '/repo/a' });
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 3 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo/b' }] },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_new')).toEqual({ chatId: 'oc_new', workingDir: '/repo/b' });
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 4 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_new')).toBeUndefined();
+  });
+
+  it('keeps the last known-good binding when an external rewrite is temporarily unreadable', () => {
+    const initial = JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_live', workingDir: '/repo' }] },
+    ]);
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    const configs = mod.loadBotConfigs();
+    mod.registerBot(configs[0]);
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 1 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_live')?.workingDir).toBe('/repo');
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockImplementationOnce(() => { throw new Error('transient read failure'); });
+    expect(mod.findOncallChat('app_a', 'oc_live')?.workingDir).toBe('/repo');
+
+    // The failed mtime was not cached, so the next lookup retries the read.
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa' },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_live')).toBeUndefined();
   });
 });
 
@@ -1408,6 +2057,40 @@ describe('loadBotConfigs', () => {
 
     expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
     expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
+  });
+
+  it('disables a cyclic fallback while still loading one indexed daemon', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'cli_a',
+        larkAppSecret: 'a-secret',
+        quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' },
+      },
+      {
+        larkAppId: 'cli_b',
+        larkAppSecret: 'b-secret',
+        quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' },
+      },
+      {
+        larkAppId: 'cli_unrelated',
+        larkAppSecret: 'unrelated-secret',
+      },
+    ]));
+
+    expect(mod.loadBotConfigAtIndex(0)).toMatchObject({
+      larkAppId: 'cli_a',
+      quotaFallbackBot: undefined,
+    });
+    expect(mod.loadBotConfigAtIndex(1)).toMatchObject({
+      larkAppId: 'cli_b',
+      quotaFallbackBot: undefined,
+    });
+    expect(mod.loadBotConfigAtIndex(2)).toMatchObject({
+      larkAppId: 'cli_unrelated',
+      quotaFallbackBot: undefined,
+    });
   });
 
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
@@ -1623,6 +2306,24 @@ describe('loadBotConfigs', () => {
     expect(configs).toEqual([]);
   });
 
+  it.each([true, false, 'true', undefined])('signed chat defaults require boolean opt-in (%s)', (enabled) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaults: enabled,
+      signedChatDefaultsRegistryUrl: 'https://registry.example/lookup',
+    }]))[0];
+    expect(config.signedChatDefaults).toBe(enabled === true ? true : undefined);
+    expect(config.signedChatDefaultsRegistryUrl).toBe('https://registry.example/lookup');
+  });
+
+  it.each(['http://registry.example/lookup', 42, null, undefined])('ignores non-HTTPS registry configuration (%s)', (endpoint) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaultsRegistryUrl: endpoint,
+    }]))[0];
+    expect(config.signedChatDefaultsRegistryUrl).toBeUndefined();
+  });
+
   // ── defaultOncall parsing ────────────────────────────────────────────────
 
   it('should parse a fully-formed defaultOncall entry', () => {
@@ -1708,16 +2409,40 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
       .toBeUndefined();
   });
 
-  it('returns undefined when VC is not enabled (normal bot)', () => {
+  it('is active by default for a Feishu bot; only enabled:false opts out', () => {
+    // Bot-agnostic join: any invited Feishu bot should join, so VC is active
+    // unless explicitly disabled. enabled:false is the per-bot opt-out.
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
       .toBeUndefined();
-    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    // Unset enabled / no vcMeetingAgent block → active with an effective config
+    // (empty object is fine; downstream reads fall back to their own defaults).
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: {} as any })).toEqual({});
+    expect(mod.vcMeetingAgentConfigActive({})).toEqual({});
     expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
   });
 
   it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
       .toBeUndefined();
+  });
+
+  // 回归(PR#916 codex阻断①):VC/实时语音默认开翻转后,enabled:false 是显式退出,
+  // 必须能 round-trip 存活。这里**过真实 parseBotConfigsFromText → vcMeetingAgentConfigActive**
+  // (而不是手搓对象喂 active),否则 normalizer 丢 false 的 bug 会被假绿掩盖。
+  it('a persisted vcMeetingAgent.enabled:false round-trips through parse and stays opted out', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_off', larkAppSecret: 's', vcMeetingAgent: { enabled: false } },
+    ]));
+    expect(cfg.vcMeetingAgent?.enabled).toBe(false);
+    expect(mod.vcMeetingAgentConfigActive(cfg)).toBeUndefined();
+  });
+
+  it('a persisted realtimeVoice.enabled:false round-trips through parse (voice stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_v', larkAppSecret: 's', vcMeetingAgent: { realtimeVoice: { enabled: false } } },
+    ]));
+    // 顶层不 enabled:false → bot 仍接收会议事件,但实时语音显式关闭必须保留。
+    expect(cfg.vcMeetingAgent?.realtimeVoice?.enabled).toBe(false);
   });
 });
 
@@ -1791,5 +2516,72 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
       throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
     });
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});
+
+describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps positive integers within the arm-able bound and rejects everything else', () => {
+    expect(mod.normalizeTurnTimeoutMs(1_800_000)).toBe(1_800_000);
+    expect(mod.normalizeTurnTimeoutMs(90_001)).toBe(90_001); // legal non-whole-minute value
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS)).toBe(mod.MAX_TURN_TIMEOUT_MS);
+    // Rejected: non-positive, non-integer, over-bound, non-number, absent.
+    expect(mod.normalizeTurnTimeoutMs(0)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(-5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(1.5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS + 1)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs('1800000')).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(undefined)).toBeUndefined();
+  });
+
+  it('parseBotConfigsFromText drops an over-bound turnTimeoutMs', () => {
+    const [ok] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: 90_001 },
+    ]));
+    expect(ok.turnTimeoutMs).toBe(90_001);
+    const [over] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: mod.MAX_TURN_TIMEOUT_MS + 1 },
+    ]));
+    expect(over.turnTimeoutMs).toBeUndefined();
+  });
+
+  it('the dashboard UI mirror of the bound stays equal to the shared constant', async () => {
+    const { DASHBOARD_MAX_TURN_TIMEOUT_MS } = await import('../src/dashboard/web/bot-defaults-page.js');
+    expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
+  });
+});
+
+describe('cardActionAckTimeoutMs bot config', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps 500–2500ms integers and drops invalid values', () => {
+    const parsed = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'min', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 500 },
+      { larkAppId: 'mid', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 1_500 },
+      { larkAppId: 'max', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 2_500 },
+      { larkAppId: 'low', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 499 },
+      { larkAppId: 'high', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 2_501 },
+      { larkAppId: 'fraction', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 1_000.5 },
+      { larkAppId: 'string', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: '1500' },
+    ]));
+
+    expect(parsed.map(bot => bot.cardActionAckTimeoutMs)).toEqual([
+      500,
+      1_500,
+      2_500,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
   });
 });

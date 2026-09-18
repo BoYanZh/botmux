@@ -8,6 +8,7 @@
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
+| `BOTMUX_CODEX_NODE_REPL_PATH` | — | 未配置有效 MCP 运行时时，指定已安装的 Codex `node_repl` 可执行文件绝对路径；仅供显式启用的浏览器功能使用。 |
 | `BOTS_CONFIG` | _(未设置)_ | 指定 bots.json 路径（覆盖默认位置） |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
 | `WEB_EXTERNAL_HOST` | _(自动探测局域网 IP)_ | 终端链接中的外部主机名/IP（公网/内网域名访问见 [Web 终端](/web-terminal)） |
@@ -30,9 +31,12 @@
 | `BOTMUX_DASHBOARD_PORT` | `7891` | dashboard HTTP 端口 |
 | `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` 或自动探测 | CLI 输出 URL 用的 host |
 | `BOTMUX_PUBLIC_URL` | _(未设置)_ | 自建反代对外基址（`scheme://host[:port]`）。没接中心平台、但自己用 nginx 等把 dashboard 反代到单一公网/内网域名时设它，dashboard / 卡片终端链接改吐 `<基址>/…`、`<基址>/s/<sessionId>`，走 dashboard 前门、无需 per-bot 端口。未设回退本地 `host:port`。必须写在 `~/.botmux/.env`（会话内发起的重启只读文件、不继承 shell） |
+| `BOTMUX_DEVBOX_AUTO_EXPORT` | `1` | 在 Merlin Devbox 且 Dashboard 端口可导出时，自动创建或复用私有短链。中心平台或 `BOTMUX_PUBLIC_URL` 已配置时不执行。设为 `0` 或 `false` 可关闭：写在 `~/.botmux/.env` 或在启动 fleet 的 shell 里 export 均可（dashboard 走 allowlist 从文件读，CLI 自己不 dotenv、直接兜读该文件，两侧对同一个开关给出同一答案）。失败或超时会静默回退本机 URL。 |
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | 每个 daemon 的 IPC 端口 = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | workflow run 存储目录 |
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | 是否允许无 token 访问 Dashboard 白名单只读 API / SSE；一旦在 Dashboard 设置页保存过该开关，`~/.botmux/config.json` 中的值优先于本环境变量 |
+| `BOTMUX_COMPANION_SECRET_FILE` | _(未设置)_ | 封闭[本地 Companion API](/companion-api) 的专用 HMAC 密钥文件路径；通常由 `start/restart --companion-secret-file` 设置。严格校验 canonical 绝对路径、当前用户 owner、非软链、普通文件、`0600`、非空；不下发给会话 CLI，绝不回退或复用 `.dashboard-secret`。 |
+| `BOTMUX_COMPANION_BOT_APP_ID` | _(未设置)_ | Companion API 唯一绑定的隔离测试 Bot；通常由 `start/restart --companion-bot` 设置。不接受请求方选择 Bot。 |
 
 ## 文件位置
 

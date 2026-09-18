@@ -9,6 +9,7 @@
  *   - validateMentionDecision: the @ hard-gate — every model-initiated reply
  *     must explicitly choose --mention / --mention-back / --no-mention.
  */
+import type { TurnParticipant } from '../types.js';
 
 export interface QuoteTargetArgs {
   /** session.scope === 'chat' */
@@ -32,6 +33,55 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   if (!args.isChatScope || args.sendTopLevel || args.noQuote) return null;
   const target = args.explicitQuote ?? args.sessionQuoteTargetId;
   return target && target.trim() ? target.trim() : null;
+}
+
+export interface AfterTheFactTopicQuoteArgs {
+  /** The message id this send would quote (null ⇒ nothing to decide). */
+  quoteTargetId: string | null;
+  /**
+   * The frozen per-turn record's `inThread` for the turn that produced
+   * `quoteTargetId`: did the inbound message arrive from INSIDE a topic?
+   * `undefined` = unknown (pre-`inThread` session row).
+   */
+  quotedTurnInThread?: boolean;
+  /**
+   * `thread_id` the quote target carries RIGHT NOW, freshly probed from Lark.
+   * `null` = confirmed no topic. `undefined` = probe failed / not attempted.
+   */
+  currentThreadId?: string | null;
+  /** An explicit `--quote <id>` is the operator's own choice; never override it. */
+  explicitQuote?: string;
+}
+
+/**
+ * Whether a chat-scope send must DROP its quote and post flat instead.
+ *
+ * Lark's reply API makes a reply inherit the **current** topic membership of the
+ * message it quotes — `reply_in_thread: false` only declines to OPEN a new
+ * topic, it cannot escape an existing one. So when the user @s the bot at group
+ * top level and only AFTERWARDS opens a 话题 on that very message, quoting it
+ * drops the answer into a topic the user never @'d the bot in (the same
+ * user-reported bug the regular-group fold fixes on the dispatcher side — this
+ * is its `botmux send` half, which owns the visible prose reply).
+ *
+ * Requires BOTH halves, so it can only ever fire on the exact reported case:
+ *   • the quoted turn arrived at top level (`inThread === false`), and
+ *   • that message NOW carries a `thread_id` — i.e. the topic appeared later.
+ *
+ * Fails toward the pre-existing behavior (keep quoting) whenever either half is
+ * unknown: an old session row has no `inThread`, and a failed/skipped probe
+ * leaves `currentThreadId` undefined. Quoting is the long-standing default, so
+ * uncertainty must never silently change where every normal reply lands.
+ */
+export function shouldDropAfterTheFactTopicQuote(args: AfterTheFactTopicQuoteArgs): boolean {
+  if (!args.quoteTargetId) return false;
+  // `--quote <id>` is an explicit operator instruction; honor it verbatim.
+  if (args.explicitQuote) return false;
+  // Only a turn PROVEN to have arrived at top level can be a victim here.
+  // `undefined` (legacy row) must keep the old behavior, never guess.
+  if (args.quotedTurnInThread !== false) return false;
+  // The topic must actually exist now. `undefined` = we don't know ⇒ keep quoting.
+  return typeof args.currentThreadId === 'string' && args.currentThreadId.trim().length > 0;
 }
 
 export interface ManagedVcQuoteArgs {
@@ -68,6 +118,7 @@ export interface ManagedVcSendControlArgs {
   overrideChatId?: string;
   sendInto?: string;
   attentionRequested: boolean;
+  urgentRequested?: boolean;
   explicitMentionCount: number;
   mentionBack: boolean;
   noMention: boolean;
@@ -83,6 +134,9 @@ export function managedVcSendControlError(args: ManagedVcSendControlArgs): strin
   }
   if (args.attentionRequested) {
     return '--attention 不属于受管 VC 主消息 action。';
+  }
+  if (args.urgentRequested) {
+    return '--urgent 不属于受管 VC 主消息 action。';
   }
   if (args.explicitMentionCount > 0 || args.mentionBack || !args.noMention) {
     return '受管 VC 回复必须显式使用 --no-mention，不能使用 --mention/--mention-back。';
@@ -127,6 +181,70 @@ export function neutralizeLarkAtTags(content: string): string {
   return content
     .replace(/<at(?=\s|>)/giu, '＜at')
     .replace(/<\/at\s*>/giu, match => `＜${match.slice(1, -1)}＞`);
+}
+
+export interface RawMention {
+  /** open_id (ou_…), or a full email / union_id / mobile when the bot
+   *  enables arbitrary mention. */
+  identifier: string;
+  /** optional display name for inline <at> substitution */
+  name: string;
+}
+
+export interface MentionClassifyResult {
+  ok: boolean;
+  /** present when !ok — message to print before exit(2) */
+  error?: string;
+  /** literal open_id entries — always allowed, pass through untouched */
+  openIdMentions: RawMention[];
+  /** non-open_id entries that must be resolved + membership-gated (empty unless
+   *  the switch is on) */
+  toResolve: RawMention[];
+}
+
+/**
+ * Pure gate for `botmux send --mention` identifiers. Splits literal open_ids
+ * (always allowed) from non-open_id identifiers (email / union_id /
+ * mobile). Non-open_id identifiers are only permitted when the bot config sets
+ * `allowArbitraryMention`; otherwise this returns ok:false so the caller can
+ * reject before doing any Lark I/O. The actual email→open_id resolution and
+ * group-membership check are async side effects the caller performs on
+ * `toResolve`. Keeping the decision here makes it unit-testable without Lark.
+ */
+export function classifyMentionIdentifiers(
+  raw: RawMention[],
+  allowArbitraryMention: boolean,
+): MentionClassifyResult {
+  const openIdMentions = raw.filter(r => r.identifier.startsWith('ou_'));
+  const nonOpenId = raw.filter(r => !r.identifier.startsWith('ou_'));
+  if (nonOpenId.length > 0 && !allowArbitraryMention) {
+    return {
+      ok: false,
+      error:
+        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱 @ 任意人。\n` +
+        `如需按完整邮箱/手机号/union_id @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
+        `无法解析的项：${nonOpenId.map(r => r.identifier).join(', ')}`,
+      openIdMentions,
+      toResolve: [],
+    };
+  }
+  return { ok: true, openIdMentions, toResolve: nonOpenId };
+}
+
+/**
+ * Pure group-membership gate for resolved --mention targets. Given the resolved
+ * open_id per non-open_id identifier and the set of open_ids that are actually
+ * members of the destination chat, return the identifiers whose resolved open_id
+ * is NOT a member (the ones that must be rejected). Extracted from cmdSend so the
+ * "in-group passes / out-of-group rejected" contract is unit-testable without
+ * Lark I/O — a mutation that deletes the check (always [] ) or reverses it
+ * (`has` instead of `!has`) must make these tests fail.
+ */
+export function outsidersForMembership(
+  resolved: Array<{ identifier: string; openId: string }>,
+  memberIds: Set<string>,
+): Array<{ identifier: string; openId: string }> {
+  return resolved.filter(r => !memberIds.has(r.openId));
 }
 
 export interface MentionDecisionArgs {
@@ -177,47 +295,72 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
   };
 }
 
-export interface MentionBackParticipantArgs {
-  /** Session chat type — 'p2p' is inherently 1v1 (no fetch needed). */
+export interface MentionBackAmbiguityArgs {
+  /** Session chat type — a p2p DM is inherently 1v1, never ambiguous. */
   chatType?: 'group' | 'p2p';
-  /** Real (human) member count from getGroupStats — excludes bots. */
-  userCount: number;
-  /** Bot member count from getGroupStats. */
-  botCount: number;
+  /** Turn-window counterparts (executable open_id candidates; sender + @-mentions
+   *  across folded/type-ahead messages, self bot already excluded, deduped). */
+  participants: TurnParticipant[];
+  /** True when the window may be under-counted (an unresolved non-open_id @, a
+   *  pruned sibling, or no window at all). Forces ambiguous regardless of count
+   *  so the model must make an explicit decision. */
+  incomplete?: boolean;
+}
+
+export interface MentionBackAmbiguityResult {
+  /** True when --mention-back is ambiguous and must be replaced by an explicit
+   *  --mention / --no-mention (2+ distinct counterparts, or an incomplete
+   *  window that could hide additional counterparts). */
+  ambiguous: boolean;
+  /** The known distinct counterparts to offer as explicit --mention candidates.
+   *  May be shorter than the true set when `incomplete` is true. */
+  candidates: TurnParticipant[];
+  /** Propagated from args: the candidate list is known-incomplete. */
+  incomplete: boolean;
 }
 
 /**
- * Should `--mention-back` be blocked because the conversation has more than
- * two participants (humans + bots)?
+ * Is `--mention-back` ambiguous for THIS turn? --mention-back means "@ back the
+ * one counterpart who triggered this turn". That is unambiguous only when the
+ * turn's window provably had a single counterpart. It becomes ambiguous when:
+ *   - two or more distinct people/bots took part (a human + a peer bot, two
+ *     humans, the triggerer plus someone they @-ed, a type-ahead follow-up from
+ *     a third party, …); OR
+ *   - the window is INCOMPLETE (an @ we couldn't resolve to an open_id, a
+ *     pruned sibling, or no window record at all) — a hidden counterpart may
+ *     exist, so we must not assume the lone visible one is the only target.
+ * In either case we ask the model to pick an explicit `--mention <open_id>`
+ * (from the known candidates) or `--no-mention`, rather than auto-@-ing.
  *
- * Rationale (symmetric with the inbound @ gate in event-dispatcher.ts, which
- * only lets an un-@ message through when `userCount <= 1 && botCount <= 1`):
- * in a true 1v1 (`userCount + botCount <= 2`, e.g. 1 human + 1 bot, or a p2p
- * DM) the triggerer IS the only counterpart, so auto-@-ing them back is safe
- * and unambiguous. Once a third party joins, "whoever triggered this turn" is
- * no longer reliably "who should be addressed" — a bystander's message can
- * trigger the bot while the substantive reply belongs to someone else. There
- * we force the model to make an explicit `--mention <ou:Name>` decision rather
- * than blindly @-ing the last speaker.
- *
- * Note: this gates the MODEL-authored `botmux send --mention-back` only — the
- * clear-headed path where the model chose to reply and can instead pick an
- * explicit `--mention` in a busy group. The daemon fallback card
- * (daemonCardFooterRecipientOpenId) is a separate, un-gated path that addresses
- * the session owner: it fires only when the model made NO routing decision at
- * all (forgot to send), so there is no reliable "who triggered this turn" to
- * honour, and guessing the last conversant would mis-@ a peer bot on a purely
- * local turn. Owner is the safe default there; real bot-to-bot handoffs go
- * through this explicit `--mention` path.
- *
- * p2p short-circuits to `false` (no API round-trip). The caller passes
- * getGroupStats' worst-case `{999,999}` soft-failure fallback, which yields
- * `true` here → fail-closed to "make an explicit decision", never a silent
- * wrong @.
+ * NOT symmetric on human-vs-bot: a bot→bot handoff in a provably 1v1 window
+ * stays unambiguous (allowed); a lone human likewise. p2p short-circuits to
+ * not-ambiguous. Fail-safe: uncertainty always resolves to ambiguous.
  */
-export function shouldBlockMentionBackByParticipants(args: MentionBackParticipantArgs): boolean {
-  if (args.chatType === 'p2p') return false;
-  return args.userCount + args.botCount > 2;
+export function mentionBackAmbiguity(args: MentionBackAmbiguityArgs): MentionBackAmbiguityResult {
+  if (args.chatType === 'p2p') return { ambiguous: false, candidates: [], incomplete: false };
+  const distinct = args.participants.filter(p => !!p.openId);
+  const incomplete = !!args.incomplete;
+  if (!incomplete && distinct.length <= 1) return { ambiguous: false, candidates: [], incomplete: false };
+  return { ambiguous: true, candidates: distinct, incomplete };
+}
+
+/** Render the blocked-`--mention-back` error: explains the ambiguity and lists
+ *  every KNOWN candidate's open_id + name + person/bot/unknown so the model can
+ *  `--mention <open_id>` the right one instead of guessing. When the window is
+ *  incomplete, says so (there may be participants without a listable open_id). */
+export function mentionBackAmbiguityError(candidates: TurnParticipant[], incomplete = false): string {
+  const kindLabel = (p: TurnParticipant): string => (p.isBot === true ? 'bot' : p.isBot === false ? '人' : '未知');
+  const lines = candidates.map((p) => {
+    const name = p.name ? ` ${p.name}` : '';
+    return `  • ${p.openId}（${kindLabel(p)}${name}）`;
+  });
+  const head = incomplete
+    ? '--mention-back 本轮无法确定唯一 @ 对象（本轮参与者可能不止下列这些，或有无法解析的 @）：'
+    : '--mention-back 在本轮有多个参与者时不可用："回复触发这轮的人" 在多方场景可能 @ 错对象。';
+  const listIntro = candidates.length
+    ? '请改用 --mention <open_id> 显式点名下列已知本轮参与者之一（可重复 --mention 点多个），或 --no-mention 不 @：'
+    : '请改用 --mention <open_id> 显式点名，或 --no-mention 不 @。';
+  return [head, listIntro, ...(lines.length ? [lines.join('\n')] : [])].join('\n');
 }
 
 /**
@@ -241,6 +384,67 @@ export function parseAttentionFlag(args: string[]): { requested: boolean; kind: 
   const raw = arg.includes('=') ? arg.slice('--attention='.length) : '';
   const kind = (ATTENTION_KINDS as readonly string[]).includes(raw) ? raw : 'blocked';
   return { requested: true, kind };
+}
+
+export const URGENT_MODES = ['app', 'sms', 'phone'] as const;
+export type UrgentMode = typeof URGENT_MODES[number];
+
+export interface UrgentFlagResult {
+  requested: boolean;
+  mode: UrgentMode;
+  error?: string;
+}
+
+/**
+ * Parse `botmux send --urgent[=app|sms|phone]`.
+ *
+ * A bare flag deliberately means in-app Buzz. SMS and phone are explicit
+ * because they consume tenant quota and are materially more disruptive.
+ * Multiple urgent flags are rejected rather than silently picking one.
+ */
+export function parseUrgentFlag(args: string[]): UrgentFlagResult {
+  const flags = args.filter(arg => arg === '--urgent' || arg.startsWith('--urgent='));
+  if (flags.length === 0) return { requested: false, mode: 'app' };
+  if (flags.length > 1) {
+    return { requested: true, mode: 'app', error: '--urgent 只能指定一次。' };
+  }
+  const flag = flags[0]!;
+  const raw = flag === '--urgent' ? 'app' : flag.slice('--urgent='.length);
+  if (!(URGENT_MODES as readonly string[]).includes(raw)) {
+    return {
+      requested: true,
+      mode: 'app',
+      error: '--urgent 仅支持 app|sms|phone；省略值时默认为 app。',
+    };
+  }
+  return { requested: true, mode: raw as UrgentMode };
+}
+
+export interface UrgentUsageArgs {
+  requested: boolean;
+  mentionBack: boolean;
+  sendTopLevel: boolean;
+  overrideChatId?: string;
+  sendInto?: string;
+  asVoice?: boolean;
+}
+
+/**
+ * Buzz is intentionally single-recipient and bound to the exact turn sender.
+ * This avoids accidentally buzzing every explicit @ (including peer bots).
+ */
+export function urgentUsageError(args: UrgentUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (!args.mentionBack) {
+    return '--urgent 必须与 --mention-back 一起使用，只加急本轮触发者。';
+  }
+  if (args.sendTopLevel || args.overrideChatId || args.sendInto) {
+    return '--urgent 只能用于回复当前会话，不能与 --top-level / --chat-id / --into 混用。';
+  }
+  if (args.asVoice) {
+    return '--urgent 暂不支持 --voice。';
+  }
+  return null;
 }
 
 export interface AttentionUsageArgs {

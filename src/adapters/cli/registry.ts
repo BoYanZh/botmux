@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { locateExecutable } from '../../utils/executable.js';
@@ -15,6 +15,7 @@ import { createCursorAdapter } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
+import { createOpenCode2Adapter } from './opencode2.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
@@ -24,10 +25,16 @@ import { createTraexAdapter } from './traex.js';
 import { createPiAdapter } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
 import { createOhMyPiAdapter } from './oh-my-pi.js';
+import { createEbsdAdapter } from './ebsd.js';
 import { createKimiAdapter } from './kimi.js';
 import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
+import { createReasonixAdapter } from './reasonix.js';
+import { createDshAdapter } from './dsh.js';
+import { createDshTuiAdapter } from './dsh-tui.js';
+import { createMojoAdapter } from './mojo.js';
+import { createMinimaxAdapter } from './minimax.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -49,6 +56,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   gemini: 'gemini',
   genius: 'genius',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   antigravity: 'agy',
   mtr: 'mtr',
   hermes: 'hermes',
@@ -61,12 +69,39 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   pi: 'pi',
   copilot: 'copilot',
   'oh-my-pi': 'omp',
+  ebsd: 'ebsd',
   kimi: 'kimi',
   grok: 'grok',
   'kiro-cli': 'kiro-cli',
   // API-backed; no local executable is required.
   riff: undefined,
+  reasonix: 'reasonix',
+  // The adapter itself launches a bundled Node runner; `dsh` (the CLI) is
+  // its real second-stage dependency.
+  dsh: 'dsh',
+  // PTY-driven TUI variant of dsh. Selected via the bot's dshRuntime='tui'
+  // toggle, not directly from the CLI dropdown (absent from CLI_ID_CHOICES).
+  'dsh-tui': 'dsh-tui',
+  // The worker never spawns this (MojoBackend shells out per turn), but the
+  // binary DOES have to exist locally — unlike riff/mira, which are pure HTTP.
+  // Declaring it lets `botmux setup` fail fast on a missing install instead of
+  // letting the first IM message die with ENOENT.
+  mojo: 'mojo',
+  // MiniMax CLI — `mmx text repl` is the interactive chat surface.
+  minimax: 'mmx',
 };
+
+/**
+ * Every known CLI id, derived from the closed `Record<CliId, …>` above rather
+ * than re-typed by hand.
+ *
+ * A hand-maintained duplicate of this list in dashboard.ts silently went stale
+ * twice (it was missing both `reasonix` and `mojo`), because a plain
+ * `CliId[]` literal is only checked for *bad* members — never for missing ones.
+ * Deriving it means adding a CLI to RAW_CLI_EXECUTABLES (which tsc forces) is
+ * enough, and no consumer can drift again.
+ */
+export const ALL_CLI_IDS: readonly CliId[] = Object.keys(RAW_CLI_EXECUTABLES) as CliId[];
 
 /** Return the unresolved command without constructing an adapter or spawning a
  * shell.  This is deliberately safe for synchronous UI option enumeration. */
@@ -77,6 +112,16 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
 }
 
 const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
+
+/** macOS desktop apps bundle a standalone Codex binary even when `codex` is
+ * not installed on PATH. ChatGPT is the current app name; keep the legacy
+ * Codex.app locations so existing installations continue to work. */
+export function macOSBundledCodexCandidates(userHome = homedir()): string[] {
+  return ['ChatGPT.app', 'Codex.app'].flatMap(appName => [
+    join('/Applications', appName, 'Contents', 'Resources', 'codex'),
+    join(userHome, 'Applications', appName, 'Contents', 'Resources', 'codex'),
+  ]);
+}
 
 /** Resolve a command name to its absolute path via a login/interactive shell.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -123,15 +168,38 @@ export function resolveCommand(cmd: string): string {
     }
   }
   if (process.platform === 'darwin' && cmd === 'codex') {
-    const bundledCodexCandidates = [
-      '/Applications/Codex.app/Contents/Resources/codex',
-      join(homedir(), 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
-    ];
-    for (const candidate of bundledCodexCandidates) {
+    for (const candidate of macOSBundledCodexCandidates()) {
       if (existsSync(candidate)) return candidate;
     }
   }
   return cmd;
+}
+
+/**
+ * `resolveCommand` + realpath — use this for any path that will be handed to a
+ * SPAWNER (a runner's `--*-bin` argv, or anything the adapter execs itself).
+ *
+ * WHY: `resolveCommand` returns the entry as found on PATH, which is commonly a
+ * symlink — `~/.local/bin/codex` → `~/.codex/packages/standalone/current/bin/codex`
+ * → a versioned release dir (two hops, and the middle `current` re-points on every
+ * upgrade). The file sandbox authorizes `dirname(canonical(p))` (see worker.ts's
+ * `execDirs`), so a spawn against the ORIGINAL symlink path ENOENTs inside the
+ * sandbox and the second-stage process crash-loops. Canonicalizing here makes the
+ * spawned path identical to the one the sandbox authorized.
+ *
+ * NOT needed for `resolvedBin` alone: the worker canonicalizes that itself on both
+ * the authorization side and the spawn side. The bug only appears where an adapter
+ * passes a path THROUGH to something else that execs it — which is why this is a
+ * shared helper rather than folded into `resolveCommand` (that would also rewrite
+ * the many display/probe call sites, where the user-facing PATH entry is the more
+ * useful string).
+ *
+ * Falls back to the non-canonical path when realpath fails (binary genuinely
+ * absent) so the failure surfaces as the same unmasked ENOENT as before.
+ */
+export function resolveCommandReal(cmd: string): string {
+  const resolved = resolveCommand(cmd);
+  try { return realpathSync(resolved); } catch { return resolved; }
 }
 
 /**
@@ -159,7 +227,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -175,6 +243,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'gemini': return createGeminiAdapter(pathOverride);
     case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
+    case 'opencode2': return createOpenCode2Adapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
     case 'hermes': return createHermesAdapter(pathOverride);
@@ -184,10 +253,16 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'pi': return createPiAdapter(pathOverride);
     case 'copilot': return createCopilotAdapter(pathOverride);
     case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
+    case 'ebsd': return createEbsdAdapter(pathOverride);
     case 'kimi': return createKimiAdapter(pathOverride);
     case 'grok': return createGrokAdapter(pathOverride);
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
+    case 'reasonix': return createReasonixAdapter(pathOverride);
+    case 'dsh': return createDshAdapter(pathOverride);
+    case 'dsh-tui': return createDshTuiAdapter(pathOverride);
+    case 'mojo': return createMojoAdapter(pathOverride);
+    case 'minimax': return createMinimaxAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

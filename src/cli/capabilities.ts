@@ -7,6 +7,8 @@ export interface BotmuxCapabilitiesDocument {
     stable_app_dispatch_v1: true;
     stable_dispatch_acceptance_v1: true;
     managed_activation_v2: true;
+    current_actor_v2: true;
+    headless_session_v1: true;
   };
 }
 
@@ -34,6 +36,8 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
       stable_app_dispatch_v1: true,
       stable_dispatch_acceptance_v1: true,
       managed_activation_v2: true,
+      current_actor_v2: true,
+      headless_session_v1: true,
     },
   };
 }

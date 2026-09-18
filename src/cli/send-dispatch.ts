@@ -1,4 +1,10 @@
 import { extname } from 'node:path';
+import { formatLarkError } from '../bot-registry.js';
+import {
+  findDisallowedCardCallback,
+  type InteractiveCardCallbackPolicy,
+} from '../core/card-callback-policy.js';
+import type { ManagedHookOrigin } from '../services/hook-runner.js';
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -7,7 +13,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean },
+  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -18,13 +24,19 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean },
+  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
   sendMessage: SendMessageFn;
   replyMessage: ReplyMessageFn;
 };
+
+/** Keep provider details visible without leaking Axios config or headers. */
+export function describeSendFailure(err: unknown): string {
+  return formatLarkError(err)
+    ?? (err instanceof Error && err.message ? err.message : String(err));
+}
 
 /**
  * Paths that resolve to the process's own stdin. `botmux send` reads stdin for
@@ -45,9 +57,44 @@ export function findStdinAliasAttachment(paths: readonly string[]): string | nul
   return null;
 }
 
+export type SlashSendValidation =
+  | { ok: true; command: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate the body of a `botmux send --slash "<cmd>"`.
+ *
+ * `--slash` exists so one bot can hand another a NATIVE slash command that the
+ * receiving daemon relays into the CLI verbatim (passthrough: /clear, /model,
+ * …) or routes as a daemon command (/close, …). The ordinary `send` path wraps
+ * every message in an interactive card whose body picks up a `[🔊 语音总结]`
+ * footer line, so the receiver sees a MULTI-LINE message and
+ * `parseSlashCommandInvocation` (which only treats /schedule|/role|/fork as
+ * multi-line commands) drops it to an ordinary prompt — the command never
+ * reaches the passthrough/daemon router. A `--slash` send therefore MUST go out
+ * as a single-line plain-`text` message.
+ *
+ * Fail LOUD rather than silently sending junk: the content has to be exactly one
+ * line and start with `/`. Leading/trailing whitespace is trimmed (a trailing
+ * newline from a heredoc is the common case); an interior newline is rejected so
+ * the caller notices instead of the daemon quietly treating it as prose.
+ */
+export function validateSlashSend(raw: string): SlashSendValidation {
+  const command = raw.trim();
+  if (!command) return { ok: false, error: '--slash 需要一条斜杠命令，例如 --slash "/clear"' };
+  if (/[\r\n]/.test(command)) {
+    return { ok: false, error: '--slash 只能发送单行斜杠命令（收到含换行的多行内容）' };
+  }
+  if (!command.startsWith('/')) {
+    return { ok: false, error: `--slash 内容必须以 / 开头（收到 ${JSON.stringify(command.slice(0, 24))}）` };
+  }
+  return { ok: true, command };
+}
+
 export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;
+  beforeEffect?: () => void | Promise<void>;
 };
 
 export type SendFileAttachmentsResult = {
@@ -72,10 +119,12 @@ export async function sendFileAttachments(
   const failed: { path: string; error: string }[] = [];
   for (const fp of files) {
     try {
+      await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
+      await deps.beforeEffect?.();
       sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
-    } catch (err: any) {
-      failed.push({ path: fp, error: err?.message ?? String(err) });
+    } catch (err: unknown) {
+      failed.push({ path: fp, error: describeSendFailure(err) });
     }
   }
   return { sent, failed };
@@ -180,86 +229,6 @@ function cardObjectFromValue(value: unknown, label: string): { ok: true; card: R
   return { ok: true, card };
 }
 
-// Interactive INPUT controls that fire a card.action.trigger callback on use.
-// Custom cards are display-only, so these are rejected by tag even when they
-// carry no `value` payload (selecting/picking still fires a callback). `button`
-// is NOT here — it's special-cased below (open_url buttons are legit jumps).
-// `checker` is Feishu's documented no-callback-by-default exception; a checker
-// that opts into a callback is still caught by its `type:'callback'` behavior.
-const CALLBACK_CONTROL_TAGS = new Set([
-  'select_static', 'multi_select_static',
-  'select_person', 'multi_select_person',
-  'select_img', 'multi_select_img',
-  'overflow', 'input',
-  'date_picker', 'picker_time', 'picker_datetime',
-]);
-
-// A button is display/jump ONLY when it opens a URL: v2 `behaviors` carrying an
-// `open_url`, or v1 non-empty `url`/`multi_url`. Everything else (a plain button,
-// or one carrying an own `value` callback payload) round-trips a callback.
-function isOpenUrlButton(el: Record<string, unknown>): boolean {
-  if (typeof el.url === 'string' && el.url.trim() !== '') return true;
-  if (el.multi_url !== undefined && el.multi_url !== null) return true;
-  return Array.isArray(el.behaviors)
-    && el.behaviors.some(b => isRecord(b) && b.type === 'open_url');
-}
-
-// Find any element that would produce a Lark card.action.trigger callback.
-// Custom cards are display + open_url only, so ALL callback-capable controls
-// are rejected — not just the ones whose payload hits a botmux privileged
-// dispatch. Returns the offending JSON path, or null if the card is clean.
-function findDisallowedCardCallback(value: unknown, path = 'card'): string | null {
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const found = findDisallowedCardCallback(value[i], `${path}[${i}]`);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (!isRecord(value)) return null;
-
-  // v2 `behaviors:[{type:'callback'}]` fires a server-side card.action.trigger
-  // callback. open_url behaviors are display/jump only and stay allowed.
-  if (value.type === 'callback') return `${path}.type`;
-  // Form submit/reset buttons ALSO fire card.action.trigger (delivering
-  // form_value to the handler). Feishu marks them with real schema fields —
-  // v2 `form_action_type:'submit'|'reset'`, v1 `action_type:'form_submit'|
-  // 'form_reset'` (see settings-card.ts / card-builder.ts) — NOT a
-  // `type:'form_action'`. Reject those so a custom card stays display-only.
-  if (typeof value.form_action_type === 'string') return `${path}.form_action_type`;
-  if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
-    return `${path}.action_type`;
-  }
-  if (typeof value.tag === 'string') {
-    // Interactive input controls (dropdowns/pickers/inputs/image-select) — reject
-    // by tag even without a `value` payload; interacting still fires a callback.
-    if (CALLBACK_CONTROL_TAGS.has(value.tag)) return `${path}.tag(${value.tag})`;
-    // A button is allowed only as an open_url jump with NO own `value` payload.
-    // `value` may be a plain string OR object (both round-trip a callback), so
-    // reject on presence, not shape. A plain button (no open_url) also fires a
-    // callback — reject. NOTE: only card ELEMENTS (nodes with a `tag`) are judged
-    // this way, so free-form chart_spec data like `{tag:'x', value:{…}}` isn't
-    // misread as a control.
-    if (value.tag === 'button') {
-      if ('value' in value && value.value !== undefined) return `${path}.value`;
-      if (!isOpenUrlButton(value)) return `${path}.tag(button)`;
-    }
-  }
-  // Belt: reserved botmux routing discriminators anywhere (defence in depth —
-  // e.g. a value round-tripped inside a behavior, or a tag we didn't enumerate).
-  if (isRecord(value.value)) {
-    for (const field of ['action', 'key', 'root_id'] as const) {
-      if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
-    }
-  }
-
-  for (const [key, child] of Object.entries(value)) {
-    const found = findDisallowedCardCallback(child, `${path}.${key}`);
-    if (found) return found;
-  }
-  return null;
-}
-
 /**
  * Normalize user-supplied Lark/Feishu interactive card JSON into the raw card
  * body expected by the Lark send/reply APIs. Accepts either:
@@ -267,12 +236,17 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
  *   - webhook/openapi-style wrapper: {"msg_type":"interactive","card":{...}}
  *   - wrapper with string/object content: {"msg_type":"interactive","content":"{...}"}
  *
- * Deliberately rejects callback actions. botmux owns a broad card-action
+ * Rejects callback actions by default. botmux owns a broad card-action
  * namespace (close/restart/ask/relay/dashboard/etc.); arbitrary callbacks from
  * a CLI-created card would be routed through those handlers with host-side
- * privileges after a user clicks. Display cards and open-url buttons still work.
+ * privileges after a user clicks. An explicit callbackPolicy may admit only
+ * actions that resolve to one selected, enabled plugin; built-in key/root
+ * discriminators remain sealed. Display cards and open-url buttons still work.
  */
-export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiveCardResult {
+export function normalizeInteractiveCardInput(
+  raw: string,
+  options: { callbackPolicy?: InteractiveCardCallbackPolicy } = {},
+): NormalizedInteractiveCardResult {
   if (!raw.trim()) return { ok: false, error: '自定义卡片 JSON 不能为空' };
 
   const parsed = parseJson(raw, '自定义卡片 JSON');
@@ -298,7 +272,11 @@ export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiv
   const normalized = cardObjectFromValue(cardSource, '自定义卡片');
   if (!normalized.ok) return normalized;
 
-  const callbackPath = findDisallowedCardCallback(normalized.card);
+  const callbackPath = findDisallowedCardCallback(
+    normalized.card,
+    'card',
+    options.callbackPolicy,
+  );
   if (callbackPath) {
     return {
       ok: false,
@@ -324,6 +302,7 @@ export type SendVideoAttachmentsDeps = {
    * replies set this to one because only the primary media message has a durable
    * action/provider identity; later bare media sends would duplicate on replay. */
   maxMessages?: number;
+  beforeEffect?: () => void | Promise<void>;
 };
 
 export type SendVideoAttachmentsResult = {
@@ -349,7 +328,9 @@ export async function sendVideoAttachments(
   let primaryUsed = false;
   for (const video of videos) {
     try {
+      await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
+      await deps.beforeEffect?.();
       const imageKey = await deps.uploadImage(appId, video.coverPath);
       const content = JSON.stringify({
         file_key: fileKey,
@@ -357,14 +338,15 @@ export async function sendVideoAttachments(
         duration: video.durationMs,
       });
       const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
+      await deps.beforeEffect?.();
       const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
-    } catch (err: any) {
+    } catch (err: unknown) {
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
-        error: err?.message ?? String(err),
+        error: describeSendFailure(err),
       });
     }
   }
@@ -384,9 +366,14 @@ export type DispatchPrimaryOptions = {
   dispatch: (content: string, msgType: string, uuid?: string, suppressHook?: boolean) => Promise<string>;
   /** Provider UUID reconciliation must not repeat the local outbound hook. */
   suppressHook?: boolean;
+  /** Revalidate immediately before the distinct post-provider hook effect. */
+  beforeHook?: () => void | Promise<void>;
+  hookOrigin?: ManagedHookOrigin;
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
+  /** Revalidate managed authority immediately before each provider call. */
+  beforeEffect?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
 };
 
@@ -400,6 +387,7 @@ export async function dispatchPrimaryMessage(
   opts: DispatchPrimaryOptions,
 ): Promise<DispatchPrimaryResult> {
   if (!opts.quoteTargetId) {
+    await opts.beforeEffect?.();
     return {
       messageId: await (opts.suppressHook
         ? opts.dispatch(opts.content, opts.msgType, opts.uuid, true)
@@ -409,6 +397,7 @@ export async function dispatchPrimaryMessage(
   }
 
   try {
+    await opts.beforeEffect?.();
     const args = [
       opts.appId,
       opts.quoteTargetId,
@@ -418,13 +407,26 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const messageId = opts.suppressHook
-      ? await deps.replyMessage(...args, { suppressHook: true })
+    const hookOptions = opts.suppressHook
+      ? { suppressHook: true as const }
+      : opts.beforeHook
+        ? {
+            beforeHook: opts.beforeHook,
+            ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+          }
+        : undefined;
+    const messageId = hookOptions
+      ? await deps.replyMessage(...args, hookOptions)
       : await deps.replyMessage(...args);
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
     if (err instanceof opts.MessageWithdrawnError) {
-      await opts.beforeQuoteFallback?.();
+      // A quote failure is an awaited provider boundary.  Revalidate once
+      // immediately before the fallback effect: callers may provide a
+      // fallback-specific composite fence (for example VC + managed-origin),
+      // otherwise reuse the ordinary per-effect fence.
+      if (opts.beforeQuoteFallback) await opts.beforeQuoteFallback();
+      else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
         messageId: await (opts.suppressHook
@@ -437,14 +439,27 @@ export async function dispatchPrimaryMessage(
               opts.hookContext,
               { suppressHook: true },
             )
-          : deps.sendMessage(
-              opts.appId,
-              opts.targetChatId,
-              opts.content,
-              opts.msgType,
-              opts.uuid,
-              opts.hookContext,
-            )),
+          : opts.beforeHook
+            ? deps.sendMessage(
+                opts.appId,
+                opts.targetChatId,
+                opts.content,
+                opts.msgType,
+                opts.uuid,
+                opts.hookContext,
+                {
+                  beforeHook: opts.beforeHook,
+                  ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+                },
+              )
+            : deps.sendMessage(
+                opts.appId,
+                opts.targetChatId,
+                opts.content,
+                opts.msgType,
+                opts.uuid,
+                opts.hookContext,
+              )),
         primaryQuotedId: null,
       };
     }

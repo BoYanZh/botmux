@@ -1,7 +1,10 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
+import { readSessionRowCopiesAcrossStores } from '../services/session-store.js';
 import { findAuthenticatedAncestorSessionContext } from './session-marker.js';
+import {
+  authorizeScheduledTurn,
+  parseScheduledTurnId,
+  scheduledTurnAuthErrorMessage,
+} from './scheduled-turn-provenance.js';
 
 interface PersistedTurnSession {
   sessionId: string;
@@ -46,35 +49,17 @@ function nonEmpty(value: unknown): value is string {
 }
 
 function readPersistedSession(dataDir: string, sessionId: string): PersistedTurnSession {
-  const matches: PersistedTurnSession[] = [];
-  let files: string[];
+  // The scan itself lives in session-store (fail-closed on an unlistable data
+  // dir, corrupt individual files skipped so an unrelated bot's bad file can
+  // neither block nor impersonate a valid record). The exactly-once policy —
+  // a duplicated row must not be used to infer the caller — stays here.
+  let matches: readonly unknown[];
   try {
-    files = readdirSync(dataDir).filter((name) => (
-      name === 'sessions.json'
-      || (name.startsWith('sessions-') && name.endsWith('.json'))
-    ));
+    matches = readSessionRowCopiesAcrossStores(sessionId, dataDir);
   } catch (err) {
     throw new CurrentTurnProvenanceError(
       `无法读取 botmux session store：${err instanceof Error ? err.message : String(err)}`,
     );
-  }
-
-  for (const file of files) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8')) as unknown;
-    } catch {
-      // A corrupt unrelated bot file must not make a valid caller look like a
-      // different principal. The target session still has to resolve exactly
-      // once from a readable record below.
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-    const keyed = (parsed as Record<string, unknown>)[sessionId];
-    if (!keyed || typeof keyed !== 'object' || Array.isArray(keyed)) continue;
-    const session = keyed as PersistedTurnSession;
-    if (session.sessionId !== sessionId) continue;
-    matches.push(session);
   }
 
   if (matches.length === 0) {
@@ -85,7 +70,7 @@ function readPersistedSession(dataDir: string, sessionId: string): PersistedTurn
       `session ${sessionId} 在多个 session store 中重复，拒绝推断当前调用者`,
     );
   }
-  return matches[0]!;
+  return matches[0] as PersistedTurnSession;
 }
 
 export interface ResolveCurrentTurnProvenanceOptions {
@@ -139,12 +124,61 @@ export function resolveCurrentTurnProvenance(
   if (session.status && session.status !== 'active') {
     throw new CurrentTurnProvenanceError(`session ${marker.sessionId} 已非 active，拒绝授权当前命令`);
   }
+  if (!nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) {
+    throw new CurrentTurnProvenanceError(`session ${marker.sessionId} 缺少 larkAppId/chatId`);
+  }
+
+  const replyTarget = session.currentReplyTarget;
+
+  // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
+  // inbound message exists, so quoteTargetId/lastCallerOpenId were never set
+  // for this turn. Authenticate via the task binding + owner gate instead of
+  // the generation join. The live owner-allowed check is enforced on the
+  // sandboxed relay path (session-relay): the sandboxed CLI cannot read
+  // bots.json, and the daemon re-checks before every run mutation there.
+  // The default non-sandboxed signed-envelope route does not re-check
+  // membership — see scheduled-turn-provenance for the exact boundary.
+  if (parseScheduledTurnId(marker.turnId)) {
+    const auth = authorizeScheduledTurn({
+      turnId: marker.turnId,
+      dataDir: options.dataDir,
+      sessionLarkAppId: session.larkAppId,
+      sessionChatId: session.chatId,
+      isOwnerAllowed: () => true,
+    });
+    if ('error' in auth) {
+      throw new CurrentTurnProvenanceError(scheduledTurnAuthErrorMessage(auth.error));
+    }
+    let scheduledRootMessageId: string | undefined;
+    if ((session.scope ?? 'thread') === 'thread') {
+      if (!nonEmpty(session.rootMessageId)) {
+        throw new CurrentTurnProvenanceError(`thread session ${marker.sessionId} 缺少 rootMessageId`);
+      }
+      scheduledRootMessageId = session.rootMessageId;
+    } else if (replyTarget) {
+      if (!nonEmpty(replyTarget.rootMessageId)) {
+        throw new CurrentTurnProvenanceError(`chat session ${marker.sessionId} 的当前 reply target 缺少 rootMessageId`);
+      }
+      scheduledRootMessageId = replyTarget.rootMessageId;
+    }
+    return {
+      sessionId: marker.sessionId,
+      turnId: marker.turnId,
+      callerOpenId: auth.ownerOpenId,
+      larkAppId: session.larkAppId,
+      chatId: session.chatId,
+      ...(session.chatType === 'group' || session.chatType === 'p2p'
+        ? { chatType: session.chatType }
+        : {}),
+      ...(scheduledRootMessageId ? { rootMessageId: scheduledRootMessageId } : {}),
+    };
+  }
+
   if (!nonEmpty(session.quoteTargetId) || session.quoteTargetId !== marker.turnId) {
     throw new CurrentTurnProvenanceError(
       `进程标记 turn ${marker.turnId} 与 session 当前 quote turn ${session.quoteTargetId ?? '(missing)'} 不一致`,
     );
   }
-  const replyTarget = session.currentReplyTarget;
   if (replyTarget && (!nonEmpty(replyTarget.turnId) || replyTarget.turnId !== marker.turnId)) {
     throw new CurrentTurnProvenanceError(
       `进程标记 turn ${marker.turnId} 与 session 当前 reply turn ${replyTarget.turnId ?? '(missing)'} 不一致`,
@@ -152,9 +186,6 @@ export function resolveCurrentTurnProvenance(
   }
   if (!nonEmpty(session.lastCallerOpenId)) {
     throw new CurrentTurnProvenanceError(`session ${marker.sessionId} 缺少 lastCallerOpenId`);
-  }
-  if (!nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) {
-    throw new CurrentTurnProvenanceError(`session ${marker.sessionId} 缺少 larkAppId/chatId`);
   }
 
   let rootMessageId: string | undefined;

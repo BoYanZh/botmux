@@ -23,7 +23,8 @@ import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
-import { loadDag, type V3Dag } from './dag.js';
+import type { V3Dag } from './dag.js';
+import { loadDag } from './dag-loader.js';
 import { runWorkflow, type V3RuntimeDeps, type V3RuntimeOptions } from './runtime.js';
 import { createEphemeralPool } from './ephemeral-pool.js';
 import { readAndValidateManifest, ManifestValidationError } from './manifest.js';
@@ -35,6 +36,7 @@ import {
 } from './contract.js';
 import { readJournal } from './journal.js';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import {
   botToSnapshot,
   freezeDagBotSnapshots,
@@ -295,6 +297,13 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
   if (sub !== 'run') {
     console.error(`未知子命令: ${sub || '(空)'}\n用法: botmux v3 run <dag.json> [--bot ...] [--working-dir ...] [--base-dir ...] [--yes]`);
     process.exit(1);
+  }
+
+  // Machine-wide workflow kill-switch: the v3 dogfood runner launches a real
+  // ephemeral run, so refuse it when the feature is off.
+  if (!isWorkflowFeatureEnabled()) {
+    console.error('⛔ 本机已关闭「工作流(Workflow)」功能，`botmux v3 run` 不可用。如需开启，请在 Dashboard 设置页打开「工作流功能」开关，或设置 BOTMUX_WORKFLOW_ENABLED=true。');
+    process.exit(2);
   }
 
   let args: V3RunArgs;

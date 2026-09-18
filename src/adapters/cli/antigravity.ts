@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { delay, scaleMs } from '../../utils/timing.js';
+import { delay } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 
@@ -112,15 +112,22 @@ function historyDeltaContains(path: string, fromByte: number, marker: string): b
   return false;
 }
 
+const HISTORY_POLL_MS = 100;
+
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + scaleMs(timeoutMs);
-  while (Date.now() < deadline) {
+  // Count poll attempts, don't use Date.now()+budget. Under load the event
+  // loop slips; a wall deadline expires while `delay()` callbacks are still
+  // queued, so a history line that landed in-budget is missed and the
+  // worker shows a false "submit not confirmed". Same number of delay(100)
+  // waits as the unscaled timeout.
+  const polls = Math.max(1, Math.round(timeoutMs / HISTORY_POLL_MS));
+  for (let i = 0; i < polls; i++) {
     if (historyDeltaContains(path, fromByte, marker)) return true;
-    await delay(100);
+    await delay(HISTORY_POLL_MS);
   }
-  return false;
+  return historyDeltaContains(path, fromByte, marker);
 }
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
@@ -191,7 +198,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       //    as `{"display":"...","timestamp":...,"workspace":"..."}` —
       //    same pattern as Codex/CoCo. We poll the delta past `baseByte`
       //    for our `display` prefix marker. If unseen after the in-band
-      //    retry budget, return {submitted:false, recheck} so the worker
+      //    poll budget, return {submitted:false, recheck} so the worker
       //    can warn the user.
       const baseByte = currentFileSize(HISTORY_PATH);
       const marker = historyMarker(content);
@@ -236,18 +243,14 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       await delay(300);
       if (!trySendEnter()) return { submitted: false };
 
-      // 3 retries × 800ms each, then a final grace check. If the user
-      // concurrently types in the web terminal, a stray Enter may submit
-      // their half-typed text — we only retry when the JSONL is provably
-      // unchanged, so the race window is bounded to genuine submit
-      // failures.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) {
-          return undefined;
-        }
-        if (!trySendEnter()) return { submitted: false };
-      }
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) {
+      // Single Enter only — do NOT retry it. agy's history.jsonl append can
+      // lag well past a short per-attempt window (cold start, large initial
+      // prompt, network-bound auth), and a retry Enter lands on the
+      // already-submitted composer: the same prompt then gets submitted
+      // multiple times. Poll history once for the full in-band budget; a
+      // genuinely dropped Enter is recovered by the worker's deferred
+      // recheck, not by a second Enter (same pattern as the grok adapter).
+      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
         return undefined;
       }
 
