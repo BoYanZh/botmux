@@ -78,8 +78,7 @@ jobs:
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
-          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
@@ -181,8 +180,7 @@ jobs:
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
-          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
