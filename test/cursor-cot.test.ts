@@ -157,6 +157,30 @@ describe('cursor CoT mapping', () => {
     expect(collector.got).toEqual([{ kind: 'thinking', text: 'later thinking' }]);
   });
 
+  it('reads a new row reusing the deleted max rowid (equality re-sweep)', async () => {
+    const { chatsRoot, dbPath, chatId } = setupStore();
+    const init = await openRealStore(dbPath);
+    init.close();
+
+    const collector = startCollector(chatsRoot, chatId);
+    let db = await openDatabaseSync(dbPath);
+    insertAssistantTurn(db, 'pk-asst-1', 'first');
+    db.close();
+    await collector.waitFor(1);
+
+    // Delete the last row, then insert a NEW turn with a different SQL pk:
+    // max(rowid) stays exactly at the cursor, so the tick must re-sweep on
+    // equality (not only when max drops below it).
+    db = await openDatabaseSync(dbPath);
+    db.exec('DELETE FROM blobs');
+    insertAssistantTurn(db, 'pk-asst-2', 'second');
+    db.close();
+
+    await new Promise(r => setTimeout(r, 1800));
+    expect(collector.got).toHaveLength(2);
+    expect((collector.got[1] as { text: string }).text).toBe('second');
+  });
+
   it('does not replay the same row after a rowid re-sweep', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
     const init = await openRealStore(dbPath);

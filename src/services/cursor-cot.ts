@@ -15,11 +15,13 @@
  *
  * NOTE: blobs are NOT strictly append-only — rowid holes from deletes are
  * normal and a new row can reuse a rowid at/below an earlier max. Each tick
- * checks `max(rowid)`; when it drops below the cursor, the reader re-sweeps
- * and dedupes entry-producing blobs by the SQL primary key. Edge case not
- * covered: deleting exactly the last row (max stays at the cursor) while a
- * new out-of-band row reuses that rowid — the WHERE rowid window cannot see
- * it; such Cursor-internal cancellations are accepted misses.
+ * re-sweeps whenever `max(rowid)` is at OR below the cursor, and dedupes
+ * entry-producing blobs by the SQL primary key so ordinary steady-state
+ * ticks (max strictly above the cursor) keep the cheap forward window.
+ * Accepted limitation: a re-sweep only renders blobs whose SQL keys are in
+ * the FIFO seen-key buffer (4000); on a store larger than that, very old
+ * rows reappearing after deletes are treated like new nodes — real stores
+ * are ~500 entry-producing rows.
  *
  * F1 guard: only `assistant` and `tool` rows produce nodes. `user` rows
  * (which include botmux's hidden injection envelope and the raw prompt) and
@@ -270,9 +272,11 @@ export function startCursorCot(
       try {
         const maxRow = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
         const maxRowid = Number(maxRow?.m ?? 0);
-        if (maxRowid < state.lastRowid) {
-          // Deletes pushed max rowid below the cursor: re-sweep; the SQL
-          // primary-key dedup prevents replay.
+        if (maxRowid <= state.lastRowid) {
+          // Deletes at/above the window can leave a new out-of-band row
+          // reusing the max rowid: sweep on equality too, not only when max
+          // drops below the cursor. SQL primary-key dedup prevents replay;
+          // the per-turn key below caps how far back a sweep renders.
           state.lastRowid = 0;
         }
       } catch {
