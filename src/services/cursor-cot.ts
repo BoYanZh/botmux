@@ -17,10 +17,9 @@
  * normal and a new row can reuse a rowid at/below an earlier max. Each tick
  * reads the head row (pk + rowid); it re-sweeps only when a NEW head sits
  * at/below the cursor, so an idle session — head unchanged — never
- * materializes the whole table. Dedup on the sweep is by SQL primary key.
- * Accepted limitation: re-sweep replay protection is the FIFO seen-key
- * buffer (4000); on a store larger than that, very old rows reappearing
- * after deletes read like new nodes — real stores are ~500 entry rows.
+ * materializes the whole table. Startup seeds every pre-baseline row's pk
+ * into a non-evicting history set, so a sweep from rowid 0 never re-delivers
+ * history (B4), regardless of store size; only genuinely new rows render.
  *
  * F1 guard: only `assistant` and `tool` rows produce nodes. `user` rows
  * (which include botmux's hidden injection envelope and the raw prompt) and
@@ -62,9 +61,15 @@ interface ReaderState {
   /** SQL primary key of the current head row; a re-sweep is needed only
    *  when the head identity changes while its rowid is at/below cursor. */
   lastMaxPk?: string;
-  /** SQL primary keys of entry-producing blobs already observed, FIFO-bounded. */
+  /** SQL primary keys of entry-producing blobs observed after baseline,
+   *  FIFO-bounded. */
   seenKeys: Set<string>;
   seenKeyOrder: string[];
+  /** Primary keys of rows present at/before the startup baseline. Seeded
+   *  once and deliberately NOT FIFO-evicted: a re-sweep from rowid 0 must
+   *  never re-deliver history into the active turn (B4), regardless of how
+   *  large the store is. */
+  historyKeys: Set<string>;
 }
 
 const readers = new Map<string, ReaderState>();
@@ -194,7 +199,7 @@ function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries:
       try { blob = JSON.parse(text); } catch { continue; }
       const entries = entriesFromBlob(blob);
       if (entries.length === 0) continue;
-      if (state.seenKeys.has(row.pk)) continue;
+      if (state.historyKeys.has(row.pk) || state.seenKeys.has(row.pk)) continue;
       rememberSeenKey(state, row.pk);
       try { onEntries(entries); } catch { /* cosmetic channel — never break the read loop */ }
     }
@@ -202,6 +207,29 @@ function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries:
     try { db.close(); } catch { /* ignore */ }
   }
   return true;
+}
+
+/** Register primary keys of every row at/below the startup baseline into
+ *  `historyKeys` (id-only index read; data is never materialized). Runs
+ *  once so a later re-sweep from rowid 0 cannot re-deliver pre-baseline
+ *  history into the active turn (B4) — including on large stores, since
+ *  this set is not FIFO-evicted. */
+function seedHistoryKeys(state: ReaderState, dbPath: string, upTo: number): void {
+  if (upTo <= 0) return;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return;
+  try {
+    let rows: Array<{ pk: string }>;
+    try {
+      rows = db.prepare('SELECT id AS pk FROM blobs WHERE rowid <= ?').all(upTo) as typeof rows;
+    } catch {
+      // Table not ready yet — no history to seed; ticks handle startup.
+      return;
+    }
+    for (const row of rows) state.historyKeys.add(String(row.pk));
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
 }
 
 /** Resolve the store.db: reuse a previously resolved path, else scan the
@@ -264,8 +292,9 @@ export function startCursorCot(
     chatId, timer: undefined as unknown as NodeJS.Timeout,
     lastRowid: baseline, chatsRoot: options.chatsRoot,
     resolvedDbPath: initialPath, lastMaxPk: baselinePk,
-    seenKeys: new Set(), seenKeyOrder: [],
+    seenKeys: new Set(), seenKeyOrder: [], historyKeys: new Set(),
   };
+  seedHistoryKeys(state, initialPath, baseline);
   state.timer = setInterval(() => {
     const db = openDatabaseSyncNow(state.resolvedDbPath!, { readOnly: true });
     if (!db) {
