@@ -16,7 +16,10 @@
  * NOTE: blobs are NOT strictly append-only — rowid holes from deletes are
  * normal and a new row can reuse a rowid at/below an earlier max. Each tick
  * checks `max(rowid)`; when it drops below the cursor, the reader re-sweeps
- * and dedupes entry-producing blobs by the blob's own `id`.
+ * and dedupes entry-producing blobs by the SQL primary key. Edge case not
+ * covered: deleting exactly the last row (max stays at the cursor) while a
+ * new out-of-band row reuses that rowid — the WHERE rowid window cannot see
+ * it; such Cursor-internal cancellations are accepted misses.
  *
  * F1 guard: only `assistant` and `tool` rows produce nodes. `user` rows
  * (which include botmux's hidden injection envelope and the raw prompt) and
@@ -55,17 +58,12 @@ interface ReaderState {
   chatsRoot?: string;
   /** First successfully resolved store.db, reused on later ticks. */
   resolvedDbPath?: string;
-  /** Entry-producing blob keys already observed (role:id), FIFO-bounded. */
+  /** SQL primary keys of entry-producing blobs already observed, FIFO-bounded. */
   seenKeys: Set<string>;
   seenKeyOrder: string[];
 }
 
 const readers = new Map<string, ReaderState>();
-
-/** True while a CoT reader is running for the chat. */
-export function isCursorCotRunning(chatId: string): boolean {
-  return readers.has(chatId);
-}
 
 /** Cursor encodes a tool call id as `<providerCallId>\n<functionCallId>` — a
  *  literal newline that must not reach the AG-UI node id. Normalize to a safe
@@ -167,14 +165,23 @@ function rememberSeenKey(state: ReaderState, key: string): void {
 }
 
 /** Read and map new blobs since `state.lastRowid`. Binary / encrypted rows
- *  that fail to parse advance the cursor but produce no entries. */
-function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries: readonly CursorCotEntry[]) => void): void {
+ *  that fail to parse advance the cursor but produce no entries. The dedup
+ *  key is the SQL primary key (`pk`): the JSON body's own `id` is not unique
+ *  — assistant rows almost always carry the literal "1". Returns false when
+ *  the blobs table is not ready yet. */
+function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries: readonly CursorCotEntry[]) => void): boolean {
   const db = openDatabaseSyncNow(dbPath, { readOnly: true });
-  if (!db) return;
+  if (!db) return false;
   try {
-    const rows = db
-      .prepare('SELECT rowid AS rowid, data AS data FROM blobs WHERE rowid > ? ORDER BY rowid LIMIT ?')
-      .all(state.lastRowid, BATCH_LIMIT) as Array<{ rowid: number | bigint; data: unknown }>;
+    let rows: Array<{ pk: string; rowid: number | bigint; data: unknown }>;
+    try {
+      rows = db
+        .prepare('SELECT id AS pk, rowid AS rowid, data AS data FROM blobs WHERE rowid > ? ORDER BY rowid LIMIT ?')
+        .all(state.lastRowid, BATCH_LIMIT) as typeof rows;
+    } catch {
+      // Table not created yet — next tick retries; never throw.
+      return false;
+    }
     for (const row of rows) {
       state.lastRowid = Number(row.rowid);
       const text = blobText(row.data);
@@ -183,14 +190,14 @@ function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries:
       try { blob = JSON.parse(text); } catch { continue; }
       const entries = entriesFromBlob(blob);
       if (entries.length === 0) continue;
-      const key = `${blob.role}:${blob.id ?? `rowid-${row.rowid}`}`;
-      if (state.seenKeys.has(key)) continue;
-      rememberSeenKey(state, key);
+      if (state.seenKeys.has(row.pk)) continue;
+      rememberSeenKey(state, row.pk);
       try { onEntries(entries); } catch { /* cosmetic channel — never break the read loop */ }
     }
   } finally {
     try { db.close(); } catch { /* ignore */ }
   }
+  return true;
 }
 
 /** Resolve the store.db: reuse a previously resolved path, else scan the
@@ -232,10 +239,17 @@ export function startCursorCot(
   if (!initialPath) return false;
   const probe = openDatabaseSyncNow(initialPath, { readOnly: true });
   let baseline = 0;
+  let tableReady = false;
   if (probe) {
     try {
-      const row = probe.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
-      baseline = Number(row?.m ?? 0);
+      try {
+        const row = probe.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
+        baseline = Number(row?.m ?? 0);
+        tableReady = true;
+      } catch {
+        // Store file exists before the blobs table is created (normal Cursor
+        // startup ordering): start anyway with baseline 0; ticks wait for it.
+      }
     } finally {
       try { probe.close(); } catch { /* ignore */ }
     }
@@ -253,11 +267,18 @@ export function startCursorCot(
       return;
     }
     try {
-      const maxRow = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
-      const maxRowid = Number(maxRow?.m ?? 0);
-      if (maxRowid < state.lastRowid) {
-        // Rowid reuse after deletes: re-sweep; blob-id dedup prevents replay.
-        state.lastRowid = 0;
+      try {
+        const maxRow = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
+        const maxRowid = Number(maxRow?.m ?? 0);
+        if (maxRowid < state.lastRowid) {
+          // Deletes pushed max rowid below the cursor: re-sweep; the SQL
+          // primary-key dedup prevents replay.
+          state.lastRowid = 0;
+        }
+      } catch {
+        // blobs table not ready yet — skip this tick, never throw (B2).
+        try { db.close(); } catch { /* ignore */ }
+        return;
       }
     } finally {
       try { db.close(); } catch { /* ignore */ }
