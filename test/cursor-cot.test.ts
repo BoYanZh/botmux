@@ -202,6 +202,35 @@ describe('cursor CoT mapping', () => {
     expect((collector.got[1] as { text: string }).text).toBe('second');
   });
 
+  it('B4: deleting the head row after history never re-delivers history', async () => {
+    const { chatsRoot, dbPath, chatId } = setupStore();
+    // History exists BEFORE the reader starts, so its pks go into the
+    // startup history set. Reader baselines at the last row.
+    let db = await openRealStore(dbPath);
+    for (let i = 1; i <= 4; i++) insertAssistantTurn(db, `pk-old-${i}`, `old ${i}`);
+    db.close();
+
+    const collector = startCollector(chatsRoot, chatId);
+    await new Promise(r => setTimeout(r, 1500));
+    expect(collector.got).toEqual([]);
+
+    // Simulate cancelling a turn: delete the current head only. Max drops
+    // strictly below the cursor with a new head pk — re-sweep triggers, but
+    // none of the pre-baseline rows may be delivered.
+    db = await openDatabaseSync(dbPath);
+    db.exec('DELETE FROM blobs WHERE id = (SELECT id FROM blobs ORDER BY rowid DESC LIMIT 1)');
+    db.close();
+    await new Promise(r => setTimeout(r, 1800));
+    expect(collector.got).toEqual([]);
+
+    // A genuinely new turn after the cancel renders only the new content.
+    db = await openDatabaseSync(dbPath);
+    insertAssistantTurn(db, 'pk-new-1', 'real new turn');
+    db.close();
+    await collector.waitFor(1);
+    expect(collector.got).toEqual([{ kind: 'thinking', text: 'real new turn' }]);
+  });
+
   it('does not replay the same row after a rowid re-sweep', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
     const init = await openRealStore(dbPath);
