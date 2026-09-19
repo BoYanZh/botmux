@@ -2,28 +2,34 @@
  * Cursor CoT (thinking process) side-channel reader.
  *
  * Cursor Agent's agent-transcript JSONL carries only user prompts and the
- * final reply — no reasoning, no tool calls/results (tool_use lines are
- * dropped by cursor-transcript.ts). The model-visible timeline DOES persist,
- * in the per-chat SQLite store:
- *   ~/.cursor/chats/<projectHash>/<chatId>/store.db
- * Each row of `blobs` is one provider message: assistant blobs hold
- * reasoning / tool-call / text content blocks, tool blobs hold tool-result
- * blocks. Rows are append-only in rowid order.
+ * final reply — no reasoning, no tool calls/results. The model-visible
+ * timeline persists in the per-chat SQLite store:
+ *   ~/.cursor/chats/<projectHash>/<chatId>/store.db   (table: blobs)
  *
- * This module incrementally reads new blobs from a baselined rowid and maps
- * them, in order, to the CoT entries the native thinking bubble renders:
- * reasoning text → thinking; tool-call → tool node (command/path extracted as
- * subject BEFORE truncation); tool-result → result node; assistant text →
- * interim narration (the turn's closing text repeats at the bubble tail, the
- * same trade-off the Claude bridge accepts). Purely cosmetic: every read
- * catches its own errors and never affects turn settlement.
+ * Each blob row is one provider message: `assistant` rows hold reasoning /
+ * tool-call / text blocks, `tool` rows hold tool-result blocks. The reader
+ * runs ONCE for the whole session (started as soon as the chatId/store is
+ * discovered), so every input-delivery mode is covered — ordinary queued
+ * turns, argv-baked first prompts (`passesInitialPromptViaArgs`), adopted
+ * sessions, and autonomous Goal turns — no per-turn arm hook needed.
  *
- * Read-only SQLite access via sqlite-compat (bun:sqlite on the compiled
- * binary, node:sqlite under Node).
+ * NOTE: blobs are NOT strictly append-only — rowid holes from deletes are
+ * normal and a new row can reuse a rowid at/below an earlier max. Each tick
+ * checks `max(rowid)`; when it drops below the cursor, the reader re-sweeps
+ * and dedupes entry-producing blobs by the blob's own `id`.
+ *
+ * F1 guard: only `assistant` and `tool` rows produce nodes. `user` rows
+ * (which include botmux's hidden injection envelope and the raw prompt) and
+ * `system` rows never enter the bubble. Entries observed while no botmux turn
+ * is active are dropped by the callback, so blobs from startup / between
+ * turns never render. Purely cosmetic: every error is caught locally.
+ *
+ * Read-only access via sqlite-compat (bun:sqlite on the compiled binary,
+ * node:sqlite under Node).
  */
 import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
 
@@ -31,6 +37,7 @@ const COT_TOOL_ARGS_MAX_CHARS = 600;
 const COT_TOOL_RESULT_MAX_CHARS = 800;
 const BATCH_LIMIT = 500;
 const POLL_INTERVAL_MS = 1_000;
+const SEEN_KEYS_MAX = 4_000;
 
 export type CursorCotEntry =
   | { kind: 'thinking'; text: string }
@@ -46,24 +53,18 @@ interface ReaderState {
   timer: NodeJS.Timeout;
   lastRowid: number;
   chatsRoot?: string;
+  /** First successfully resolved store.db, reused on later ticks. */
+  resolvedDbPath?: string;
+  /** Entry-producing blob keys already observed (role:id), FIFO-bounded. */
+  seenKeys: Set<string>;
+  seenKeyOrder: string[];
 }
 
 const readers = new Map<string, ReaderState>();
 
-function cursorChatsRoot(rootOverride?: string): string {
-  return rootOverride ?? join(homedir(), '.cursor', 'chats');
-}
-
-/** Locate the store.db for a chatId: ~/.cursor/chats/<projectHash>/<chatId>/store.db. */
-export function findCursorStoreDb(chatId: string, chatsRoot?: string): string | undefined {
-  if (!chatId) return undefined;
-  const root = cursorChatsRoot(chatsRoot);
-  if (!existsSync(root)) return undefined;
-  for (const projectHash of readdirSync(root)) {
-    const candidate = join(root, projectHash, chatId, 'store.db');
-    if (existsSync(candidate)) return candidate;
-  }
-  return undefined;
+/** True while a CoT reader is running for the chat. */
+export function isCursorCotRunning(chatId: string): boolean {
+  return readers.has(chatId);
 }
 
 /** Cursor encodes a tool call id as `<providerCallId>\n<functionCallId>` — a
@@ -112,9 +113,12 @@ function toolResultEntry(block: any): CursorCotEntry | null {
   return { kind: 'tool_result', id, result };
 }
 
-/** Map one parsed blob's content blocks to CoT entries, in block order. */
+/** Map one parsed blob's content blocks to CoT entries, in block order.
+ *  F1: `user` rows (hidden envelope + raw prompt) and `system` rows never
+ *  produce entries. */
 function entriesFromBlob(blob: any): CursorCotEntry[] {
   if (!blob || typeof blob !== 'object') return [];
+  if (blob.role !== 'assistant' && blob.role !== 'tool') return [];
   const content = blob.content;
   if (!Array.isArray(content)) return [];
   const entries: CursorCotEntry[] = [];
@@ -152,8 +156,18 @@ function blobText(data: unknown): string | undefined {
   return undefined;
 }
 
-/** Read and map new blobs since rowid `state.lastRowid`. Binary / encrypted
- *  rows that fail to parse are skipped but advance the cursor. */
+function rememberSeenKey(state: ReaderState, key: string): void {
+  if (state.seenKeys.has(key)) return;
+  state.seenKeys.add(key);
+  state.seenKeyOrder.push(key);
+  if (state.seenKeyOrder.length > SEEN_KEYS_MAX) {
+    const drop = state.seenKeyOrder.splice(0, state.seenKeyOrder.length - SEEN_KEYS_MAX);
+    for (const k of drop) state.seenKeys.delete(k);
+  }
+}
+
+/** Read and map new blobs since `state.lastRowid`. Binary / encrypted rows
+ *  that fail to parse advance the cursor but produce no entries. */
 function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries: readonly CursorCotEntry[]) => void): void {
   const db = openDatabaseSyncNow(dbPath, { readOnly: true });
   if (!db) return;
@@ -168,13 +182,27 @@ function readNewEntries(state: ReaderState, dbPath: string, onEntries: (entries:
       let blob: any;
       try { blob = JSON.parse(text); } catch { continue; }
       const entries = entriesFromBlob(blob);
-      if (entries.length > 0) {
-        try { onEntries(entries); } catch { /* cosmetic channel — never break the read loop */ }
-      }
+      if (entries.length === 0) continue;
+      const key = `${blob.role}:${blob.id ?? `rowid-${row.rowid}`}`;
+      if (state.seenKeys.has(key)) continue;
+      rememberSeenKey(state, key);
+      try { onEntries(entries); } catch { /* cosmetic channel — never break the read loop */ }
     }
   } finally {
     try { db.close(); } catch { /* ignore */ }
   }
+}
+
+/** Resolve the store.db: reuse a previously resolved path, else scan the
+ *  chats root for `<projectHash>/<chatId>/store.db`. */
+function resolveDbPath(chatId: string, chatsRoot: string, cached?: string): string | undefined {
+  if (cached && existsSync(cached)) return cached;
+  if (!existsSync(chatsRoot)) return undefined;
+  for (const projectHash of readdirSync(chatsRoot)) {
+    const candidate = join(chatsRoot, projectHash, chatId, 'store.db');
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 export interface StartCursorCotOptions {
@@ -184,75 +212,75 @@ export interface StartCursorCotOptions {
   dbPath?: string;
 }
 
-/** Start (or restart) the CoT reader for a chat. Baselines at the current
- *  max rowid so historical blobs are not replayed; subsequent blobs poll at
- *  1s. The timer is unref'd so it can never hold the process alive. */
+/** Start the session-long CoT reader for a chat, baselined at the current
+ *  max rowid. Returns false (and registers nothing) when the store cannot be
+ *  resolved/opened, so the caller never believes a reader is running. The
+ *  timer is unref'd so it can never hold the process alive. */
 export function startCursorCot(
   chatId: string,
   onEntries: (entries: readonly CursorCotEntry[]) => void,
   options: StartCursorCotOptions = {},
-): void {
-  if (!chatId) return;
+): boolean {
+  if (!chatId) return false;
   let existing = readers.get(chatId);
-  if (existing) clearTimer(existing);
-  const dbPath = options.dbPath ?? findCursorStoreDb(chatId, options.chatsRoot);
-  if (!dbPath) return;
-  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (existing) {
+    clearInterval(existing.timer);
+    readers.delete(chatId);
+  }
+  const chatsRoot = options.chatsRoot ?? join(homedir(), '.cursor', 'chats');
+  const initialPath = options.dbPath ?? resolveDbPath(chatId, chatsRoot);
+  if (!initialPath) return false;
+  const probe = openDatabaseSyncNow(initialPath, { readOnly: true });
   let baseline = 0;
-  if (db) {
+  if (probe) {
     try {
-      const row = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
+      const row = probe.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
       baseline = Number(row?.m ?? 0);
     } finally {
-      try { db.close(); } catch { /* ignore */ }
+      try { probe.close(); } catch { /* ignore */ }
     }
   }
   const state: ReaderState = {
     chatId, timer: undefined as unknown as NodeJS.Timeout,
     lastRowid: baseline, chatsRoot: options.chatsRoot,
+    resolvedDbPath: initialPath, seenKeys: new Set(), seenKeyOrder: [],
   };
   state.timer = setInterval(() => {
-    const path = options.dbPath ?? findCursorStoreDb(chatId, options.chatsRoot) ?? dbPath;
-    try { readNewEntries(state, path, onEntries); } catch { /* cosmetic channel */ }
+    const db = openDatabaseSyncNow(state.resolvedDbPath!, { readOnly: true });
+    if (!db) {
+      // Store may have moved/rotated: rescan root, then retry next tick.
+      state.resolvedDbPath = resolveDbPath(chatId, chatsRoot, state.resolvedDbPath);
+      return;
+    }
+    try {
+      const maxRow = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
+      const maxRowid = Number(maxRow?.m ?? 0);
+      if (maxRowid < state.lastRowid) {
+        // Rowid reuse after deletes: re-sweep; blob-id dedup prevents replay.
+        state.lastRowid = 0;
+      }
+    } finally {
+      try { db.close(); } catch { /* ignore */ }
+    }
+    try {
+      readNewEntries(state, state.resolvedDbPath!, onEntries);
+    } catch { /* cosmetic channel */ }
   }, POLL_INTERVAL_MS);
   if (typeof state.timer.unref === 'function') state.timer.unref();
   readers.set(chatId, state);
-}
-
-function clearTimer(state: ReaderState): void {
-  clearInterval(state.timer);
+  return true;
 }
 
 /** Stop the CoT reader for a chat, if any. */
 export function stopCursorCot(chatId: string): void {
   const state = readers.get(chatId);
   if (!state) return;
-  clearTimer(state);
+  clearInterval(state.timer);
   readers.delete(chatId);
-}
-
-/** Reset the rowid cursor to the current end of the store, so subsequent
- *  reads only expose blobs written after this call. No-op when no reader is
- *  running — startCursorCot itself baselines at max rowid. */
-export function rebaselineCursorCot(chatId: string): void {
-  const existing = readers.get(chatId);
-  if (!existing) return;
-  const dbPath = findCursorStoreDb(chatId);
-  const db = dbPath ? openDatabaseSyncNow(dbPath, { readOnly: true }) : null;
-  if (!db) return;
-  try {
-    const row = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
-    existing.lastRowid = Number(row?.m ?? 0);
-  } finally {
-    try { db.close(); } catch { /* ignore */ }
-  }
 }
 
 /** Stop every active CoT reader (full teardown). */
 export function stopAllCursorCot(): void {
-  for (const state of readers.values()) clearTimer(state);
+  for (const state of readers.values()) clearInterval(state.timer);
   readers.clear();
 }
-
-export const cursorCotChatIdFromTranscriptPath = (transcriptPath: string): string =>
-  basename(dirname(transcriptPath));

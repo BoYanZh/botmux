@@ -239,7 +239,7 @@ import {
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
-import { startCursorCot, stopAllCursorCot, rebaselineCursorCot, cursorCotChatIdFromTranscriptPath, type CursorCotEntry } from './services/cursor-cot.js';
+import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -7138,24 +7138,28 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
  *  post-adopt Lark/user turn can still be attributed. */
 let cursorCotReaderChatId: string | undefined;
 
-/** Feed the current active botmux turn's thinking channel from Cursor's
- *  store.db timeline. Entries arriving with no active turn are dropped
- *  (cosmetic channel, never buffered). The reader is started lazily on the
- *  first turn whose chatId is known. */
+/** Start the session-long CoT reader once the Cursor chat's store is known.
+ *  Entries arriving with no active botmux turn are dropped by the callback
+ *  (cosmetic channel, never buffered). One session-long reader — instead of
+ *  per-turn arm hooks — covers every delivery mode: ordinary queued turns,
+ *  argv-baked first prompts, adopted sessions and autonomous Goal turns.
+ *  The reader chat is marked only on success so an unresolved store cannot
+ *  make later attempts short-circuit. */
 function ensureCursorCotReader(chatId: string): void {
   if (!chatId || cursorCotReaderChatId === chatId) return;
-  cursorCotReaderChatId = chatId;
-  startCursorCot(chatId, (entries: readonly CursorCotEntry[]) => {
+  const ok = startCursorCot(chatId, (entries: readonly CursorCotEntry[]) => {
     if (!currentBotmuxTurnId) return;
     observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   });
+  if (ok) {
+    cursorCotReaderChatId = chatId;
+    log(`Cursor CoT reader started for chat ${chatId}`);
+  }
 }
 
-/** Arm the Cursor thinking bubble for one turn. Called at the same pre-write
- *  anchor as the structured-bridge mark: the CLI has not produced any model
- *  output yet, so (re)baselining the store.db rowid here makes every reasoning
- *  / tool node of THIS turn visible while the previous turn's nodes stay out.
- *  Resolves the chatId from the observed session id or the live pid. */
+/** Start the Cursor thinking bubble as soon as the chatId is resolvable —
+ *  from the observed native session id, or the live process's store.db fd.
+ *  Called from spawn/observation, adopt and Goal paths. */
 function armCursorCotForTurn(): void {
   if (lastInitConfig?.cliId !== 'cursor') return;
   let chatId = lastSpawnEffectiveCliSessionId;
@@ -7165,13 +7169,12 @@ function armCursorCotForTurn(): void {
   }
   if (!chatId) return;
   ensureCursorCotReader(chatId);
-  rebaselineCursorCot(chatId);
 }
 
 function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
-  // Adopt path: the chat's whole timeline is live from this point, so start
-  // (baselined at the current end) the CoT reader; subsequent turns re-arm.
-  ensureCursorCotReader(cursorCotChatIdFromTranscriptPath(path));
+  // Transcript path: .../agent-transcripts/<chatId>/<chatId>.jsonl
+  const chatId = path.split('/').slice(-2, -1)[0];
+  ensureCursorCotReader(chatId);
   if (mode === 'baseline-existing' && existsSync(path)) {
     try {
       const full = drainCursorTranscript(path, 0);
@@ -11487,6 +11490,9 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      // The chat's store exists now: start the session-long thinking reader,
+      // covering the argv-baked first turn (which never enters flushPending).
+      ensureCursorCotReader(chatId);
       return;
     }
     attempts++;
@@ -12204,9 +12210,8 @@ async function flushPending(): Promise<void> {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
         } else if (lastInitConfig?.cliId === 'cursor' && !writeRpcEngine) {
-          // Cursor keeps its fallback bridge adopt-only, but its thinking
-          // bubble runs in every session: arm the store.db CoT reader at the
-          // same pre-write anchor the other bridges use.
+          // Reader is session-long; this also covers turns whose chatId the
+          // spawn-time observation has not resolved yet.
           armCursorCotForTurn();
         } else {
           // Same anchoring rule as the transcript bridges above: stamp the send
