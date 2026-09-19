@@ -15,13 +15,12 @@
  *
  * NOTE: blobs are NOT strictly append-only — rowid holes from deletes are
  * normal and a new row can reuse a rowid at/below an earlier max. Each tick
- * re-sweeps whenever `max(rowid)` is at OR below the cursor, and dedupes
- * entry-producing blobs by the SQL primary key so ordinary steady-state
- * ticks (max strictly above the cursor) keep the cheap forward window.
- * Accepted limitation: a re-sweep only renders blobs whose SQL keys are in
- * the FIFO seen-key buffer (4000); on a store larger than that, very old
- * rows reappearing after deletes are treated like new nodes — real stores
- * are ~500 entry-producing rows.
+ * reads the head row (pk + rowid); it re-sweeps only when a NEW head sits
+ * at/below the cursor, so an idle session — head unchanged — never
+ * materializes the whole table. Dedup on the sweep is by SQL primary key.
+ * Accepted limitation: re-sweep replay protection is the FIFO seen-key
+ * buffer (4000); on a store larger than that, very old rows reappearing
+ * after deletes read like new nodes — real stores are ~500 entry rows.
  *
  * F1 guard: only `assistant` and `tool` rows produce nodes. `user` rows
  * (which include botmux's hidden injection envelope and the raw prompt) and
@@ -60,6 +59,9 @@ interface ReaderState {
   chatsRoot?: string;
   /** First successfully resolved store.db, reused on later ticks. */
   resolvedDbPath?: string;
+  /** SQL primary key of the current head row; a re-sweep is needed only
+   *  when the head identity changes while its rowid is at/below cursor. */
+  lastMaxPk?: string;
   /** SQL primary keys of entry-producing blobs already observed, FIFO-bounded. */
   seenKeys: Set<string>;
   seenKeyOrder: string[];
@@ -241,16 +243,18 @@ export function startCursorCot(
   if (!initialPath) return false;
   const probe = openDatabaseSyncNow(initialPath, { readOnly: true });
   let baseline = 0;
-  let tableReady = false;
+  let baselinePk: string | undefined;
   if (probe) {
     try {
       try {
-        const row = probe.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
-        baseline = Number(row?.m ?? 0);
-        tableReady = true;
+        const head = probe
+          .prepare('SELECT id AS pk, rowid AS rowid FROM blobs ORDER BY rowid DESC LIMIT 1')
+          .get() as { pk?: string; rowid?: number | bigint };
+        baseline = Number(head?.rowid ?? 0);
+        baselinePk = head?.pk;
       } catch {
         // Store file exists before the blobs table is created (normal Cursor
-        // startup ordering): start anyway with baseline 0; ticks wait for it.
+        // startup ordering): start anyway at 0; ticks wait for the table.
       }
     } finally {
       try { probe.close(); } catch { /* ignore */ }
@@ -259,7 +263,8 @@ export function startCursorCot(
   const state: ReaderState = {
     chatId, timer: undefined as unknown as NodeJS.Timeout,
     lastRowid: baseline, chatsRoot: options.chatsRoot,
-    resolvedDbPath: initialPath, seenKeys: new Set(), seenKeyOrder: [],
+    resolvedDbPath: initialPath, lastMaxPk: baselinePk,
+    seenKeys: new Set(), seenKeyOrder: [],
   };
   state.timer = setInterval(() => {
     const db = openDatabaseSyncNow(state.resolvedDbPath!, { readOnly: true });
@@ -269,21 +274,25 @@ export function startCursorCot(
       return;
     }
     try {
+      let head: { pk?: string; rowid?: number | bigint };
       try {
-        const maxRow = db.prepare('SELECT max(rowid) AS m FROM blobs').get() as { m?: number | bigint };
-        const maxRowid = Number(maxRow?.m ?? 0);
-        if (maxRowid <= state.lastRowid) {
-          // Deletes at/above the window can leave a new out-of-band row
-          // reusing the max rowid: sweep on equality too, not only when max
-          // drops below the cursor. SQL primary-key dedup prevents replay;
-          // the per-turn key below caps how far back a sweep renders.
-          state.lastRowid = 0;
-        }
+        head = db
+          .prepare('SELECT id AS pk, rowid AS rowid FROM blobs ORDER BY rowid DESC LIMIT 1')
+          .get() as typeof head;
       } catch {
         // blobs table not ready yet — skip this tick, never throw (B2).
-        try { db.close(); } catch { /* ignore */ }
         return;
       }
+      const headRowid = Number(head.rowid ?? 0);
+      const headPk = head.pk;
+      if (headRowid <= state.lastRowid && state.lastMaxPk !== undefined && headPk !== state.lastMaxPk) {
+        // A delete left a NEW head at/below the cursor (a row reusing the
+        // max rowid, or max dropped): re-sweep. Same pk means plain idle —
+        // do nothing, so steady state never materializes the whole table
+        // (B3). SQL pk dedup prevents replay on the sweep.
+        state.lastRowid = 0;
+      }
+      state.lastMaxPk = headPk;
     } finally {
       try { db.close(); } catch { /* ignore */ }
     }
