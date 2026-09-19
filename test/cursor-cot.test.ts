@@ -21,31 +21,43 @@ function setupStore(): { chatsRoot: string; dbPath: string; chatId: string } {
   return { chatsRoot, dbPath: join(chatDir, 'store.db'), chatId };
 }
 
-async function openFreshStore(dbPath: string) {
+/** Match Cursor's real schema: the SQL primary key is the only unique row
+ *  identifier — assistant rows' JSON body id is almost always the literal
+ *  "1" (B1). */
+async function openRealStore(dbPath: string, withTable = true) {
   const db = await openDatabaseSync(dbPath);
-  db.exec('CREATE TABLE blobs (data TEXT)');
+  if (withTable) db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data TEXT)');
   return db;
 }
 
-function startCollector(chatsRoot: string, chatId: string): { got: CursorCotEntry[]; waitFor: (kind: CursorCotEntry['kind']) => Promise<void> } {
+function startCollector(chatsRoot: string, chatId: string): { got: CursorCotEntry[]; waitFor: (count: number) => Promise<void> } {
   const got: CursorCotEntry[] = [];
   let resolver: (() => void) | undefined;
-  let wanted: CursorCotEntry['kind'] | undefined;
+  let wanted = 0;
   startCursorCot(chatId, (entries) => {
     got.push(...entries);
-    if (wanted && got.some(e => e.kind === wanted)) {
-      wanted = undefined;
+    if (wanted > 0 && got.length >= wanted) {
+      wanted = 0;
       resolver?.();
     }
   }, { chatsRoot });
   return {
     got,
-    waitFor: (kind) => new Promise<void>((resolve) => {
-      wanted = kind;
+    waitFor: (count) => new Promise<void>((resolve) => {
+      wanted = count;
       resolver = resolve;
-      if (got.some(e => e.kind === kind)) resolve();
+      if (got.length >= count) resolve();
     }),
   };
+}
+
+/** Insert one assistant blob whose JSON id is the literal "1" — the real
+ *  Cursor shape; the SQL pk must stay unique across turns (B1). */
+function insertAssistantTurn(db: { prepare: (sql: string) => { run: (...p: unknown[]) => unknown } }, pk: string, text: string) {
+  db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(pk, line({
+    id: '1', role: 'assistant',
+    content: [{ type: 'reasoning', text }],
+  }));
 }
 
 afterEach(() => {
@@ -57,28 +69,27 @@ afterEach(() => {
 describe('cursor CoT mapping', () => {
   it('maps reasoning / tool-call / tool-result / text blocks in order', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
-    const init = await openFreshStore(dbPath);
+    const init = await openRealStore(dbPath);
     init.close();
 
     const collector = startCollector(chatsRoot, chatId);
     const callId = 'call-abc\nfc_1';
     const db = await openDatabaseSync(dbPath);
-    const insert = db.prepare('INSERT INTO blobs (data) VALUES (?)');
-    insert.run(line({
-      id: 'asst-1', role: 'assistant',
+    db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run('pk-asst-1', line({
+      id: '1', role: 'assistant',
       content: [
         { type: 'reasoning', text: 'thinking first' },
         { type: 'text', text: 'a narration' },
         { type: 'tool-call', toolCallId: callId, toolName: 'Shell', args: { command: 'ls -la /tmp' } },
       ],
     }));
-    insert.run(line({
+    db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run('pk-tool-1', line({
       id: 'tool-1', role: 'tool',
       content: [{ type: 'tool-result', toolCallId: callId, result: 'total 0' }],
     }));
     db.close();
 
-    await collector.waitFor('tool_result');
+    await collector.waitFor(4);
     expect(collector.got.map(e => e.kind)).toEqual(['thinking', 'text', 'tool_call', 'tool_result']);
     expect(collector.got[0]).toMatchObject({ kind: 'thinking', text: 'thinking first' });
     const toolCall = collector.got[2];
@@ -90,76 +101,107 @@ describe('cursor CoT mapping', () => {
     expect(collector.got[3]).toMatchObject({ kind: 'tool_result', result: 'total 0' });
   });
 
-  it('F1: user and system rows never produce entries', async () => {
+  it('B1: renders every assistant turn even though each JSON body id is "1"', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
-    const init = await openFreshStore(dbPath);
+    const init = await openRealStore(dbPath);
     init.close();
 
     const collector = startCollector(chatsRoot, chatId);
     const db = await openDatabaseSync(dbPath);
-    const insert = db.prepare('INSERT INTO blobs (data) VALUES (?)');
-    // Raw user prompt + hidden botmux envelope — must stay out of the bubble.
-    insert.run(line({
+    for (let i = 1; i <= 3; i++) insertAssistantTurn(db, `pk-asst-${i}`, `thinking ${i}`);
+    db.close();
+
+    await collector.waitFor(3);
+    expect(collector.got).toHaveLength(3);
+    expect(collector.got.map(e => e.kind)).toEqual(['thinking', 'thinking', 'thinking']);
+    expect((collector.got[2] as { text: string }).text).toBe('thinking 3');
+  });
+
+  it('F1: user and system rows never produce entries', async () => {
+    const { chatsRoot, dbPath, chatId } = setupStore();
+    const init = await openRealStore(dbPath);
+    init.close();
+
+    const collector = startCollector(chatsRoot, chatId);
+    const db = await openDatabaseSync(dbPath);
+    const insert = db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)');
+    insert.run('pk-user-1', line({
       id: 'user-1', role: 'user',
       content: [{ type: 'text', text: '<user_query>do the thing</user_query>\n<botmux_routing>hidden envelope' }],
     }));
-    insert.run(line({
-      id: 'sys-1', role: 'system',
-      content: [{ type: 'text', text: 'system text' }],
-    }));
-    // One assistant blob proves the reader tick ran.
-    insert.run(line({
-      id: 'asst-1', role: 'assistant',
-      content: [{ type: 'reasoning', text: 'real thinking' }],
+    insert.run('pk-sys-1', line({ id: 'sys-1', role: 'system', content: [{ type: 'text', text: 'system text' }] }));
+    insert.run('pk-asst-1', line({
+      id: '1', role: 'assistant', content: [{ type: 'reasoning', text: 'real thinking' }],
     }));
     db.close();
 
-    await collector.waitFor('thinking');
+    await collector.waitFor(1);
     expect(collector.got).toHaveLength(1);
     expect(collector.got[0]).toMatchObject({ kind: 'thinking', text: 'real thinking' });
   });
 
   it('skips empty reasoning and unparsable blobs', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
-    const init = await openFreshStore(dbPath);
+    const init = await openRealStore(dbPath);
     init.close();
 
     const collector = startCollector(chatsRoot, chatId);
     const db = await openDatabaseSync(dbPath);
-    const insert = db.prepare('INSERT INTO blobs (data) VALUES (?)');
-    insert.run(line({ id: 'asst-1', role: 'assistant', content: [{ type: 'reasoning', text: '' }] }));
-    insert.run('not json\n');
-    insert.run(line({ id: 'asst-2', role: 'assistant', content: [{ type: 'reasoning', text: 'later thinking' }] }));
+    const insert = db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)');
+    insert.run('pk-asst-1', line({ id: '1', role: 'assistant', content: [{ type: 'reasoning', text: '' }] }));
+    insert.run('pk-bad-1', 'not json\n');
+    insert.run('pk-asst-2', line({ id: '1', role: 'assistant', content: [{ type: 'reasoning', text: 'later thinking' }] }));
     db.close();
 
-    await collector.waitFor('thinking');
+    await collector.waitFor(1);
     expect(collector.got).toEqual([{ kind: 'thinking', text: 'later thinking' }]);
   });
 
-  it('does not replay the same blob after a rowid re-sweep', async () => {
+  it('does not replay the same row after a rowid re-sweep', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
-    const init = await openFreshStore(dbPath);
+    const init = await openRealStore(dbPath);
     init.close();
 
     const collector = startCollector(chatsRoot, chatId);
-    const db = await openDatabaseSync(dbPath);
-    db.prepare('INSERT INTO blobs (data) VALUES (?)')
-      .run(line({ id: 'asst-1', role: 'assistant', content: [{ type: 'reasoning', text: 'once only' }] }));
+    let db = await openDatabaseSync(dbPath);
+    insertAssistantTurn(db, 'pk-asst-1', 'once only');
     db.close();
 
-    await collector.waitFor('thinking');
+    await collector.waitFor(1);
     expect(collector.got).toHaveLength(1);
 
-    // Simulate rowid reuse below the cursor: tick re-sweeps from 0, the
-    // stable blob id must dedupe it.
-    const second = await openDatabaseSync(dbPath);
-    second.exec('DELETE FROM blobs');
-    second.prepare('INSERT INTO blobs (data) VALUES (?)')
-      .run(line({ id: 'asst-1', role: 'assistant', content: [{ type: 'reasoning', text: 'once only' }] }));
-    second.close();
+    // Same SQL primary key reinserted after delete: re-sweep must dedupe it.
+    db = await openDatabaseSync(dbPath);
+    db.exec('DELETE FROM blobs');
+    insertAssistantTurn(db, 'pk-asst-1', 'once only');
+    db.close();
 
     await new Promise(r => setTimeout(r, 1800));
     expect(collector.got).toHaveLength(1);
+  });
+
+  it('B2: store with no blobs table starts and never throws', async () => {
+    const { chatsRoot, dbPath, chatId } = setupStore();
+    // Store file exists, table deliberately missing (Cursor startup ordering).
+    const init = await openRealStore(dbPath, false);
+    init.close();
+
+    const got: CursorCotEntry[] = [];
+    let threw: unknown;
+    process.once('uncaughtException', (e) => { threw = e; });
+    const ok = startCursorCot(chatId, (entries) => got.push(...entries), { chatsRoot, dbPath });
+    expect(ok).toBe(true);
+    await new Promise(r => setTimeout(r, 1800));
+    expect(got).toEqual([]);
+    expect(threw).toBeUndefined();
+
+    // Once the table appears, subsequent blobs render.
+    const db = await openDatabaseSync(dbPath);
+    db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data TEXT)');
+    insertAssistantTurn(db, 'pk-asst-1', 'after table ready');
+    db.close();
+    await new Promise(r => setTimeout(r, 1500));
+    expect(got).toEqual([{ kind: 'thinking', text: 'after table ready' }]);
   });
 
   it('returns false when the store cannot be resolved', () => {
