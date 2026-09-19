@@ -157,6 +157,27 @@ describe('cursor CoT mapping', () => {
     expect(collector.got).toEqual([{ kind: 'thinking', text: 'later thinking' }]);
   });
 
+  it('B3: idle ticks with history do not re-sweep old rows', async () => {
+    const { chatsRoot, dbPath, chatId } = setupStore();
+    // Pre-populate BEFORE starting the reader: head sits exactly at the
+    // cursor. A full re-sweep would deliver these (their pks were never
+    // seen); idle must read nothing.
+    let db = await openRealStore(dbPath);
+    for (let i = 1; i <= 5; i++) insertAssistantTurn(db, `pk-old-${i}`, `old ${i}`);
+    db.close();
+
+    const collector = startCollector(chatsRoot, chatId);
+    await new Promise(r => setTimeout(r, 2800));
+    expect(collector.got).toEqual([]);
+
+    // A genuinely new turn (rowid above the cursor) still reads normally.
+    db = await openDatabaseSync(dbPath);
+    insertAssistantTurn(db, 'pk-new-1', 'new turn');
+    db.close();
+    await collector.waitFor(1);
+    expect(collector.got).toEqual([{ kind: 'thinking', text: 'new turn' }]);
+  });
+
   it('reads a new row reusing the deleted max rowid (equality re-sweep)', async () => {
     const { chatsRoot, dbPath, chatId } = setupStore();
     const init = await openRealStore(dbPath);
