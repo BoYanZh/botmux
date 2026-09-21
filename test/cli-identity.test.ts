@@ -25,6 +25,7 @@ import {
   publishActiveTurn,
   installLoginShellPathShim,
   writeSessionIdentity,
+  refreshSessionIdentity,
   clearSessionIdentity,
   clearAllSessionIdentities,
   sessionIdentityPath,
@@ -57,6 +58,15 @@ describe('renderIdentityEnv', () => {
   it('refuses a value carrying a line break rather than silently truncating it', () => {
     expect(() => renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a\nb' }))
       .toThrow(/line break/);
+  });
+
+  it('user-home identity exports HOME, never a token or app secret', () => {
+    const body = renderIdentityEnv({ tool: 'lark-cli', mode: 'user-home', home: '/p/ab/cd' });
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/p/ab/cd'");
+    // No credential text at all: not the token, and not an app secret.
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+    expect(body).not.toContain('LARKSUITE_CLI_APP_SECRET');
   });
 });
 
@@ -349,6 +359,40 @@ describe('renderIdentityWrapper', () => {
     expect(out).toBe('cli_app|u-tok|im +send');
   });
 
+  it('user-home identity runs the tool with HOME pointed at the person dir', () => {
+    const personHome = join(dir, 'ph');
+    mkdirSync(personHome, { recursive: true });
+    // Stub reports the HOME it saw; proves the wrapper redirects it for this exec.
+    const homeTool = join(dir, 'real-home.sh');
+    writeFileSync(homeTool, '#!/bin/sh\nprintf "%s|%s" "$HOME" "$*"\n');
+    chmodSync(homeTool, 0o755);
+    const wrapperPath = join(dir, 'lark-cli-home');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', homeTool));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', mode: 'user-home', home: personHome });
+    writeFileSync(join(dir, `${SESSION}.turn`), 'turn-h\n');
+
+    const out = runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
+    }, ['docs', '+fetch']);
+    expect(out).toBe(`${personHome}|docs +fetch`);
+  });
+
+  it('user-home identity refuses when the person HOME does not exist (never falls back)', () => {
+    const homeTool = join(dir, 'real-missing.sh');
+    writeFileSync(homeTool, '#!/bin/sh\necho RAN_WITH_WRONG_HOME\n');
+    chmodSync(homeTool, 0o755);
+    const wrapperPath = join(dir, 'lark-cli-missing');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', homeTool));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', mode: 'user-home', home: join(dir, 'does-not-exist') });
+    writeFileSync(join(dir, `${SESSION}.turn`), 'turn-h2\n');
+
+    const { status, stderr } = runDenied(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
+    });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(stderr).toContain('身份目录');
+  });
+
   // The regression this whole wrapper exists to prevent. Running the tool with
   // no identity env does NOT make it act as the bot: lark-cli then resolves the
   // operator's on-disk login and acts as *that person* — the machine account.
@@ -423,6 +467,35 @@ describe('renderIdentityWrapper', () => {
     publishActiveTurn(dir, SESSION, 'turn-A');
 
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
+  });
+
+  it('uses refreshed credentials on the next invocation in the same turn', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    const identity = { tool: 'lark-cli' as const, appId: 'a', userAccessToken: 'old-token', turnId: 'turn-A' };
+    writeSessionIdentity(dir, SESSION, identity);
+    publishActiveTurn(dir, SESSION, identity.turnId);
+    const env = { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION };
+    expect(runWrapper(wrapperPath, env)).toBe('a|old-token|');
+
+    expect(refreshSessionIdentity(dir, SESSION, { ...identity, userAccessToken: 'new-token' })).toBe(true);
+    expect(runWrapper(wrapperPath, env)).toBe('a|new-token|');
+  });
+
+  it.each([
+    ['turn-B', 'turn-A'],
+    ['turn-A', 'turn-B'],
+    [undefined, 'turn-A'],
+    ['turn-A', undefined],
+  ])('preserves identity when published turn is %s and active turn is %s', (publishedTurn, activeTurn) => {
+    const identity = { tool: 'lark-cli' as const, appId: 'a', userAccessToken: 'old-token', turnId: 'turn-A' };
+    const path = sessionIdentityPath(dir, SESSION, identity.tool);
+    if (publishedTurn) writeSessionIdentity(dir, SESSION, { ...identity, turnId: publishedTurn });
+    if (activeTurn) publishActiveTurn(dir, SESSION, activeTurn);
+    const before = existsSync(path) ? readFileSync(path) : undefined;
+
+    expect(refreshSessionIdentity(dir, SESSION, { ...identity, userAccessToken: 'new-token' })).toBe(false);
+    expect(existsSync(path) ? readFileSync(path) : undefined).toEqual(before);
   });
 
   // The regression itself: Alice's turn is mid-flight when Bob's message lands.

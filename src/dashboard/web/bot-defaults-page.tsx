@@ -57,6 +57,8 @@ import {
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
+import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
@@ -83,9 +85,14 @@ import {
  *  save, even though the wrapper only replaces the binary — `stripWrapperUnsafeArgs`
  *  removes `--settings`, botmux's `-c` overrides and `--dangerously-bypass-hook-trust`,
  *  never `--effort`. So resolve the key first. */
-function reasoningCatalogKey(cliKey: string): string | undefined {
+function selectedAgentCliId(cliKey: string): string {
   const cliId = lookupCliSelection(cliKey)?.cliId ?? cliKey;
-  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code') return cliId;
+  return cliId;
+}
+
+function reasoningCatalogKey(cliKey: string): string | undefined {
+  const cliId = selectedAgentCliId(cliKey);
+  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code' || cliId === 'kimi') return cliId;
   if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
   return undefined;
 }
@@ -760,10 +767,10 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
+    codexBrowser: body.codexBrowser,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
-    thinkingCard: body.thinkingCard,
-    thinkingCardToolResult: body.thinkingCardToolResult,
+    cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
@@ -771,6 +778,8 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
+    groupJoinCommandEnabled: body.groupJoinCommandEnabled,
+    groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
@@ -1185,6 +1194,9 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+                避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
+            <section className="bd-tile"><ReplyDeliverySection bot={bot} patchBot={patchBot} /></section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -1196,6 +1208,80 @@ function BotDefaultsCard(props: {
       </div>
     </article>
   );
+}
+
+export function OncallServiceSecretSettings() {
+  const inputId = useId();
+  const [secret, setSecret] = useState('');
+  const [configured, setConfigured] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void sendJson('GET', '/api/oncall-service-secret').then(res => {
+      if (cancelled) return;
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setConfigured(res.body.configured === true);
+    }).catch(() => { if (!cancelled) setStatus({ text: '无法读取凭据状态，请刷新后重试' }); });
+    return () => { cancelled = true; };
+  }, []);
+  async function saveSecret(): Promise<void> {
+    setBusy(true); setStatus(null);
+    try {
+      const response = await fetch('/api/oncall-service-secret', {
+        method: 'PUT', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() },
+        body: JSON.stringify({ secret }),
+      });
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error(body.error || '保存失败');
+      setConfigured(true);
+      setStatus({ text: '已保存，重启 BotMux 后生效', ok: true });
+    } catch (error) { setStatus({ text: caughtErrorText(error) }); }
+    finally { setSecret(''); setBusy(false); }
+  }
+  return <form className="bd-oncall-secret" onSubmit={event => { event.preventDefault(); if (secret.trim() && !busy && configured !== null) void saveSecret(); }}>
+    <label htmlFor={inputId}>Service Secret <span className="muted">{configured === null ? '状态未确认' : configured ? '已配置' : '未配置'}</span></label>
+    <div className="bd-oncall-secret-input">
+      <input id={inputId} type="password" autoComplete="new-password" spellCheck={false} maxLength={8192}
+        value={secret} disabled={busy || configured === null} placeholder={configured ? '输入新凭据以替换' : '输入 Service Secret'}
+        onChange={event => setSecret(event.currentTarget.value)} />
+      <button type="submit" disabled={busy || configured === null || !secret.trim()}>{busy ? '保存中' : '保存'}</button>
+    </div>
+    <small className="muted">同一部署共用，保存后重启生效。</small>
+    <StatusSpan status={status} />
+  </form>;
+}
+
+function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; chats: GroupChat[]; active: boolean }) {
+  const [policy, setPolicy] = useState(props.bot.oncallGroup ?? { enabled: false, chatIds: [] });
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const groupLabel = useId();
+  useEffect(() => { setPolicy(props.bot.oncallGroup ?? { enabled: false, chatIds: [] }); }, [props.bot.oncallGroup]);
+  async function save(next: typeof policy): Promise<void> {
+    const previous = policy;
+    setPolicy(next);
+    setBusy(true); setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/oncall-group`, { oncallGroup: next });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setPolicy(res.body.oncallGroup);
+      props.patchBot(props.bot.larkAppId, { oncallGroup: res.body.oncallGroup });
+    } catch (error) { setPolicy(previous); setStatus({ text: caughtErrorText(error) }); }
+    finally { setBusy(false); }
+  }
+  const options = [...props.chats, ...policy.chatIds.filter(id => !props.chats.some(chat => chat.chatId === id)).map(chatId => ({ chatId }))];
+  return <fieldset className="bd-oncall-settings" disabled={busy} aria-busy={busy}>
+    <ToggleRow checked={policy.enabled} disabled={busy} title="支持拉起 Oncall 群" help={null} onChange={enabled => void save({ ...policy, enabled })} />
+    <div className="bd-oncall-scope">
+      <label htmlFor={groupLabel}>生效群</label>
+      <SearchableGroupPicker id={groupLabel} label="生效群" groups={options} value={policy.chatIds} multiple disabled={!policy.enabled}
+        placeholder="选择生效群" searchPlaceholder="搜索生效群" emptyLabel="暂无匹配群" selectedCountLabel={count => `已选 ${count} 个群`}
+        onChange={value => void save({ ...policy, chatIds: value as string[] })} />
+    </div>
+    <StatusSpan status={status ?? (policy.enabled && !policy.chatIds.length ? { text: '请选择生效群' } : null)} />
+    {props.active && ui.authed ? <OncallServiceSecretSettings key={props.bot.larkAppId} /> : null}
+  </fieldset>;
 }
 
 function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
@@ -1277,7 +1363,10 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <h3 className="bd-section-title">
         <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
       </h3>
-      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+      <div className="bd-feedback-controls">
+        <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+        <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
+      </div>
       <StatusSpan status={status} />
       {on ? (
         <details className="bd-feedback-advanced">
@@ -2365,7 +2454,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (!isBackendVariantCliId(nextKey)) {
+    if (!isBackendVariantCliId(selectedAgentCliId(nextKey))) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2434,7 +2523,8 @@ export function BotAgentSection(props: {
       turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
     }
     const trimmedNativeModel = nativeModel.trim();
-    if (cliKey === 'traex') {
+    const saveCliId = selectedAgentCliId(cliKey);
+    if (saveCliId === 'traex') {
       const nextNativePolicyErrors: NativePolicyErrors = {
         model: nativeModelMode === 'custom' && !trimmedNativeModel ? tr('botDefaults.nativeSubagentModelRequired') : null,
         effort: nativeEffortMode === 'custom' && !nativeEffort ? tr('botDefaults.nativeSubagentReasoningEffortRequired') : null,
@@ -2460,7 +2550,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(isBackendVariantCliId(cliKey) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2471,7 +2561,7 @@ export function BotAgentSection(props: {
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
-        ...(cliKey === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
+        ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
@@ -2512,6 +2602,7 @@ export function BotAgentSection(props: {
             ? runtimeTouched ? null : bot.cliPathOverride ?? null
             : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
+          cliLaunchMode: res.body.cliLaunchMode ?? null,
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
@@ -2520,6 +2611,8 @@ export function BotAgentSection(props: {
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
+          readIsolation: res.body.readIsolation === true,
+          readIsolationSupported: res.body.readIsolationSupported === true,
         });
         // Re-sync the minutes input from the authoritative saved ms and clear
         // the dirty flag so a subsequent unrelated save won't touch the field.
@@ -2665,12 +2758,13 @@ export function BotAgentSection(props: {
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
-  const isRiff = cliKey === 'riff';
-  const isTraex = isBackendVariantCliId(cliKey);
-  const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const selectedCliId = selectedAgentCliId(cliKey);
+  const isRiff = selectedCliId === 'riff';
+  const isTraex = isBackendVariantCliId(selectedCliId);
+  const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
-  const isDsh = cliKey === 'dsh';
+  const isDsh = selectedCliId === 'dsh';
   const reasoningEffortOptions = useMemo(
     () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
     [cliKey, isCodexSelection, model],
@@ -2705,7 +2799,7 @@ export function BotAgentSection(props: {
   }, [nativeEffort, nativeEffortMode, nativePolicyErrors.effort]);
   useEffect(() => {
     if (
-      cliKey === 'traex'
+      isTraex
       && nativePolicyTouched
       && nativeEffortMode === 'custom'
       && nativeEffort
@@ -3052,9 +3146,9 @@ export function BotAgentSection(props: {
                 {
                   value: '',
                   label: tr(
-                    cliKey === 'grok'
+                    selectedCliId === 'grok'
                       ? 'botDefaults.agentReasoningEffortDefaultGrok'
-                      : cliKey === 'traex'
+                      : isTraex
                         ? 'botDefaults.agentReasoningEffortDefaultTraex'
                       : isCodexSelection
                         ? 'botDefaults.agentReasoningEffortDefaultCodex'
@@ -3071,7 +3165,7 @@ export function BotAgentSection(props: {
           </div>
         </div>
       )}
-      {cliKey === 'traex' && (
+      {isTraex && (
         <div className="bd-codex-runtime" data-native-subagent-runtime="">
           <div className="bd-runtime-heading">
             <FieldTitle help={tr('botDefaults.nativeSubagentHelp')}>{tr('botDefaults.nativeSubagentTitle')}</FieldTitle>
@@ -3373,7 +3467,11 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
   // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+  const [joinCmdOn, setJoinCmdOn] = useState(bot.groupJoinCommandEnabled === true);
+  const [joinCmd, setJoinCmd] = useState(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   const [status, setStatus] = useState<StatusMessage>(null);
+  // 同一块里有两排按钮，状态提示跟着最后操作的那一排显示。
+  const [statusKey, setStatusKey] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3381,6 +3479,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+    setJoinCmdOn(bot.groupJoinCommandEnabled === true);
+    setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
     bot.autoStartOnGroupJoin,
@@ -3388,11 +3488,14 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartOnGroupJoinSeed,
     bot.autoStartOnGroupJoinSeedDefault,
     bot.autoStartOnNewTopic,
+    bot.groupJoinCommandEnabled,
+    bot.groupJoinCommand,
   ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
     setStatus(null);
+    setStatusKey(key);
     try {
       const res = await putCardPref(patch);
       setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
@@ -3465,7 +3568,36 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
             {tr('botDefaults.autoStartJoinSeedReset')}
           </button>
         ) : null}
-        <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
+        {statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
+      </div>
+      <ToggleRow
+        checked={joinCmdOn}
+        disabled={busy === 'joincmd-toggle' || (!joinCmdOn && !(bot.groupJoinCommand ?? '').trim())}
+        dataAction="toggle-group-join-command"
+        title={tr('botDefaults.groupJoinCommand')}
+        help={tr('botDefaults.groupJoinCommandHelp')}
+        onChange={checked => {
+          setJoinCmdOn(checked);
+          void savePatch({ groupJoinCommandEnabled: checked }, 'joincmd-toggle');
+        }}
+      />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.groupJoinCommandFieldHelp')}>{tr('botDefaults.groupJoinCommandField')}</FieldTitle>
+          <textarea
+            data-input="groupJoinCommand"
+            rows={2}
+            placeholder={tr('botDefaults.groupJoinCommandPlaceholder')}
+            value={joinCmd}
+            onChange={event => setJoinCmd(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-group-join-command" disabled={busy === 'joincmd'} onClick={() => void savePatch({ groupJoinCommand: joinCmd }, 'joincmd')}>
+          {tr('botDefaults.groupJoinCommandSave')}
+        </button>
+        {statusKey?.startsWith('joincmd') ? <StatusSpan status={status} attr={{ 'data-group-join-command-status': '' }} /> : null}
       </div>
     </div>
   );
@@ -3574,24 +3706,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
-          <div className="bd-row">
-            <label>
-              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
-              <select
-                data-input="triggerUserAuthFallback"
-                value={fallback}
-                disabled={busy}
-                onChange={event => void save({
-                  enabled: true,
-                  tools,
-                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
-                })}
-              >
-                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
-                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
-              </select>
-            </label>
-          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
@@ -4275,8 +4390,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
-  const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
-  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
+  const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -4289,9 +4403,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-    setThinkingCard(bot.thinkingCard !== false);
-    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setCotEnabled(bot.cotEnabled !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4398,42 +4511,27 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
           <ToggleRow
-            checked={thinkingCard}
+            checked={cotEnabled}
             disabled={busy !== null}
-            dataAction="toggle-thinking-card"
-            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
-            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
-            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
+            dataAction="toggle-cot"
+            title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
-              const previous = thinkingCard;
-              setThinkingCard(checked);
-              void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
+              const previous = cotEnabled;
+              setCotEnabled(checked);
+              void savePatch({ cotEnabled: checked }, 'cot', () => setCotEnabled(previous));
             }}
           />
-          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
-            <ToggleRow
-              checked={thinkingCardToolResult}
-              disabled={busy !== null}
-              dataAction="toggle-thinking-card-tool-result"
-              title={tr('botDefaults.thinkingCardToolResult')}
-              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
-              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
-              onChange={checked => {
-                const previous = thinkingCardToolResult;
-                setThinkingCardToolResult(checked);
-                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
-              }}
-            />
-          </div>
           {replyMode === 'legacy' && pinToggle}
           <QuietPresetSection
             tr={tr}
-            thinkingCard={thinkingCard}
+            cotEnabled={cotEnabled}
             silentReactions={silentReactions}
             disableStreaming={disableStreaming}
             putCardPref={putCardPref}
             onApplied={() => {
-              setThinkingCard(false);
+              setCotEnabled(false);
               setSilentReactions(true);
               setDisableStreaming(true);
             }}
@@ -4547,15 +4645,17 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
+  const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | null>(null);
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
+  useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
 
-  async function save(checked: boolean): Promise<void> {
+  async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
     setCleanInput(checked);
-    setBusy(true);
+    setBusy('clean-input');
     setStatus(null);
     try {
       const res = await props.putCardPref({ codexAppCleanInput: checked });
@@ -4569,7 +4669,28 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setCleanInput(previous);
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function saveBrowser(checked: boolean): Promise<void> {
+    const previous = browserEnabled;
+    setBrowserEnabled(checked);
+    setBusy('browser');
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ codexBrowser: checked });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setBrowserEnabled(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setBrowserEnabled(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -4578,13 +4699,23 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
       <ToggleRow
         checked={cleanInput}
-        disabled={busy}
+        disabled={busy !== null}
         dataAction="toggle-codex-app-clean-input"
         title={tr('botDefaults.codexAppCleanInput')}
         help={tr('botDefaults.codexAppCleanInputHelp')}
-        onChange={checked => void save(checked)}
+        onChange={checked => void saveCleanInput(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+      <ToggleRow
+        checked={browserEnabled}
+        disabled={busy !== null}
+        dataAction="toggle-codex-browser"
+        title={tr('botDefaults.codexBrowser')}
+        description={tr('botDefaults.codexBrowserDescription')}
+        help={tr('botDefaults.codexBrowserHelp')}
+        onChange={checked => void saveBrowser(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>
@@ -4638,6 +4769,64 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
       <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+/** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
+ *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
+ *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
+export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [transcript, setTranscript] = useState(props.bot.replyDelivery === 'transcript');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = props.bot.replyDeliverySupported === true;
+  const defaultMode = props.bot.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send';
+
+  useEffect(() => setTranscript(props.bot.replyDelivery === 'transcript'), [props.bot.replyDelivery]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = transcript;
+    setTranscript(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-delivery`, { replyDelivery: next ? 'transcript' : 'send' });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.replyDelivery === 'transcript';
+        setTranscript(saved);
+        props.patchBot(props.bot.larkAppId, { replyDelivery: saved ? 'transcript' : 'send' });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setTranscript(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setTranscript(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-reply-delivery>
+      <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <ToggleRow
+        checked={transcript}
+        disabled={busy || !supported}
+        dataAction="toggle-reply-delivery"
+        title={tr('botDefaults.replyDeliveryTranscript')}
+        help={tr('botDefaults.replyDeliveryHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">
+        {supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
+      </small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-reply-delivery-status': '' }} />
       </div>
     </section>
   );

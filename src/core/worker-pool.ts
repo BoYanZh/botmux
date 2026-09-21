@@ -12,6 +12,7 @@ import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -30,9 +31,10 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
+import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
@@ -73,6 +75,7 @@ import {
   type CliRuntimeConfig,
   type CliRuntimeSnapshot,
 } from '../adapters/cli/runtime.js';
+import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
@@ -94,13 +97,15 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { zmxEnv } from '../setup/ensure-zmx.js';
+import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -111,6 +116,7 @@ import { RestartCoordinator, type RestartObserver } from './restart-coordinator.
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -342,7 +348,7 @@ export function getDaemonSessionUsageSnapshot(
       ?? ds.adoptedFrom?.cliId
       ?? getBot(ds.larkAppId).config.cliId
     ) as CliId;
-    return getSessionUsageSnapshot({
+    const snapshot = getSessionUsageSnapshot({
       cliId: resolvedCliId,
       sessionId: ds.session.sessionId,
       cliSessionId:
@@ -366,6 +372,17 @@ export function getDaemonSessionUsageSnapshot(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
     });
+    // Claude Code statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
+    // 回复卡页脚、流式卡用量行、IPC /usage 三个读取点都经本函数，只在这里合并一次。
+    // 独立 try/catch：快照读取失败不能拖垮 transcript 用量。无文件 / 陈旧 ⇒ 不带 key，
+    // 卡片与无 statusline 时逐字节相同。
+    if (resolvedCliId === 'claude-code') {
+      try {
+        const quota = toCardQuota(readStatuslineSnapshot(config.session.dataDir, ds.session.sessionId));
+        if (quota) return { ...snapshot, quota };
+      } catch { /* best-effort */ }
+    }
+    return snapshot;
   } catch (error) {
     logger.warn(
       `[${ds.session.sessionId.slice(0, 8)}] Failed to read card usage snapshot: `
@@ -542,7 +559,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
-import { trustedSessionController } from './trusted-session-controller.js';
+import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -1100,7 +1117,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -1156,7 +1173,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -1175,7 +1192,18 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
  *  「已处理 · 判定无需回复」 instead of 「等待输入」 until beginNewTurn clears
  *  the flag, or an unrelated patch would silently revert the label. */
 export function silentIdleCardFlag(ds: DaemonSession): boolean {
-  return !!ds.silentIdleTurnId;
+  return idleCardLabel(ds) === 'silent';
+}
+
+/** idle 卡头的替代标签（所有 buildStreamingCard 调用点统一从这里取）：
+ *  'completed' = transcript 模式下本轮最终回复卡已投递（`completedIdleTurnId`）；
+ *  'silent' = 本轮判定无需回复（`silentIdleTurnId`）；两者都无 → undefined，
+ *  卡头照旧「等待输入」。两个 turnId 在每个新轮次入口一起清理，正常不会同时
+ *  存在；万一同时存在，「已完成」更贴近事实（回复确实发出去了）。 */
+export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
+  if (ds.completedIdleTurnId) return 'completed';
+  if (ds.silentIdleTurnId) return 'silent';
+  return undefined;
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
@@ -1272,7 +1300,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -1353,7 +1381,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // path fires every 12s while a turn works, so omitting it would drop the
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -1438,7 +1466,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -1987,8 +2015,8 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
@@ -2001,6 +2029,7 @@ function sessionAgentConfig(
     const runtime = selected.cliRuntime ?? undefined;
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
+    const cliLaunchMode = selected.cliLaunchMode ?? undefined;
     const reasoningEffort = selected.reasoningEffort ?? groupEffort;
     const modelBackendVariant = isBackendVariantCliId(selected.cliId)
       ? selected.modelBackendVariant ?? undefined
@@ -2013,6 +2042,7 @@ function sessionAgentConfig(
       ds.session.cliRuntime = runtime;
       ds.session.cliPathOverride = legacyPath;
       ds.session.wrapperCli = wrapperCli;
+      ds.session.cliLaunchMode = cliLaunchMode;
       ds.session.reasoningEffort = reasoningEffort;
       ds.session.modelBackendVariant = modelBackendVariant;
       ds.session.agentFrozen = true;
@@ -2026,7 +2056,7 @@ function sessionAgentConfig(
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2071,6 +2101,7 @@ function sessionAgentConfig(
       ?? runtimePathOverride(runtime)
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
+    ds.session.cliLaunchMode = ds.session.cliLaunchMode ?? botCfg.cliLaunchMode;
     ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
@@ -2109,6 +2140,10 @@ function sessionAgentConfig(
       ds.session.modelBackendVariant = undefined;
       repaired = true;
     }
+    if (ds.session.cliId !== 'traex' && ds.session.cliLaunchMode !== undefined) {
+      ds.session.cliLaunchMode = undefined;
+      repaired = true;
+    }
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
@@ -2126,6 +2161,7 @@ function sessionAgentConfig(
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
+    cliLaunchMode: ds.session.cliLaunchMode,
     model,
     modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
@@ -2195,12 +2231,13 @@ export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonS
  */
 function frozenSessionLaunchIdentity(
   ds: DaemonSession,
-  botCfg: { cliPathOverride?: string; wrapperCli?: string },
-): { cliPathOverride?: string; wrapperCli?: string } {
+  botCfg: { cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode },
+): { cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode } {
   if (ds.session.agentFrozen) {
     return {
       cliPathOverride: ds.session.cliPathOverride,
       wrapperCli: ds.session.wrapperCli,
+      cliLaunchMode: ds.session.cliLaunchMode,
     };
   }
   // Legacy, never frozen: it was launching off the live bot config, so that is
@@ -2208,6 +2245,7 @@ function frozenSessionLaunchIdentity(
   return {
     cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
+    cliLaunchMode: ds.session.cliLaunchMode ?? botCfg.cliLaunchMode,
   };
 }
 
@@ -2494,7 +2532,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -2640,7 +2678,11 @@ export function parkStreamCard(ds: DaemonSession): void {
     title: ds.currentTurnTitle ?? '',
     displayMode: ds.displayMode ?? 'hidden',
     imageKey: ds.currentImageKey,
-    ...(silentIdleCardFlag(ds) ? { silentIdle: true } : {}),
+    ...(() => {
+      // 新字段 idleLabel 为准；'silent' 同时写旧字段 silentIdle，旧版 daemon 读盘不退化。
+      const label = idleCardLabel(ds);
+      return label ? { idleLabel: label, ...(label === 'silent' ? { silentIdle: true } : {}) } : {};
+    })(),
     ...(() => {
       const badge = codexServiceTierBadge(
         sessionCliId(ds, getBot(ds.larkAppId).config),
@@ -3577,7 +3619,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -3669,7 +3711,7 @@ async function postTurnStartingStatusCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -3810,7 +3852,7 @@ export async function postFreshStreamingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -4235,25 +4277,29 @@ export async function deliverEphemeralOrReply(
 /**
  * Queue a card PATCH. If no PATCH is in-flight, sends immediately.
  * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
- * any previously queued value — only the latest state matters).
+ * any previously queued value — only the latest state matters). Returns
+ * whether the PATCH was accepted for immediate or queued delivery.
  */
-export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
+export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): boolean {
   // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
   // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
   // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
   // call can never dial updateMessage on a synthetic id.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
   // Bot opted out of the streaming card — never patch one into existence.
   // Turn-exact when the caller has turn context (screen updates): a substitute
   // turn arriving mid-PATCH must not suppress a normal turn's card (or vice
   // versa) just because it overwrote the latest-turn slot.
-  if (streamingCardDisabled(ds, turnId)) return;
+  if (streamingCardDisabled(ds, turnId)) return false;
+  const cardId = ds.streamCardId;
+  if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
-  ds.pendingCardId = ds.streamCardId;
-  if (ds.cardPatchInFlight) return;
+  ds.pendingCardId = cardId;
+  if (ds.cardPatchInFlight) return true;
   flushCardPatch(ds);
+  return true;
 }
 
 function flushCardPatch(ds: DaemonSession): void {
@@ -6925,9 +6971,8 @@ function teardownAuthoritativePersistentBackingBeforeCloseImpl(
     || session.status === 'closed'
   ) return;
 
-  killPersistentSession(
-    'zmx',
-    persistentSessionName('zmx', session.sessionId),
+  killPersistentBackendTarget(
+    resolvePersistentBackendTarget('zmx', session.sessionId, session.persistentBackendTarget),
     session.sessionId,
   );
 }
@@ -6966,7 +7011,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
@@ -8216,9 +8261,14 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
+    // Native Codex now commits after history confirms submission, rather than
+    // on enqueue. Its normal two-second screen settle already exceeds the IPC
+    // receipt budget; keep that budget for transport, not for CLI startup.
+    const commitWaitMs = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput
+      ? 90_000 : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
     record.timer = setTimeout(() => {
       delayOrdinaryImDelivery(record);
-    }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+    }, commitWaitMs);
     record.timer.unref?.();
   }
   logger.info(
@@ -8423,6 +8473,45 @@ export function sendWorkerSessionInput(
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   return afterWorkerIpcBootstrap(worker, () => worker.send(message));
+}
+
+export type ExactTurnInterruptResult =
+  | { ok: true }
+  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
+
+/** Ask the currently owning worker to interrupt one exact turn and wait for its
+ * acknowledgement. IPC delivery alone is not proof: the worker compares the
+ * immutable turn id with its active turn before it can inject Ctrl+C. */
+export function interruptExactWorkerTurn(
+  ds: DaemonSession,
+  turnId: string,
+  timeoutMs = 10_000,
+): Promise<ExactTurnInterruptResult> {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return Promise.resolve({ ok: false, reason: 'no_worker' });
+  const requestId = randomUUID();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: ExactTurnInterruptResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(result);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'turn_interrupt_result' || msg.requestId !== requestId || msg.turnId !== turnId) return;
+      finish(msg.delivered ? { ok: true } : { ok: false, reason: msg.reason ?? 'delivery_failed' });
+    };
+    const onExit = (): void => finish({ ok: false, reason: 'no_worker' });
+    const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    const queued = afterWorkerIpcBootstrap(worker, () => worker.send({ type: 'interrupt_turn', requestId, turnId } satisfies DaemonToWorker));
+    if (!queued) finish({ ok: false, reason: 'no_worker' });
+  });
 }
 
 function settleTransferInputGate(
@@ -9269,6 +9358,7 @@ export async function forkSession(
     : undefined;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
+  childSession.cliLaunchMode = ds.session.cliLaunchMode;
   childSession.agentFrozen = ds.session.agentFrozen;
   childSession.nativeSessionTitle = childTitle;
   childSession.nativeSessionTitleUserDefined = true;
@@ -10054,6 +10144,8 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
+    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+      ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
@@ -11451,6 +11543,7 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     wrapperCli: agentCfg.wrapperCli,
+    cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
     model: agentCfg.model,
     modelBackendVariant: agentCfg.modelBackendVariant,
@@ -11572,6 +11665,11 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    // replyDelivery=transcript 的冻结值（core/reply-delivery.ts）：worker 只用它给
+    // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
+    // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
+    replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId),
+    solo: ds.soloSession === true,
     feedback: feedbackPolicy,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
@@ -12519,7 +12617,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
@@ -12629,7 +12727,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
@@ -13269,7 +13367,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
@@ -13384,7 +13482,7 @@ function setupWorkerHandlers(
             }),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
@@ -13461,7 +13559,7 @@ function setupWorkerHandlers(
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -13892,7 +13990,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
@@ -13967,7 +14065,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
@@ -14980,8 +15078,17 @@ function setupWorkerHandlers(
           // pending turn. preview.ledger is the post-settle remainder.
           if (msg.disposition === 'steer_superseded') {
             const entry = preview.settledEntry;
+            // HTTP steer members (options.steer) carry an http_async / http_wait
+            // sink: unlike a Lark member (which simply skips delivery) they are
+            // PARKED here and resolved with the group's real final after the
+            // commit below — see parkSteerFanoutMember / fanOutSteerGroupFinal.
+            // doc_comment / suppressed / VC / legacy-undefined sinks remain
+            // rejected exactly as before.
+            const supersededSink = entry.deliverySink;
             const supersededHeadOk = entry.codexAppSteerable === true
-              && entry.deliverySink === 'lark'
+              && (supersededSink === 'lark'
+                || supersededSink === 'http_async'
+                || supersededSink === 'http_wait')
               && entry.vcMeetingImTurnOrigin === undefined
               && ds.session.vcMeetingReceiver === undefined
               && preview.ledger.length > 0;
@@ -14991,7 +15098,7 @@ function setupWorkerHandlers(
                 + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
                 + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
               );
-              acknowledge(false, 'superseded_head_not_plain_lark_steerable_with_successor');
+              acknowledge(false, 'superseded_head_not_authorized_sink_with_successor');
               break;
             }
           }
@@ -15097,6 +15204,25 @@ function setupWorkerHandlers(
           }
           const persisted = await inFlight;
           acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted) {
+            // HTTP steer group settlement (options.steer). An earlier member's
+            // empty superseded final is parked behind its successor; the real
+            // final fans the merged answer back to every parked member. Runs
+            // AFTER the durable FIFO commit so a parked/resolved member can
+            // never disagree with the ledger.
+            const settledSink = preview.settledEntry.deliverySink;
+            if (msg.disposition === 'steer_superseded'
+              && (settledSink === 'http_async' || settledSink === 'http_wait')) {
+              parkSteerFanoutMember(
+                ds,
+                settlement.generation,
+                { turnId: msg.turnId, sink: settledSink },
+                preview.ledger[0]?.turnId,
+              );
+            } else if (msg.disposition !== 'steer_superseded') {
+              fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now());
+            }
+          }
           if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
             try { await cb.onCodexAppLedgerDrained?.(ds); }
             catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -15350,6 +15476,136 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+// ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──
+//
+// A steered group settles as N finals: each earlier member gets an EMPTY
+// `steer_superseded` final and the LAST member owns the real merged final. A
+// Lark member only skips delivery, but an HTTP caller polls ITS OWN triggerId
+// (wait-mode promise or async result): the earlier member must not hang at
+// `running` and must not complete with empty content. We park it until the
+// group's real final lands, then fan the real content out to every parked
+// member of the same runner generation.
+//
+// GROUP-IDENTITY INVARIANT: the table is keyed only by sessionId+generation and
+// fan-out fires on ANY non-superseded final settle. This is sound ONLY because
+// the codex-app FIFO admits no bypass dispatch inside one runner generation —
+// every follow-up queued behind a steerable head either natively merges into
+// the active turn (extending the same group) or queues serially as the group's
+// FIFO successor; there is no path that starts an INDEPENDENT turn for the same
+// generation while parked members exist. If such a bypass dispatch is ever
+// introduced, fan-out must additionally match the real final's turnId against
+// the parked successor chain.
+type SteerFanoutSink = 'http_async' | 'http_wait';
+interface SteerFanoutParked {
+  turnId: string;
+  sink: SteerFanoutSink;
+}
+const steerFanoutBySession = new Map<string, { generation: string; members: SteerFanoutParked[] }>();
+
+/** Park one superseded HTTP steer member. `successorTurnId` is the next FIFO
+ *  head AFTER this member's pop (the chain target for durable restart
+ *  resolution); omit when unavailable (http_wait is in-memory only).
+ *
+ *  Accepted durable-chain edge: when the immediate FIFO successor is a LARK
+ *  turn it has no async-trigger record, so a daemon restart in the
+ *  superseded→real-final window cannot walk to the group terminal through this
+ *  member; the parked turn then converges via the ordinary closed-session
+ *  path (failed/no_output). This needs a restart AND a lark-steer successor
+ *  interleaved into one HTTP group — the live in-memory fan-out is unaffected
+ *  and the failure direction is safe. */
+function parkSteerFanoutMember(
+  ds: DaemonSession,
+  generation: string,
+  member: SteerFanoutParked,
+  successorTurnId: string | undefined,
+): void {
+  const sessionId = ds.session.sessionId;
+  const existing = steerFanoutBySession.get(sessionId);
+  if (!existing || existing.generation !== generation) {
+    // A new runner generation invalidates an older fenced/dead group's parks;
+    // those turns converge through the ordinary worker-exit/boot paths.
+    steerFanoutBySession.set(sessionId, { generation, members: [member] });
+  } else if (!existing.members.some(candidate => candidate.turnId === member.turnId)) {
+    existing.members.push(member);
+  }
+  if (member.sink !== 'http_async' || !successorTurnId) return;
+  try {
+    asyncTriggerStore.recordSteerParked(
+      sessionId, member.turnId, successorTurnId, Date.now(), ds.larkAppId,
+    );
+  } catch (err) {
+    // Best-effort restart insurance (same tier as recordPending): the live
+    // in-memory fan-out still resolves this member; only a daemon restart in the
+    // superseded→real window falls back to dispatch_unknown convergence.
+    logger.error(
+      `[${tag(ds)}] Failed to persist steer park for ${member.turnId.substring(0, 8)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Resolve every parked earlier member of a steer group with the group's real
+ *  final. Called exactly once, after the REAL final's durable commit. No usage
+ *  is forwarded: the merged turn's token usage belongs solely to the group's
+ *  real (last) trigger. Idempotent — a replayed real final re-resolves safely
+ *  (the per-session park list is consumed on the first call). */
+function fanOutSteerGroupFinal(
+  ds: DaemonSession,
+  generation: string,
+  content: string,
+  completedAt: number,
+): void {
+  const sessionId = ds.session.sessionId;
+  const parked = steerFanoutBySession.get(sessionId);
+  if (!parked || parked.generation !== generation) return;
+  steerFanoutBySession.delete(sessionId);
+  for (const member of parked.members) {
+    if (member.sink === 'http_wait') {
+      const waitPromise = ds.pendingWaitPromises?.get(member.turnId);
+      if (waitPromise) {
+        waitPromise.resolve(content);
+        ds.pendingWaitPromises?.delete(member.turnId);
+      }
+      continue;
+    }
+    const asyncResult = ds.asyncTriggerResults?.get(member.turnId);
+    if (asyncResult && asyncResult.status === 'pending') {
+      asyncResult.status = 'completed';
+      asyncResult.content = content;
+      asyncResult.completedAt = completedAt;
+      // Drop the convergence entry, mirroring the real-final path: a later
+      // graceful worker exit must not retro-fail this now-merged turn.
+      ds.idempotentAsyncTurns?.delete(member.turnId);
+    }
+    try {
+      asyncTriggerStore.recordCompleted(
+        sessionId, member.turnId, content, completedAt, ds.larkAppId,
+      );
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Steer fan-out failed for ${member.turnId.substring(0, 8)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+/** Drop any parked steer-group state for a session whose codex-app dispatch
+ *  ledger has fully drained. The success path already consumed the entry in
+ *  fanOutSteerGroupFinal (this is a no-op there); this reaps the failure
+ *  shapes — the group's last turn died via turn_terminal / recovery fence, so
+ *  no real-final settle can ever fan the parked members out. Parked http_async
+ *  members then converge through their own terminal/closed-session paths (the
+ *  durable steerParkedBy chain mirrors the failure on the next poll); parked
+ *  http_wait members have no durable surface and fall back to their own wait
+ *  timeout — same best-effort contract wait mode already has for a non-steer
+ *  turn that dies without a final_output (a deliberate, accepted boundary).
+ *  Called from the single onCodexAppLedgerDrained chokepoint, which every
+ *  ledger-emptying path routes through. */
+export function pruneSteerFanoutState(sessionId: string): void {
+  steerFanoutBySession.delete(sessionId);
+}
+
 /**
  * Shutdown-only view of the in-flight Codex App final-settlement promises. Each
  * entry is a `deliverFinalOutput` awaited inside the IPC message handler that
@@ -15549,6 +15805,28 @@ async function persistFinalOutputDelivery(
   }
 }
 
+/** transcript 模式（replyDelivery=transcript）：最终回复卡投递成功后给本轮打
+ *  「已完成」标签，idle 时卡头不再显示「等待输入」。
+ *  - 只对 bridge 类 final_output 生效：local-turn 系列是终端本地对话同步到飞书，
+ *    不是对某个飞书轮次的回复；VC 会议 receiver 的输出走审计 sink，与状态卡无关。
+ *  - send 模式（缺省）在此直接 return，行为与今天逐字节相同。
+ *  - lineage 守卫与 `silentIdleTurnId` 同款：type-ahead 下更新的轮次已开启时，
+ *    本次投递属于旧轮次，不得把正在工作的卡改成「已完成」。 */
+function markTurnReplyDelivered(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  effectiveCliId: string | undefined,
+): void {
+  if (msg.kind && msg.kind !== 'bridge') return;
+  if (ds.session.vcMeetingReceiver) return;
+  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId) !== 'transcript') return;
+  if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) return;
+  ds.completedIdleTurnId = msg.turnId;
+  // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
+  // 卡已冻结 / 禁用流式卡时 scheduleActiveRuntimePatch 自行 no-op。
+  if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -15581,6 +15859,16 @@ function deliverFinalOutput(
 
   const asyncResult = managedReceiver ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
   if (asyncResult) {
+    // An acknowledged exact interrupt is a caller-selected terminal boundary.
+    // Ctrl+C can race a final already buffered by the CLI; never resurrect that
+    // turn as completed in memory (which would otherwise beat the durable
+    // interrupted record during trigger-result resolution).
+    if (asyncResult.status === 'interrupted') {
+      ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      logger.info(`[${t}] Ignored final_output for interrupted Async HTTP turn (turn ${msg.turnId.substring(0, 8)})`);
+      onComplete?.(true);
+      return;
+    }
     const completedAt = Date.now();
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
@@ -15865,7 +16153,7 @@ function deliverFinalOutput(
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
-      const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
+      let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
@@ -15889,6 +16177,9 @@ function deliverFinalOutput(
             localHomeLinkMode,
             usage: cardUsage,
           });
+      if (!managedReceiver) {
+        cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
+      }
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -16040,6 +16331,14 @@ function deliverFinalOutput(
       );
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
+      const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
+      if (!managedReceiver) {
+        recordOncallGroupDelivery(config.session.dataDir, {
+          appId: ds.larkAppId, chatId: ds.chatId, messageId,
+          questionId: msg.replyTurnId ?? msg.turnId,
+          answer: explicit?.finalText ?? safeAssistantText, card: JSON.parse(explicit?.finalCard ?? cardJson),
+        });
+      }
       if (msg.turnId.startsWith('mlrp_turn_')) {
         markMessageListenerRunPreviewReplied(msg.turnId, {
           sessionId: ds.session.sessionId,
@@ -16050,11 +16349,11 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      markTurnReplyDelivered(ds, msg, effectiveCliId);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
       if (messageId && !managedReceiver) {
         // Normal fallback final only; managed VC receivers have their own
         // delivery accounting and no feedback turn_terminal to correlate to.
-        const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
         await persistFinalOutputDelivery(ds, msg, explicit?.finalText ?? safeAssistantText, effectiveCliId, messageId,
           explicit ? explicit.feedback?.policy : feedbackPolicy,
           explicit ? (explicit.feedback && explicit.finalCard ? JSON.parse(explicit.finalCard) as Record<string, unknown> : undefined) : baseFeedbackCard,
@@ -16816,6 +17115,12 @@ function cleanupPersistentBackendSessions(
   if (!anyBackend) return;
 
   const backend = backendType === 'tmux' ? TmuxBackend : backendType === 'zmx' ? ZmxBackend : HerdrBackend;
+  const targetForSession = (session: Session): PersistentBackendTarget => backendType === 'zmx'
+    ? resolvePersistentBackendTarget(backendType, session.sessionId, session.persistentBackendTarget)
+    : { backendType, sessionName: backend.sessionName(session.sessionId) };
+  const targetKey = (target: PersistentBackendTarget): string => target.backendType === 'zmx'
+    ? persistentBackendTargetKey(target) : target.sessionName;
+  const sessionTargetKey = (session: Session): string => targetKey(targetForSession(session));
   const multiBot = getAllBots().length > 1;
   const cliIdFile = join(config.session.dataDir, backendType === 'tmux' ? 'last-cli-id' : `last-cli-id-${backendType}`);
   let lastCliId: string | undefined;
@@ -16823,34 +17128,52 @@ function cleanupPersistentBackendSessions(
   const currentCliId = config.daemon.cliId;
   // Codex App sessions with an unsettled dispatch ledger must reconcile before
   // any CLI-change sweep tears their backing pane down.
-  const unsettledNames = new Set(
+  const unsettledTargetKeys = new Set(
     activeSessions_
       .filter(hasProtectedSessionMutationOwnership)
-      .map(session => backend.sessionName(session.sessionId)),
+      .map(sessionTargetKey),
   );
   const belongsToBackend = (session: Session) =>
     session.backendType === backendType ||
     (session.backendType === undefined && backendType === 'tmux');
-  const activeNames = new Set(
+  const activeTargetKeys = new Set(
     [...activeSessions_, ...runtimeSessionRows]
       .filter(belongsToBackend)
-      .map(s => backend.sessionName(s.sessionId)),
+      .map(sessionTargetKey),
   );
-  const runtimeNames = new Set(
-    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+  const runtimeTargetKeys = new Set(
+    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(sessionTargetKey),
   );
   const ownedSessions = [
     ...storedSessions.filter(belongsToBackend),
     ...activeSessions_.filter(belongsToBackend),
   ];
-  const ownedIdsByName = new Map<string, Set<string>>();
+  const ownedIdsByTarget = new Map<string, Set<string>>();
   for (const session of ownedSessions) {
-    const name = backend.sessionName(session.sessionId);
-    const ids = ownedIdsByName.get(name) ?? new Set<string>();
+    const name = sessionTargetKey(session);
+    const ids = ownedIdsByTarget.get(name) ?? new Set<string>();
     ids.add(session.sessionId);
-    ownedIdsByName.set(name, ids);
+    ownedIdsByTarget.set(name, ids);
   }
-  const ownedNames = new Set(ownedIdsByName.keys());
+  const ownedTargetKeys = new Set(ownedIdsByTarget.keys());
+  const listBackingTargets = (): PersistentBackendTarget[] => {
+    if (backendType !== 'zmx') {
+      return backend.listBotmuxSessions().map(sessionName => ({ backendType, sessionName }));
+    }
+    // Enumerate only namespaces represented by this store/runtime. Never scan
+    // arbitrary directories or treat a bmx-* name as ownership authority.
+    const directories = new Set(ownedSessions.concat(runtimeSessionRows.filter(belongsToBackend))
+      .map(session => {
+        const target = targetForSession(session);
+        return target.backendType === 'zmx' ? target.socketDir : undefined;
+      }));
+    return [...directories].flatMap(socketDir => {
+      const names = socketDir === undefined
+        ? ZmxBackend.listBotmuxSessions()
+        : ZmxBackend.listBotmuxSessions(zmxEnv(process.env, socketDir));
+      return names.map(sessionName => ({ backendType: 'zmx' as const, sessionName, socketDir }));
+    });
+  };
   type ExactHerdrTarget = { sessionName: string; agentName: string };
   const exactHerdrTarget = (session: Session): ExactHerdrTarget | undefined => {
     const target = session.persistentBackendTarget;
@@ -16933,14 +17256,15 @@ function cleanupPersistentBackendSessions(
       HerdrBackend.killAgents(sessionName, agentNames);
     }
   };
-  const killOwnedBackendSession = (name: string, exactSessionId?: string): void => {
+  const killOwnedBackendSession = (target: PersistentBackendTarget, exactSessionId?: string): void => {
+    const name = target.sessionName;
     if (backendType !== 'zmx') {
       backend.killSession(name);
       return;
     }
     const candidates = exactSessionId
       ? new Set([exactSessionId])
-      : ownedIdsByName.get(name);
+      : ownedIdsByTarget.get(targetKey(target));
     if (!candidates || candidates.size !== 1) {
       logger.warn(
         `Refusing ambiguous name-only ZMX cleanup for ${name}; ` +
@@ -16949,7 +17273,7 @@ function cleanupPersistentBackendSessions(
       return;
     }
     try {
-      ZmxBackend.killManagedSession(name, [...candidates][0]!);
+      killPersistentBackendTarget(target, [...candidates][0]!);
     } catch (err) {
       logger.warn(`Refusing unsafe ZMX cleanup for ${name}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -16958,29 +17282,33 @@ function cleanupPersistentBackendSessions(
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     // Legacy per-topic hosts are still enumerable by bmx-* name.
-    for (const name of backend.listBotmuxSessions()) {
-      if (unsettledNames.has(name)) {
+    for (const target of listBackingTargets()) {
+      const name = target.sessionName;
+      const key = targetKey(target);
+      if (unsettledTargetKeys.has(key)) {
         logger.warn(`Preserving ${backendType} ${name}: unsettled Codex App dispatch must reconcile first`);
         continue;
       }
       // A dispatcher-created runtime session already runs the current CLI.
       // Never let the stale last-cli marker tear it down during restore.
-      if (runtimeNames.has(name)) continue;
+      if (runtimeTargetKeys.has(key)) continue;
       // ZMX_DIR is a user-wide namespace and bmx-* is deterministic, not an
       // ownership credential. Another checkout/data root can legitimately own
       // a bmx-* daemon, so never kill a name absent from this bot's store/map.
-      if (backendType === 'zmx' && !ownedNames.has(name)) continue;
-      killOwnedBackendSession(name);
+      if (backendType === 'zmx' && !ownedTargetKeys.has(key)) continue;
+      killOwnedBackendSession(target);
     }
     // Machine-wide Herdr agents are not separate bmx-* sessions. Include
     // persisted inactive rows as well as the active restore snapshot so a CLI
     // switch cannot leave an old executable behind.
     killManagedExactHerdrTargets(false);
   } else {
-    for (const name of backend.listBotmuxSessions()) {
-      if (ownedNames.has(name) && !activeNames.has(name)) {
+    for (const target of listBackingTargets()) {
+      const name = target.sessionName;
+      const key = targetKey(target);
+      if (ownedTargetKeys.has(key) && !activeTargetKeys.has(key)) {
         logger.info(`Killing orphaned ${backendType} session: ${name}`);
-        killOwnedBackendSession(name);
+        killOwnedBackendSession(target);
       }
     }
     killManagedExactHerdrTargets(true);
@@ -17007,7 +17335,7 @@ function cleanupPersistentBackendSessions(
             sessionName: target.sessionName,
             agentName: target.agentName,
           }))
-          : runtimeNames.has(target.sessionName);
+          : runtimeTargetKeys.has(targetKey(target));
         if (runtimeOwnsTarget) continue;
         const label = target.backendType === 'herdr' && target.agentName
           ? `${target.sessionName}/${target.agentName}`
