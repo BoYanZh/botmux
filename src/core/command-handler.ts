@@ -8,8 +8,9 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
-import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -1283,27 +1284,35 @@ function triggerUserAuthStatusLines(
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
   const brand = normalizeBrand(botCfg.brand);
-  const larkAuthorized = senderOpenId
+  // lark-cli acts as the person via either the new per-person device-code HOME
+  // or a legacy bot-app OAuth token. Both must count (and /login status reads the
+  // same two sources), or someone who authorized through the device flow would
+  // be told here they had not. The legacy lookup also supplies a display name.
+  const legacyLarkUser = senderOpenId
     ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
     : undefined;
-  const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
+  const larkAuthorized = senderOpenId !== undefined
+    && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
   const lines = ['Trigger-user auth: 已开启'];
   for (const tool of policy.tools) {
     lines.push(`  ${tool}: ${
       tool === 'lark-cli'
         ? larkAuthorized
-          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
-          : botFallback
-            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
-            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+          // lark-cli no longer degrades to the bot's own identity: an
+          // unauthorized call is refused, and the refusal carries a ready
+          // device-code link. Saying "running as the bot" here would describe a
+          // fallback that the turn path does not have.
+          : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
         // ByteCloud is a separate identity provider, so this is a genuinely
         // different verdict from the Lark line above — the same person can be
-        // authorized for one and not the other. There is no bot identity to
-        // degrade to here, so unauthorized always means the command is refused.
+        // authorized for one and refused by the other. There is no bot identity
+        // to degrade to here either; the mint path tries the existing HOME even
+        // while a fresh challenge is pending, so the verdict is just HOME/no.
         : hasBytedcliHome(senderOpenId ?? '')
           ? '以你自己的身份调用'
-          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
+          : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
   }
   return lines;
@@ -3327,20 +3336,107 @@ export async function handleCommand(
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
-          // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
-          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
-          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
-          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
+          // Per-person status lines, only for governed tools.
+          const lines: string[] = [];
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+            lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
+          }
+          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
             lines.push(t(
-              hasBytedcliHome(loginOpenId)
+              hasBytedcliHome(loginOpenId) && !pendingBytedcliChallenge(loginOpenId)
                 ? 'cmd.login.bytedcli_status_yes'
                 : 'cmd.login.bytedcli_status_no',
               undefined,
               loc,
             ));
           }
+          // Legacy bot-app OAuth status when lark-cli is not governed by the
+          // per-person device-code flow.
+          if (!lines.length) lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login done` / `完成` —— finish any device-code login in progress.
+        // lark-cli and ByteCloud are independent providers: a person commonly
+        // has a challenge for one while already authorized (or pending) for the
+        // other, so each side is handled on its own merits instead of the first
+        // matching side suppressing the other.
+        if (subCmd === 'done' || subCmd === '完成') {
+          const doneLines: string[] = [];
+          const larkPending = pendingLarkCliChallenge(loginOpenId);
+          if (larkPending) {
+            const { state, detail } = await completeLarkCliLogin(loginOpenId);
+            doneLines.push(state === 'authorized'
+              ? t('cmd.login.lark_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.lark_pending', undefined, loc)
+                : t('cmd.login.lark_failed', { detail: detail ?? 'unknown' }, loc));
+          } else if (hasLarkCliHome(loginOpenId)) {
+            doneLines.push(t('cmd.login.lark_status_yes', undefined, loc));
+          }
+          const bytedPending = pendingBytedcliChallenge(loginOpenId);
+          if (bytedPending) {
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
+            doneLines.push(state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+          } else if (hasBytedcliHome(loginOpenId)) {
+            doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
+          }
+          if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
+          await sessionReply(rootId, doneLines.join('\n'));
+          break;
+        }
+
+        // `/login lark` — lark-cli device-code (QR) authorization against the
+        // provisioned per-person issuer app. Non-blocking: returns a verify URL.
+        if (subCmd === 'lark' || subCmd.startsWith('lark ')) {
+          if (loginOpenId) {
+            const started = await beginLarkCliLogin(loginOpenId);
+            if (!started) {
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'lark-cli has no provisioned issuer app on the server' }, loc));
+              break;
+            }
+            await sessionReply(rootId, [
+              t('cmd.login.lark_title', undefined, loc),
+              '',
+              t('cmd.login.lark_step1', undefined, loc),
+              started.authUrl,
+              '',
+              t('cmd.login.lark_step2', undefined, loc),
+              '',
+              t('cmd.login.lark_note', undefined, loc),
+            ].join('\n'));
+          } else {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+          }
+          break;
+        }
+
+        // When trigger-user auth governs lark-cli, the bare `/login` goes through
+        // the device-code flow (per-person HOME), not the per-bot web OAuth.
+        const larkDeviceOn = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        if (larkDeviceOn && subCmd === '') {
+          if (loginOpenId) {
+            const started = await beginLarkCliLogin(loginOpenId);
+            if (!started) {
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'no provisioned issuer app' }, loc));
+              break;
+            }
+            await sessionReply(rootId, [
+              t('cmd.login.lark_title', undefined, loc), '',
+              t('cmd.login.lark_step1', undefined, loc),
+              started.authUrl, '',
+              t('cmd.login.lark_step2', undefined, loc), '',
+              t('cmd.login.lark_note', undefined, loc),
+            ].join('\n'));
+          } else {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+          }
           break;
         }
 
