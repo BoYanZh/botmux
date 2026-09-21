@@ -263,6 +263,7 @@ import type {
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from './types.js';
+import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -10048,6 +10049,21 @@ async function handleTrustedCodexAppMarker(
 ): Promise<boolean> {
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
+    return true;
+  }
+
+  if (kind === 'thinking' && lastInitConfig?.cliId === 'codex-app') {
+    const marker = normalizeCodexAppCotMarker(payload);
+    if (!marker) {
+      rejectCodexAppControlMarker('invalid signed thinking marker');
+      return false;
+    }
+    const turn = codexAppTurnDispatchQueue.findByTurnId(marker.turnId);
+    if (!turn) {
+      log(`${cliName()} dropped thinking marker for unknown turn ${marker.turnId.substring(0, 12)}`);
+      return true;
+    }
+    observeCotEntries(marker.entries, turn);
     return true;
   }
 
