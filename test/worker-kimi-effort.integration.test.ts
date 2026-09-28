@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane without leaking into the next session', async () => {
@@ -38,7 +38,9 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
           workingDir: data, cliId: 'kimi', cliPathOverride: fixture, backendType: 'tmux', prompt: '',
           launchShell: '/bin/bash', model: 'kimi-code/k3-256k', reasoningEffort, env: botEnv,
           larkAppId: 'test', larkAppSecret: 'test', apiOnly: true });
-        await expect.poll(() => existsSync(output), { timeout: 15000 }).toBe(true)
+        // NOTE: no expect.poll here — the bun-test shim (test/bun-test-shim.ts)
+        // only mirrors vi.waitFor, so poll would throw "not a function" under bun.
+        await vi.waitFor(() => expect(existsSync(output)).toBe(true), { timeout: 15000 })
           .catch(error => { throw new Error(`${error}\n${logs}`); });
         expect(readFileSync(output, 'utf8'), logs).toBe(expected);
       } finally {
