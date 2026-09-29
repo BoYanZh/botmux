@@ -2639,7 +2639,19 @@ async function cmdStart(): Promise<void> {
     // 30 seconds merely to discover that the supervisor is already alive.
     if (watchdogStopRequested(CONFIG_DIR)) return;
     const { liveSupervisorPid } = await import('./core/fleet-runtime.js');
-    if (liveSupervisorPid() !== undefined) return;
+    let pid: number | undefined;
+    try {
+      pid = liveSupervisorPid();
+    } catch (err) {
+      // Unverifiable fleet-state (e.g. identity fields missing in a stale or
+      // half-written state file) is fail-closed for start — but the watchdog
+      // tick must not exit non-zero over it every 30s. Log, skip this tick
+      // (exit 0), retry next tick. Do NOT fall through to a full start: it
+      // throws on the same liveness check after paying the preflight cost.
+      logger.warn(`[watchdog] 跳过本次探活(fleet 状态不可核验，下个 tick 重试): ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (pid !== undefined) return;
   } else {
     // An explicit start (including the enabled boot unit) overrides a previous
     // explicit stop and re-arms crash recovery.

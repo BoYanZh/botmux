@@ -203,4 +203,23 @@ describe('Linux autostart crash watchdog', () => {
     expect(guardAt).toBeGreaterThan(lockAt);
     expect(clearAfterGuard).toBeGreaterThan(guardAt);
   });
+
+  it('__watchdog skips the tick instead of exiting non-zero on unverifiable fleet-state', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
+    const start = src.indexOf('if (watchdogStart) {');
+    const end = src.indexOf('} else {', start);
+    const body = src.slice(start, end);
+
+    // The liveness probe must sit inside try/catch: liveSupervisorPid()
+    // throws fail-closed on unverifiable state, and the tick must log + exit
+    // 0 (skip) instead of failing the unit every 30s. Falling through to a
+    // full start is wrong — it throws on the same check after preflight.
+    const tryAt = body.indexOf('try {');
+    const probeAt = body.indexOf('liveSupervisorPid()');
+    const catchAt = body.indexOf('} catch', probeAt);
+    expect(tryAt).toBeGreaterThan(-1);
+    expect(probeAt).toBeGreaterThan(tryAt);
+    expect(catchAt).toBeGreaterThan(probeAt);
+    expect(body.indexOf('return;', catchAt)).toBeGreaterThan(catchAt);
+  });
 });
