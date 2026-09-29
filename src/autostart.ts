@@ -135,6 +135,22 @@ export function watchdogStopRequested(configDir: string): boolean {
   return existsSync(watchdogStopIntentPath(configDir));
 }
 
+/**
+ * Stop-intent marker contract (watchdog suppression):
+ *
+ * - WRITERS: every intentional-shutdown entry must write the marker BEFORE
+ *   mutating the fleet. Today that is CLI `botmux stop` (cmdStop). Any future
+ *   shutdown entry — including external callers of the trusted supervisor
+ *   shutdown IPC route (SUPERVISOR_SHUTDOWN_ROUTE, handled in
+ *   core/dashboard-ipc-server.ts) — must write it too; otherwise the watchdog
+ *   will mistake the outage for a crash and resurrect the fleet.
+ * - READERS: the `__watchdog` tick checks the marker first and returns quietly
+ *   while it exists.
+ * - CLEARERS: an explicit `start`/`restart`/boot start always clears it (a
+ *   newer start intent overrides a previous stop intent). `stop` itself clears
+ *   it again when the stop demonstrably did NOT happen (fleet-mutation lock
+ *   timeout, supervisor stop timeout) so a half-stopped fleet keeps healing.
+ */
 export function markWatchdogStopped(configDir: string): void {
   mkdirSync(configDir, { recursive: true });
   writeFileSync(watchdogStopIntentPath(configDir), `${new Date().toISOString()}\n`, { mode: 0o600 });

@@ -2829,27 +2829,43 @@ async function cmdStop(): Promise<void> {
   ensureConfigDir();
   // Persist intent before taking the fleet lock so a concurrently-fired
   // watchdog cannot resurrect the fleet after this stop completes.
+  // If the stop demonstrably did NOT happen (lock never acquired, or the
+  // supervisor outlived its stop window), the marker is dropped again below:
+  // a half-stopped fleet must keep healing instead of being suppressed forever.
+  // Only a confirmed stop (or an untouched idle fleet) keeps the marker.
   markWatchdogStopped(CONFIG_DIR);
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
-    cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
-    const { stopFleet } = await import('./core/fleet-runtime.js');
-    const result = stopFleet();
-    if (result.action === 'not-running') {
+  try {
+    await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+      cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
+      const { stopFleet } = await import('./core/fleet-runtime.js');
+      const result = stopFleet();
+      if (result.action === 'not-running') {
+        cleanupStaleDaemonDescriptors();
+        if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+        console.log('daemon 未在运行。');
+        return;
+      }
+      if (result.action === 'timeout') {
+        // SIGKILL sent but exit unconfirmed: the supervisor may still be
+        // alive, so drop the stop intent before surfacing the failure.
+        clearWatchdogStopped(CONFIG_DIR);
+        throw new Error(
+          `[stop] supervisor (pid ${result.supervisorPid}) 未在超时时间内退出；已发送 SIGKILL，`
+          + `请用 \`botmux status\` 复核 fleet 状态。`,
+        );
+      }
       cleanupStaleDaemonDescriptors();
       if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-      console.log('daemon 未在运行。');
-      return;
+      console.log(`✅ daemon 已停止 (supervisor pid ${result.supervisorPid})`);
+    }, { maxWaitMs: 5_000 });
+  } catch (err) {
+    // The fleet was never touched when the lock could not be acquired;
+    // errors thrown after a successful stop keep the marker (intent stands).
+    if (err instanceof FileLockTimeoutError) {
+      clearWatchdogStopped(CONFIG_DIR);
     }
-    if (result.action === 'timeout') {
-      throw new Error(
-        `[stop] supervisor (pid ${result.supervisorPid}) 未在超时时间内退出；已发送 SIGKILL，`
-        + `请用 \`botmux status\` 复核 fleet 状态。`,
-      );
-    }
-    cleanupStaleDaemonDescriptors();
-    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-    console.log(`✅ daemon 已停止 (supervisor pid ${result.supervisorPid})`);
-  }, { maxWaitMs: 5_000 });
+    throw err;
+  }
 }
 
 interface RestartLifecycleFlags {

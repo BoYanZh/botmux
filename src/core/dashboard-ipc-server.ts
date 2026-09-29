@@ -464,6 +464,10 @@ function rejectProtectedSessionMutation(
 }
 
 ipcRoute('POST', SUPERVISOR_SHUTDOWN_ROUTE, async (req, res) => {
+  // CONTRACT: accepting a shutdown here is an intentional stop. External
+  // callers bypassing `botmux stop` must write the watchdog stop-intent
+  // marker themselves (markWatchdogStopped in autostart.ts); otherwise the
+  // watchdog will resurrect the fleet as if it had crashed.
   // The production server-wide HMAC gate records trusted requests here. Keep
   // an explicit route-local check: shutdown is never a bare loopback API.
   if (!isTrustedHostIpcRequest(req)) {

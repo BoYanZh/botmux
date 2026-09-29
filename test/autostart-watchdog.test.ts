@@ -177,4 +177,30 @@ describe('Linux autostart crash watchdog', () => {
     expect(lockAt).toBeGreaterThan(-1);
     expect(intentAt).toBeGreaterThan(lockAt);
   });
+
+  it('cmdStop drops the stop intent when the stop demonstrably did not happen', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
+    const start = src.indexOf('async function cmdStop(): Promise<void> {');
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end);
+
+    // The marker is still pre-written before the lock (anti-resurrection).
+    const markAt = body.indexOf('markWatchdogStopped(CONFIG_DIR)');
+    const lockAt = body.indexOf('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
+    expect(markAt).toBeGreaterThan(-1);
+    expect(lockAt).toBeGreaterThan(markAt);
+
+    // …but the supervisor-timeout branch clears it before throwing, so a
+    // half-stopped fleet keeps healing instead of being suppressed forever.
+    const timeoutAt = body.indexOf("result.action === 'timeout'");
+    const clearAfterTimeout = body.indexOf('clearWatchdogStopped(CONFIG_DIR)', timeoutAt);
+    expect(timeoutAt).toBeGreaterThan(-1);
+    expect(clearAfterTimeout).toBeGreaterThan(timeoutAt);
+
+    // …and a lock-acquire failure clears it too (fleet never touched).
+    const guardAt = body.indexOf('instanceof FileLockTimeoutError');
+    const clearAfterGuard = body.indexOf('clearWatchdogStopped(CONFIG_DIR)', guardAt);
+    expect(guardAt).toBeGreaterThan(lockAt);
+    expect(clearAfterGuard).toBeGreaterThan(guardAt);
+  });
 });
