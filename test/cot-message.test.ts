@@ -68,6 +68,19 @@ beforeEach(() => {
 });
 
 describe('handleCotThinkingUpdate', () => {
+  it.each([false, true])('keeps hidden recovery turns quiet after restore with cotForced=%s', async cotForced => {
+    const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({ hiddenThinkingTurns: ['trg_recovery'] })) });
+    handleCotThinkingUpdate(ds, upd([say('User work')], 'om_user'));
+    await flush(); request.mockClear();
+    expect(handleCotThinkingUpdate(ds, upd([say('Internal recovery')], 'trg_recovery'))).toBe(false);
+    expect(finalizeCotMessage(ds, 'trg_recovery', 'completed')).toBe(false);
+    expect(handleCotThinkingUpdate(ds, upd([say('Late update')], 'trg_recovery'))).toBe(false);
+    await flush(); expect(request).not.toHaveBeenCalled();
+    expect(finalizeCotMessage(ds, 'om_user', 'completed')).toBe(true);
+    await flush(); expect(pushedEvents().some(e => e.type === 'RUN_FINISHED')).toBe(true);
+    expect(handleCotThinkingUpdate(ds, upd([say('Next user reply')], 'om_next'))).toBe(true);
+  });
+
   it.each([false, true])('keeps silent scheduled thinking quiet with cotForced=%s', async (cotForced) => {
     const ds = makeDs({ cotForced });
     armSilentScheduledTurn(ds, 'schedule:quiet');
@@ -567,6 +580,19 @@ describe('handleCotThinkingUpdate', () => {
     expect(title).not.toContain('.ts');
     const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
     expect(body.language).toBe('typescript');
+  });
+
+  it('legacy tool-output opt-out still settles the tool without publishing its result', async () => {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, thinkingCardToolResult: false } } as any);
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'hidden-result', name: 'Bash', args: '{"command":"echo example"}' },
+      { kind: 'tool_result', id: 'hidden-result', result: 'private-result-body' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+    expect(JSON.stringify(pushedEvents())).not.toContain('private-result-body');
   });
 
   it('an empty tool result is also closed with the marker rather than left pending', async () => {

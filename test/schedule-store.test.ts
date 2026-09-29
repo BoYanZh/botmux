@@ -320,6 +320,16 @@ describe('schedule-store', () => {
       updateTask(task.id, { enabled: false });
       const updated = getTask(task.id);
       expect(updated!.enabled).toBe(false);
+      expect(updated!.disabledReason).toBe('manual');
+    });
+
+    it('clears the disable reason when a task is re-enabled', async () => {
+      const { createTask, updateTask, getTask } = await freshImport();
+      const task = createTask(TASK_PARAMS);
+      updateTask(task.id, { enabled: false });
+      updateTask(task.id, { enabled: true });
+      expect(getTask(task.id)).toMatchObject({ enabled: true });
+      expect(getTask(task.id)?.disabledReason).toBeUndefined();
     });
 
     it('should update lastRunAt', async () => {
@@ -474,7 +484,33 @@ describe('schedule-store', () => {
       const reloaded = store2.getTask(task.id);
       expect(reloaded).toBeDefined();
       expect(reloaded!.enabled).toBe(false);
+      expect(reloaded!.disabledReason).toBe('manual');
       expect(reloaded!.lastRunAt).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    it('persists a valid disable reason and drops unknown legacy values', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask(TASK_PARAMS);
+      store1.updateTask(task.id, { enabled: false, disabledReason: 'once_completed' });
+      expect((await freshImport()).getTask(task.id)?.disabledReason).toBe('once_completed');
+
+      const raw = JSON.parse(readFileSync(storeFp(), 'utf-8'));
+      raw[task.id].disabledReason = 'unknown';
+      writeFileSync(storeFp(), JSON.stringify(raw));
+      expect((await freshImport()).getTask(task.id)?.disabledReason).toBeUndefined();
+    });
+
+    it('marks one-shot completion separately from an operator pause', async () => {
+      const store = await freshImport();
+      const task = store.createTask({
+        ...TASK_PARAMS,
+        schedule: '2026-09-20T03:00:00.000Z',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      store.markRun(task.id, true);
+      expect(store.getTask(task.id)).toMatchObject({
+        enabled: false, disabledReason: 'once_completed', lastStatus: 'ok',
+      });
     });
 
     // 每次 reload 都按 normalizeTask 的字段白名单重建任务对象，白名单漏一个字段就
@@ -591,18 +627,49 @@ describe('schedule-store', () => {
       store.__setScheduleStoreBeforeRenameTestHook(() => {
         throw new Error('injected persistence failure');
       });
-      expect(() => store.updateTask(original.id, { enabled: false })).toThrow(
+      expect(() => store.updateTask(original.id, { enabled: false, prompt: 'new prompt' })).toThrow(
         'injected persistence failure',
       );
       store.__setScheduleStoreBeforeRenameTestHook(undefined);
 
       expect(readFileSync(fp, 'utf-8')).toBe(before);
       expect(store.getTask(original.id)?.enabled).toBe(true);
+      expect(store.getTask(original.id)?.prompt).toBe(original.prompt);
       expect(readdirSync(tempDir).filter(name => name.includes('.tmp.'))).toEqual([]);
 
       // The store remains usable after the failed transaction.
-      store.updateTask(original.id, { enabled: false });
+      store.updateTask(original.id, { enabled: false, prompt: 'new prompt' });
       expect(store.getTask(original.id)?.enabled).toBe(false);
+    });
+
+    it('keeps the dispatched prompt snapshot and concurrent run state when editing', async () => {
+      const editor = await freshImport();
+      const original = editor.createTask({ ...TASK_PARAMS, id: 'editing_running' });
+      const runner = await freshImport();
+      const claim = runner.claimRun(original.id, {
+        lastRunAt: '2026-09-23T04:00:00.000Z',
+        nextRunAt: '2026-09-24T04:00:00.000Z',
+        lastRunId: 'in-flight',
+      });
+      expect(claim.ok).toBe(true);
+      if (!claim.ok) throw new Error('expected dispatch claim');
+      expect(editor.updateTask(original.id, { prompt: 'replacement' })).toBe(true);
+      expect(claim.task.prompt).toBe(original.prompt);
+      expect(editor.getTask(original.id)).toMatchObject({
+        prompt: 'replacement', lastRunId: 'in-flight', lastStatus: 'running',
+        nextRunAt: '2026-09-24T04:00:00.000Z',
+      });
+      runner.markRun(original.id, true, undefined, undefined, 'in-flight');
+      expect(editor.getTask(original.id)).toMatchObject({ prompt: 'replacement', lastStatus: 'ok' });
+    });
+
+    it('reports a concurrent deletion instead of recreating or falsely updating a task', async () => {
+      const stale = await freshImport();
+      const task = stale.createTask({ ...TASK_PARAMS, id: 'deleted_before_update' });
+      const other = await freshImport();
+      other.removeTask(task.id);
+      expect(stale.updateTask(task.id, { prompt: 'new' })).toBe(false);
+      expect(stale.getTask(task.id)).toBeUndefined();
     });
 
     it('does not lose updates when a stale module instance mutates later', async () => {

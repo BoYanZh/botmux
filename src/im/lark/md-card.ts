@@ -102,6 +102,12 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Session-only configuration; separate from the last executor-reported effort. */
+  reasoningControl?: {
+    choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
+    selected?: string;
+    pending: boolean;
+  };
   /** Frozen TraeX backend variant selected for this session. */
   modelBackendVariant?: string;
   /** Claude model fallback in effect, rendered as its own notice line on the
@@ -635,6 +641,8 @@ export function buildReplyCardFooter(opts: {
   brand?: string;
   recipientOpenIds?: readonly string[];
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   locale?: Locale;
 }): ReplyCardFooter | null {
   const parts: string[] = [];
@@ -644,6 +652,16 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+  }
+  const durationMs = opts.executionDurationMs;
+  const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
+  const waitingMs = opts.waitingDurationMs;
+  const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
+  if (hasWaiting) {
+    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+  }
+  if (hasDuration) {
+    parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
   const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
@@ -665,9 +683,9 @@ export function buildReplyCardFooter(opts: {
   // plain link text with no mention, so it cannot trigger bot-to-bot pollution
   // and does not need the ownership marker (the parser already treats a bare
   // repo link as ordinary content, matching the long-standing "brand-only is
-  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // undecidable, keep it" contract). Any footer carrying usage, timing, or a recipient
   // is still signed.
-  const signMarker = hasUsage || hasRecipient;
+  const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
@@ -1286,6 +1304,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1295,6 +1315,8 @@ export function buildCanonicalFinalReplyCard(opts: {
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
     usage: opts.usage,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
@@ -1336,6 +1358,8 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
@@ -1384,6 +1408,8 @@ export function buildContextualReplyCard(opts: {
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
   });
   if (footer) {
     elements.push({ tag: 'hr' });

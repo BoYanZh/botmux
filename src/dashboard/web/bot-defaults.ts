@@ -151,6 +151,7 @@ export type BotDefaultsRow = {
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
   replyDelivery?: 'send' | 'transcript' | null;
+  promptInjection?: 'default' | 'none';
   /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
   replyDeliveryDefault?: 'send' | 'transcript';
   /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
@@ -162,6 +163,7 @@ export type BotDefaultsRow = {
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  idleSuspendMinutes?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
@@ -177,6 +179,8 @@ export type BotDefaultsRow = {
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;
+  /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
+  autoInviteOwnerOnGroupAdd?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -185,9 +189,11 @@ export type BotDefaultsRow = {
   groupJoinCommandEnabled?: boolean;
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
+  autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
+  grantRequestToOwnerDm?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;

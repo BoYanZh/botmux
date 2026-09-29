@@ -866,7 +866,8 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    expect(trustedCallerArgs.length).toBe(2);
+    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
+    expect(trustedCallerArgs.length).toBe(3);
     for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
@@ -924,6 +925,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(block).toContain('startMaintenance();');
     expect(block).toContain('startCliRuntimeUpdateMonitor(');
     expect(block).toContain('sendRestartReportIfPending(');
+    expect(block).toContain('notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,');
   });
 
   it('P1(3rd round): core-only does NOT write shared-HOME .data-dir breadcrumb or ~/.botmux/bin wrapper', () => {

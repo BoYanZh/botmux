@@ -66,6 +66,27 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('voice configuration', () => {
+  it('preserves a MiniMax per-bot override', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([
+      makeCfg({
+        voice: {
+          engine: 'minimax',
+          speaker: 'voice-id',
+          minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+        },
+      }),
+    ]));
+
+    expect(config.voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+});
+
 // ─── registerBot ──────────────────────────────────────────────────────────
 
 describe('registerBot', () => {
@@ -267,6 +288,29 @@ describe('parseBotConfigsFromText — brand', () => {
         { larkAppId: 'a', larkAppSecret: 's', maxLiveWorkers: bad },
       ]));
       expect(cfg.maxLiveWorkers).toBeUndefined();
+    }
+  });
+
+  it('keeps a positive-integer idleSuspendMinutes TTL', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: 30 },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBe(30);
+  });
+
+  it('leaves idleSuspendMinutes undefined (TTL disabled) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBeUndefined();
+  });
+
+  it('drops 0 / negative / fractional / non-numeric idleSuspendMinutes to undefined', () => {
+    for (const bad of [0, -10, 2.5, '30', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: bad },
+      ]));
+      expect(cfg.idleSuspendMinutes).toBeUndefined();
     }
   });
 

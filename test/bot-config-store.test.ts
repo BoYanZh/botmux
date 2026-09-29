@@ -78,6 +78,45 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange };
   }
 
+  it('zero injection is per-bot, preserves reply preferences, and refuses unsupported CLI changes', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', replyDelivery: 'send' });
+    const spec = store.findConfigField('promptInjection')!;
+    expect((await store.applyConfigField('app_default', spec, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('transcript');
+    registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
+    expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
+    const cli = store.findConfigField('cli')!;
+    const changed = await store.applyConfigField('app_default', cli, 'gemini');
+    expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
+    expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('send');
+    expect(readConfig().replyDelivery).toBe('send');
+  });
+
+  it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
+    const { store } = await loaded({ cliId, replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
+  });
+
+  it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
+    const { store } = await loaded({ cliId, codexRpcInput: true });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
+  });
+
+  it('rejects zero injection without automatic reply support', async () => {
+    const { store } = await loaded({ cliId: 'gemini' });
+    expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
+      .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().promptInjection).toBeUndefined();
+  });
+
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
     const { store } = await freshModules();
     const keys = store.CONFIG_FIELDS.map(f => f.key);
@@ -89,6 +128,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
     expect(keys).toContain('feedback');
+    expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
   });
 
@@ -445,6 +485,13 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+
+    const timing = store.findConfigField('showReplyTiming')!;
+    await store.applyConfigField('app_default', timing, true);
+    expect(registry.getBot('app_default').config.showReplyTiming).toBe(true);
+    expect(registry.loadBotConfigs()[0].showReplyTiming).toBe(true);
+    await store.applyConfigField('app_default', timing, false);
+    expect(readConfig().showReplyTiming).toBeUndefined();
   });
 
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
@@ -683,6 +730,30 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().maxLiveWorkers).toBeUndefined();
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('idleSuspendMinutes is an immediate clearable number field that round-trips', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('idleSuspendMinutes')!;
+    expect(spec).toMatchObject({ kind: 'number', effect: 'immediate', clearable: true });
+
+    // Coerce layer: positive integers only (0/negative/fraction/garbage rejected).
+    expect(store.coerceConfigValue(spec, 30)).toEqual({ ok: true, value: 30 });
+    expect(store.coerceConfigValue(spec, '45')).toEqual({ ok: true, value: 45 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -1)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+
+    const set = await store.applyConfigField('app_default', spec, 20);
+    expect(set).toMatchObject({ ok: true, effect: 'immediate' });
+    expect(readConfig().idleSuspendMinutes).toBe(20);
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBe(20);
+
+    const clear = await store.applyConfigField('app_default', spec, null);
+    expect(clear.ok).toBe(true);
+    expect(readConfig().idleSuspendMinutes).toBeUndefined();
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBeUndefined();
   });
 
   it('cardActionAckTimeoutMs enforces its range and hot-updates the registered Bot', async () => {

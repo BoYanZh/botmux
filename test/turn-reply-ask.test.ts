@@ -173,12 +173,27 @@ describe('Ask inside the running reply card', () => {
   });
 
   it('records timeouts without allowing a late initial snapshot to restore buttons', async () => {
-    const { snapshot, answer } = await ask({ timeoutMs: 150 });
-    expect(await answer).toMatchObject({ kind: 'timedOut' });
-    await publishReplyCardAsk(snapshot);
-    expect(body).toContain('超时未答');
-    expect(body).not.toContain('ask_select');
-    expect(body).not.toContain('等待你确认');
+    // Drive expiry only after initial publication. A real 150ms deadline can
+    // expire during filesystem work on a busy CI runner, before the helper's
+    // cardMessageId assertion, without exercising late-snapshot protection.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      const answer = registerAsk({ ...input, timeoutMs: 150 });
+      const id = _allAskIds().at(-1)!;
+      await Promise.all([...publishing]);
+      const snapshot = getAskSnapshot(id)!;
+      expect(snapshot.cardMessageId).toBe('om_reply');
+      expect(snapshot.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await answer).toMatchObject({ kind: 'timedOut' });
+      await Promise.all([...publishing]);
+      await publishReplyCardAsk(snapshot);
+      expect(body).toContain('超时未答');
+      expect(body).not.toContain('ask_select');
+      expect(body).not.toContain('等待你确认');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps callback refreshes from overwriting a newer final answer', async () => {

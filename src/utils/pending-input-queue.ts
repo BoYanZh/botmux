@@ -1,6 +1,6 @@
 import type {
   CodexAppTurnInput,
-  ReadonlyContinuationDispatchMarker,
+  TaskContinuationDispatchMarker,
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
@@ -51,7 +51,7 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
-  readonlyContinuation?: ReadonlyContinuationDispatchMarker;
+  taskContinuation?: TaskContinuationDispatchMarker;
 }
 
 /**
@@ -116,7 +116,7 @@ export function mergeQueuedCliInput(
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent
-    || tail.readonlyContinuation || next.readonlyContinuation) return false;
+    || tail.taskContinuation || next.taskContinuation) return false;
   // Caller attribution is part of the logical envelope. Older code merged two
   // queued messages and kept only the later turnId while silently retaining no
   // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
@@ -129,14 +129,19 @@ export function mergeQueuedCliInput(
 
 /** Durable delivery and ordinary IM turns share one CLI but must not steer
  *  into each other. Adapter type-ahead remains available only while neither
- *  the active turn nor the next queued input is a durable attempt. */
+ *  the active turn nor the next queued input is a durable attempt. Direct RPC
+ *  is also forced serial while its current native turn is unresolved: unlike
+ *  Codex App's runner, that engine has no turn/steer grouping contract, so a
+ *  second turn/start against the busy thread would have an ambiguous outcome. */
 export function pendingInputAllowsTypeAhead(
   adapterSupportsTypeAhead: boolean,
   durableTurnInFlight: boolean,
   next: PendingCliInput | undefined,
+  directRpcTurnInFlight = false,
 ): boolean {
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
+    && !directRpcTurnInFlight
     && next?.dispatchAttempt === undefined
     && !next?.vcMeetingImTurnOrigin;
 }

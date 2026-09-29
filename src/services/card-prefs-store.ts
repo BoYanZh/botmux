@@ -34,6 +34,7 @@ import { rmwBotEntry } from './config-store.js';
 import {
   getBot,
   normalizeUsageDisplay,
+  normalizeCotEnabled,
   DEFAULT_USAGE_DISPLAY,
   type ChatReplyMode,
   type UsageDisplayMode,
@@ -72,6 +73,7 @@ export interface BotCardPrefs {
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
+  thinkingCardToolResult: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -85,6 +87,9 @@ export interface BotCardPrefs {
    *  already working, inherit that sibling's workingDir & skip the repo card.
    *  Default TRUE (unlike the others) — only an explicit false is persisted. */
   botToBotSameDir: boolean;
+  /** 被动入群（bot.added）时自动把 owner 拉进群。缺省 = 开；只有显式 false
+   *  持久化（同 cotEnabled 约定）。 */
+  autoInviteOwnerOnGroupAdd: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
   autoStartOnGroupJoin: boolean;
   /** 主动开工 — 场景① optional pre-configured first-turn prompt ('' = none). */
@@ -93,6 +98,7 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinSeed: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
+  autoStartExcludedChats: string[];
   /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
   groupJoinCommandEnabled: boolean;
   /** 主动开工 — 入群执行的命令（'' = 未配置）。 */
@@ -123,16 +129,19 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       codexBrowser: c.codexBrowser?.enabled === true,
+      thinkingCardToolResult: c.thinkingCardToolResult !== false,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
+      autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
+      autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
       groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
       regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat-topic',
@@ -152,16 +161,19 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: false,
       codexAppCleanInput: false,
       codexBrowser: false,
+      thinkingCardToolResult: true,
       writableTerminalLinkInCard: false,
       privateCard: false,
       cotEnabled: true,
       senderTag: true,
       overloadAlert: false,
       botToBotSameDir: true,
+      autoInviteOwnerOnGroupAdd: true,
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
+      autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
       groupJoinCommand: '',
       regularGroupReplyMode: 'chat-topic',
@@ -268,16 +280,24 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'codexBrowser', patch.codexBrowser);
+    applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
+    if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
+    applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
+    if (patch.autoStartExcludedChats !== undefined) {
+      if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
+      else delete entry.autoStartExcludedChats;
+    }
     apply(entry, 'groupJoinCommandEnabled', patch.groupJoinCommandEnabled);
     applyStr(entry, 'groupJoinCommand', patch.groupJoinCommand?.trim());
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
@@ -297,16 +317,19 @@ async function updateBotCardPrefsInternal(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         codexBrowser: entry.codexBrowser === true
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
+        thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
-        cotEnabled: entry.cotEnabled !== false,
+        cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
+        autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
+        autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
         groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
         regularGroupReplyMode: (entry.regularGroupReplyMode === 'chat' || entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared')
@@ -359,6 +382,9 @@ async function updateBotCardPrefsInternal(
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
   }
+  if (patch.thinkingCardToolResult !== undefined) {
+    bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
+  }
   if (patch.cotEnabled !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.cotEnabled = patch.cotEnabled === false ? false : undefined;
@@ -374,6 +400,10 @@ async function updateBotCardPrefsInternal(
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.botToBotSameDir = patch.botToBotSameDir === false ? false : undefined;
   }
+  if (patch.autoInviteOwnerOnGroupAdd !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.autoInviteOwnerOnGroupAdd = patch.autoInviteOwnerOnGroupAdd === false ? false : undefined;
+  }
   if (patch.autoStartOnGroupJoin !== undefined) {
     bot.config.autoStartOnGroupJoin = patch.autoStartOnGroupJoin || undefined;
   }
@@ -383,6 +413,7 @@ async function updateBotCardPrefsInternal(
   if (patch.autoStartOnGroupJoinSeed !== undefined) {
     bot.config.autoStartOnGroupJoinSeed = patch.autoStartOnGroupJoinSeed.trim() ? patch.autoStartOnGroupJoinSeed : undefined;
   }
+  if (patch.autoStartExcludedChats !== undefined) bot.config.autoStartExcludedChats = patch.autoStartExcludedChats;
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
@@ -425,12 +456,13 @@ async function updateBotCardPrefsInternal(
     `codexBrowser=${r.result.codexBrowser} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
+    `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
-    `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
+    `botToBotSameDir=${r.result.botToBotSameDir} autoInviteOwnerOnGroupAdd=${r.result.autoInviteOwnerOnGroupAdd} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
     `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length} ` +
     `autoStartOnGroupJoinSeed.len=${r.result.autoStartOnGroupJoinSeed.length}`,

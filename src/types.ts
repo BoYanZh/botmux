@@ -262,6 +262,187 @@ export interface FailedTurnRecord {
   lastRetryAt?: string;    // ISO
 }
 
+/** Stable human/bot identity used only for principal-lane routing.  The
+ * serialized `principalKey` is derived from this value; it is never accepted
+ * from model output or persisted caller claims. */
+export type HumanLanePrincipal =
+  | {
+      senderType: 'user';
+      kind: 'union';
+      unionId: string;
+    }
+  | {
+      senderType: 'user';
+      kind: 'app_open';
+      larkAppId: string;
+      openId: string;
+    };
+
+/** Trusted inbound identity is broader than durable lane identity. Bot
+ * principals may be recognised for the explicit --as protocol, but can never
+ * be persisted as principal lanes. */
+export type InboundPrincipal = HumanLanePrincipal
+  | {
+      senderType: 'bot';
+      kind: 'union';
+      unionId: string;
+    }
+  | {
+      senderType: 'bot';
+      kind: 'app_open';
+      larkAppId: string;
+      openId: string;
+    };
+
+/** Backward-compatible name for the durable, human-only lane principal. */
+export type LanePrincipal = HumanLanePrincipal;
+
+/** Identity evidence reconstructed from one trusted human inbound event.
+ * unionId is canonical when present; the same-event app/openId is retained as
+ * a source-scoped alias so a later identity upgrade cannot duplicate a lane. */
+export interface HumanLaneIdentityEvidence {
+  larkAppId: string;
+  unionId?: string;
+  openId?: string;
+}
+
+/** Visible Lark surface is deliberately independent from the daemon routing
+ * anchor. Multiple principal lanes may render into one chat/topic while each
+ * keeps an isolated worker/session key. */
+export type PrincipalLaneDisplayTarget =
+  | { scope: 'chat'; larkAppId: string; chatId: string }
+  | { scope: 'thread'; larkAppId: string; chatId: string; rootMessageId: string };
+
+export type PrincipalLanePhase =
+  | 'creating'
+  | 'active'
+  | 'dormant'
+  | 'closing'
+  | 'closed'
+  | 'quarantined';
+
+/** Durable binding carried by a source (lane 0) or one shadow lane. */
+export interface PrincipalLaneBinding {
+  version: 1;
+  laneId: string;
+  sourceSessionId: string;
+  principalKey: string;
+  principal: LanePrincipal;
+  routingAnchor: string;
+  displayTarget: PrincipalLaneDisplayTarget;
+  workspaceEpoch: number;
+  phase: PrincipalLanePhase;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  quarantineReason?: string;
+}
+
+/**
+ * One exact human turn admitted behind an already-running turn in the same
+ * principal lane.  The final CLI payload is persisted so daemon-side FIFO does
+ * not depend on re-parsing a Lark event after the transport has acknowledged
+ * it.  `attempting` is a commit-unknown fence: a restart must never replay a
+ * turn that may already have crossed the worker IPC boundary.
+ */
+export interface PrincipalLaneQueuedTurn {
+  version: 1;
+  turnId: string;
+  caller: TrustedCaller;
+  userPrompt: string;
+  title: string;
+  cliInput: CliTurnPayload;
+  createdAt: string;
+  resume: boolean;
+  codexAppSteerable?: true;
+  dispatchState?: 'queued' | 'attempting';
+}
+
+/** Durable owner-visible terminal notice for a principal-lane turn that
+ * crossed the dispatch barrier before its outcome became unknowable. The
+ * original turn is removed from the runnable FIFO in the same transaction;
+ * only this notice is retried after restart. */
+export interface PrincipalLaneDispatchUnknownNotice {
+  version: 1;
+  id: string;
+  turnId: string;
+  caller: TrustedCaller;
+  detectedAt: string;
+  noticePending: true;
+}
+
+/** Durable proof that one shadow lane runs in its own linked git worktree.
+ * The source checkout remains the workspace identity; `workingDir` preserves
+ * the source session's repo-relative subdirectory inside the linked worktree.
+ * Source lane 0 deliberately has no such proof. */
+export interface PrincipalLaneWorktreeProof {
+  version: 1;
+  materializationId: string;
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  principalKey: string;
+  workspaceEpoch: number;
+  sourceCanonicalCwd: string;
+  sourceRepoRoot: string;
+  sourceGitCommonDir: string;
+  sourceRelativeCwd: string;
+  worktreeRoot: string;
+  worktreeGitCommonDir: string;
+  workingDir: string;
+  branch: string;
+  baseRef: string;
+  phase: 'ready';
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Source-owned lane/workspace epoch. `sourcePrincipalKey` is lane 0 and must
+ * be proven from the original owner identity; it is never first-speaker-wins. */
+export interface PrincipalLaneSourceState {
+  version: 1;
+  sourcePrincipalKey: string;
+  displayTarget: PrincipalLaneDisplayTarget;
+  canonicalCwd: string;
+  workspaceEpoch: number;
+  workspaceGroupId: string;
+  /** Missing only on a provable legacy v1 group id. New shared workspace
+   * groups always persist version 2 explicitly. */
+  workspaceGroupKeyVersion?: 2;
+  phase: PrincipalLanePhase;
+  revision: number;
+  updatedAt: string;
+  leaseOwner?: string;
+  leaseGeneration?: number;
+  principalLaneDisabledReason?: string;
+  migrationAudit?: {
+    evidence: 'owner_union_id' | 'same_app_owner_open_id';
+    migratedAt: string;
+    larkAppId: string;
+  };
+}
+
+/** Unique durable owner of quote/reply authority. A successful outbound send
+ * is trusted only after this record commits; missing/untrusted records are
+ * never reconstructed from text, timestamps, or replyTargets. */
+export interface MessageProvenance {
+  messageId: string;
+  larkAppId: string;
+  chatId: string;
+  displayRootId?: string;
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  turnId: string;
+  principalKey: string;
+  workerGeneration: number;
+  direction: 'inbound' | 'outbound';
+  trustState: 'trusted' | 'untrusted';
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
@@ -332,6 +513,27 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /** Principal-lane routing/display binding. Optional while the feature is
+   * staged and for legacy sessions that have not passed the migration gate. */
+  principalLane?: PrincipalLaneBinding;
+  /** Present only on the source row (lane 0). */
+  principalLaneSource?: PrincipalLaneSourceState;
+  /** Present only on a materialized shadow lane. The matching indexed sidecar
+   * is re-read before on-demand hydration; this embedded copy alone is never a
+   * capability to register or fork a worker. */
+  principalLaneWorktree?: PrincipalLaneWorktreeProof;
+  /** Crash-safe, per-lane FIFO. Only the exact head may enter this lane's
+   * worker, and it is retained until that turn reaches a terminal edge. */
+  principalLaneQueuedTurns?: PrincipalLaneQueuedTurn[];
+  /** Pending notices are deliberately separate from the runnable FIFO. */
+  principalLaneDispatchUnknownNotices?: PrincipalLaneDispatchUnknownNotice[];
+  /** Legacy source could not prove its original human identity. This disables
+   * only principal-lane routing; the original single-principal session remains
+   * usable. */
+  principalLaneDisabledReason?: 'caller_identity_unproven';
+  /** Durable fail-closed marker for malformed source routing metadata. It
+   * disables only principal-lane routing and keeps the legacy session usable. */
+  principalLaneQuarantineReason?: 'invalid_source_display_target';
   /**
    * Crash-safe host-owned state for a human message that arrived while another
    * human's interactive turn owned this session.  The message is deliberately
@@ -381,8 +583,8 @@ export interface Session {
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
-  /** Explicit opt-in lease for one read-only long-running task. Disabled
-   * globally unless BOTMUX_READONLY_CONTINUATION_ENABLED=true. */
+  /** Explicit opt-in lease for one authorization-inheriting long-running task.
+   * The field name is retained for persisted-state compatibility. */
   readonlyTaskContinuation?: import('./services/readonly-task-continuation.js').ReadonlyTaskContinuationState;
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
@@ -554,12 +756,7 @@ export interface Session {
   /** Best-effort human-readable chat name. Group sessions use the Lark group
    *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
-  /** open_id of whoever created this session (the first sender), app-scoped to
-   *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
-   *  sessions and is NEVER overwritten by later activity — so it stably points at
-   *  the dispatch orchestrator for `botmux report` even when there is no `/repo`
-   *  prime (foreign-bot auto-create nulls ownerOpenId) and the reply-chain
-   *  quoteTargetSenderOpenId has drifted to a peer reviewer. */
+  /** Immutable first sender, scoped to this bot and session; a user-created thread does not inherit its task's creator. */
   creatorOpenId?: string;
   /** Lark `union_id` of the session owner. Stable across apps within a tenant
    *  (unlike `ownerOpenId`, which is app-scoped: the same Lark user has a
@@ -635,6 +832,10 @@ export interface Session {
    * accepted so daemon restarts and replacement workers invalidate receipts
    * emitted by an earlier lifetime. */
   workerGeneration?: number;
+  /** Random revocation epoch for the read-only terminal link embedded in the
+   * live Lark card. Stable across worker replacement, rotated when a closed
+   * session is resumed so an old card never regains access to a new lifecycle. */
+  terminalCardEpoch?: string;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /** Bounded exact destination captured at inbound turn start. Codex App copies
@@ -655,6 +856,16 @@ export interface Session {
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
   quoteTargetSenderIsBot?: boolean;
+  /** Connector-owned lifecycle, scoped to the exact committed handoff. */
+  handoffLiveCard?: {
+    turnId: string; sequence: number; title?: string; closed?: boolean; resultMessageId?: string;
+    /** Identity captured on first completion; retries must never capture a replacement. */
+    closedCard?: { messageId?: string; nonce?: string; removed?: true };
+    /** A successful explicit /card after completion may keep this exact card live. */
+    manualCard?: { messageId: string; nonce: string };
+  };
+  /** Exact trigger turns with hidden thinking, persisted for restore and late transcript events. */
+  hiddenThinkingTurns?: string[];
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
@@ -739,6 +950,8 @@ export interface Session {
   suspendedColdResume?: boolean;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /** Frozen at creation; absent on historical/adopted sessions means default. */
+  promptInjection?: 'default' | 'none';
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
   /** Durable account-directory routing, independent of the live bot defaults. */
@@ -1051,11 +1264,13 @@ export interface XpiSharedCwdQuarantine {
   noticePending: boolean;
 }
 
-/** Private daemon→worker capability stamp for one continuation dispatch. The
- * worker accepts it only on the exact RPC generation that produced the proof. */
-export interface ReadonlyContinuationDispatchMarker {
+/** Private daemon→worker marker for one authorization-inheriting continuation.
+ * It carries no authority: the synthetic turn runs through the same live RPC
+ * thread and runtime permission policy as the originating user turn. */
+export interface TaskContinuationDispatchMarker {
   leaseId: string;
   rpcGeneration: string;
+  authorizationMode: 'inherited';
 }
 
 export interface SessionCliLaunchSnapshotV1 {
@@ -1076,6 +1291,8 @@ export interface SessionCliLaunchSnapshotV1 {
 }
 
 export interface LarkAttachment {
+  resourceKey?: string; // Stable provider key, independent of a normalized filename.
+  mimeType?: string;    // Detected from downloaded image bytes.
   type: 'image' | 'file';
   path: string;       // 本地文件绝对路径
   name: string;       // 文件名
@@ -1234,10 +1451,17 @@ export interface ScheduledTask {
    *  running as the bot. */
   ownerUnionId?: string;
   enabled: boolean;
+  /** Why an enabled task became disabled. Missing means a legacy/unknown
+   *  disable and is never enough to extend scheduled-turn authority. */
+  disabledReason?: 'once_completed' | 'manual';
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  /** Durable state of the most recently claimed run. `running` is written
+   *  before asynchronous dispatch and settled only by the matching run id. */
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  /** Scheduler-generated identity for the run represented by lastStatus. */
+  lastRunId?: string;
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
@@ -1483,13 +1707,13 @@ export interface PendingRepoSetup {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'worker_ipc_probe' }
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; readonlyContinuation?: ReadonlyContinuationDispatchMarker }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; taskContinuation?: TaskContinuationDispatchMarker }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -1580,7 +1804,11 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
+    ? Message & {
+        feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
+        cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+        terminalCardEpoch?: string;
+      }
     : Message
   : never;
 
@@ -1651,10 +1879,12 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
-      /** PER-BOOT random read capability (P1-5): card links minted from it die
-       * with this worker generation, and the dashboard view-link API replaces
-       * it with a short-lived auth-bound grant instead of handing it out. */
+      /** PER-BOOT random read capability (P1-5). The dashboard view-link API
+       * binds its short-lived grants to this worker generation. */
       viewToken?: string;
+      /** Session-lifecycle read capability embedded in Lark cards. It survives
+       * worker replacement but rotates when a closed session is resumed. */
+      cardViewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;
       turnId?: string;
@@ -1665,6 +1895,9 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string }
+  /** A live native terminal turn in a zero-injection session. Freeze its
+   * reply destination before newer IM inputs can replace the sender. */
+  | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
   /** Transport-only receipt for ordinary Lark IM delivery. Emitted
    * synchronously when the live worker's IPC handler claims the exact turn,
    * before slow startup work; input-queue ownership is acknowledged separately
@@ -1685,6 +1918,10 @@ export type WorkerToDaemon =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+      /** RPC app-server root. Tool subprocesses are descendants of this
+       * sibling rather than of the viewer CLI. */
+      enginePid?: number;
+      engineProcStart?: string;
     }
   | {
       type: 'queued_activation_submitted';
@@ -1734,11 +1971,10 @@ export type WorkerToDaemon =
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
   | {
-      type: 'readonly_continuation_rpc_status';
+      type: 'task_continuation_rpc_status';
       sessionId: string;
       rpcGeneration: string;
       eligible: boolean;
-      reason?: string;
     }
   | { type: 'prompt_ready' }
   | { type: 'cli_runtime_version'; version: string }
@@ -1794,7 +2030,7 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; readonlyContinuation?: true }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
@@ -1823,6 +2059,13 @@ export type WorkerToDaemon =
       lastUuid: string;
       turnId: string;
       replyTurnId?: string;
+      /** Zero-injection terminal input uses normal final rendering, with the
+       * reply context captured by terminal_turn_started. */
+      terminalLocal?: boolean;
+      /** Measured native execution time for this exact turn/attempt, excluding queueing. */
+      durationMs?: number;
+      /** Literal CLI input time, from the same execution window as durationMs. */
+      executionStartedAtMs?: number;
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;

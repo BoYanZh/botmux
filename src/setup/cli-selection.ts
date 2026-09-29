@@ -24,6 +24,7 @@
 import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
+import { CODEX_REASONING_EFFORTS } from '../services/codex-reasoning-effort.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
@@ -320,8 +321,15 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
     // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
     // 否则 aiden 网关会拒收裸 `-c` 直接启动失败。
     || value === 'notice.hide_rate_limit_model_nudge=true'
+    // codex 适配器对 fresh 启动注入的 cwd 信任预置（projects 内联表，见
+    // codex.ts codexCwdTrustOverrideArgs）。aiden 网关拒收裸 `-c` → 剥掉（信任弹窗
+    // 退回 worker 的文案识别兜底）；cjadk 改写成 --config 透传给真 codex 继续生效。
+    || BOTMUX_CODEX_CWD_TRUST_RE.test(value)
   );
 }
+
+/** 匹配 codex 适配器注入的 cwd 信任预置值：projects={"<任意路径>"={trust_level="trusted"}}。 */
+const BOTMUX_CODEX_CWD_TRUST_RE = /^projects=\{"(?:[^"\\]|\\.)*"=\{trust_level="trusted"\}\}$/;
 
 /**
  * 剥掉 aiden x claude 拒收的 `--settings`（含其值），支持 `--settings <v>` 与
@@ -380,6 +388,38 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
   return out;
 }
 
+const AIDEN_CODEX_REASONING_CONFIG = new RegExp(
+  `^model_reasoning_effort="(${CODEX_REASONING_EFFORTS.join('|')})"$`,
+);
+
+/**
+ * Aiden owns the Codex provider configuration and rejects passthrough `-c`.
+ * Extract only the exact reasoning config emitted by Botmux's Codex adapter so
+ * the launch builder can route it through the Codex shim. Unrelated user-owned
+ * `-c` values retain their existing behavior.
+ */
+export function rewriteAidenCodexArgs(args: ReadonlyArray<string>): {
+  reasoningEffort?: string;
+  forwardedArgs: string[];
+} {
+  const stripped = stripWrapperUnsafeArgs(args);
+  let reasoningEffort: string | undefined;
+  const forwardedArgs: string[] = [];
+  for (let i = 0; i < stripped.length; i++) {
+    const arg = stripped[i]!;
+    if (arg === '-c') {
+      const match = stripped[i + 1]?.match(AIDEN_CODEX_REASONING_CONFIG);
+      if (match) {
+        reasoningEffort = match[1]!;
+        i++;
+        continue;
+      }
+    }
+    forwardedArgs.push(arg);
+  }
+  return { reasoningEffort, forwardedArgs };
+}
+
 /**
  * cjadk codex 专用改写：把 botmux 给 codex 注入的 `-c <config>` 改写成 Codex 的
  * 长形式 `--config <config>`。
@@ -431,6 +471,20 @@ export interface WrappedLaunchOptions {
    * 用 {@link TTADK_DEFAULT_MODEL} 兜底；不接受 -m 的子命令（CoCo）忽略此项。
    */
   readonly ttadkModel?: string;
+  /** Effective PATH inherited by the wrapper process. */
+  readonly childPath?: string;
+  /** Resolved underlying Codex executable, used by the Aiden reasoning shim. */
+  readonly aidenCodexRealBin?: string;
+  /** Directory containing Botmux's `codex` shim. */
+  readonly aidenCodexShimDir?: string;
+  /** Platform PATH delimiter supplied by the server-side caller. */
+  readonly pathDelimiter?: string;
+}
+
+export interface WrappedLaunch {
+  readonly bin: string;
+  readonly args: string[];
+  readonly env?: Record<string, string>;
 }
 
 /**
@@ -481,6 +535,7 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - bin = 前缀首 token（经 binResolver 走 PATH 解析）
  *   - args = 前缀其余 token + CLI 参数（aiden `aiden x <cli>` 形态会先经
  *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`；
+ *     `aiden x codex` 的 reasoning 配置由 PATH shim 在 Aiden 生成网关参数后注入；
  *     cjadk `cjadk <agent>` 形态走 {@link rewriteCjadkCodexConfigArgs} 把 codex 注入的 `-c`
  *     改写成 cjadk 不会吞掉的 `--config`）
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
@@ -504,10 +559,29 @@ export function buildWrappedLaunch(
   cliArgs: ReadonlyArray<string>,
   binResolver: (bin: string) => string = (b) => b,
   opts: WrappedLaunchOptions = {},
-): { bin: string; args: string[] } {
+): WrappedLaunch {
   const tokens = parseWrapperCli(wrapperCli);
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
+  if (tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'codex') {
+    const { reasoningEffort, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
+    if (!reasoningEffort) {
+      return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+    }
+    const realCodexBin = opts.aidenCodexRealBin ?? binResolver('codex');
+    const shimDir = opts.aidenCodexShimDir;
+    if (!shimDir) {
+      return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+    }
+    return {
+      bin: `${shimDir}/launch`,
+      args: [binResolver(tokens[0]), ...tokens.slice(1), ...forwardedArgs],
+      env: {
+        BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
+        BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort,
+      },
+    };
+  }
   let forwarded: string[];
   if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
   else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);

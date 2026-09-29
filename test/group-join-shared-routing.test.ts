@@ -158,6 +158,14 @@ afterAll(() => {
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('excluded group joins send no greeting and start no worker', async () => {
+    const { daemon, registry } = modules;
+    registry.registerBot({ larkAppId: 'app_excluded', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true, autoStartExcludedChats: ['oc_quiet'] });
+    await daemon.__testOnly_handleBotAdded('oc_quiet', 'ou_owner', 'app_excluded');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
     const { collaborationModeStore, daemon, registry } = modules;
     const appId = 'app_join_explicit_worker';
@@ -249,6 +257,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: seedId }),
+      expect.any(Object),
     );
     expect(mocks.getChatContext).toHaveBeenCalledOnce();
     expect(mocks.getChatContext).toHaveBeenCalledWith(appId, chatId);
@@ -324,6 +333,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: 'om_join_seed' }),
+      expect.any(Object),
     );
   });
 
@@ -385,6 +395,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: expect.stringMatching(/^join_/) }),
+      expect.any(Object),
     );
   });
 
@@ -815,6 +826,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
       expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
     );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
@@ -892,6 +904,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
       expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
     );
 
     releaseSeed('om_late_join_seed');
@@ -1093,7 +1106,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds?.session.currentReplyTarget).toBeUndefined();
     // 话题群自动开工：seed 消息 id 即首轮权威 turnId（修复前为 false，首轮回复
     // 发不回飞书）。
-    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' });
+    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' }, expect.any(Object));
   });
 
   it('话题群配置自定义 seed 时锚点消息用自定义文案', async () => {
@@ -1155,7 +1168,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     // new-topic 是独立会话（非 shared 复用），不 arm shared reply target。
     expect(ds?.session.currentReplyTarget).toBeUndefined();
     // 同话题群：seed 消息 id 即首轮权威 turnId。
-    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' });
+    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' }, expect.any(Object));
   });
 });
 

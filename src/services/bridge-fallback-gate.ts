@@ -31,7 +31,8 @@
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
  *     with, hence no marker to gate on.
- *   - Non-adopt + isLocal: suppress. A local-typing turn means the
+ *   - Non-adopt + isLocal: suppress unless zero-injection forwards local
+ *     finals (`forwardLocalFinal`). A local-typing turn means the
  *     attribution queue saw a user event whose content didn't match any
  *     pending Lark fingerprint. In a worker-spawned CLI that's a Web
  *     terminal hand-typed input — the user is already looking at it, no
@@ -39,9 +40,15 @@
  *   - Non-adopt + send observed in window: suppress. The window is
  *     [turn.markTimeMs, nextBoundaryMs). Legacy markers only carry time,
  *     so any marker in the window still suppresses. Newer markers carry the
- *     normalized length of the explicit `botmux send` body. When the
- *     transcript final is available, only emit fallback if that final is
- *     materially longer than any single explicit send in the same window.
+ *     normalized length of the explicit `botmux send` body. A marker tagged
+ *     responseKind/replyCardResponseKind 'final' is an explicit final-answer
+ *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
+ *     length) under EVERY replyDelivery, including when the marker carries no
+ *     body length at all (image-only / voice sends) — see the note on
+ *     markerSetDuplicatesFinal. That comparison only ever runs for
+ *     progress/kind-less sends. When the transcript final is available, only
+ *     emit fallback if that final is materially longer than any single
+ *     explicit send in the same window.
  *     This lets short progress updates surface a later substantive final
  *     answer, while same-size rewrites and short acknowledgements stay
  *     suppressed. Boundary handling intentionally also considers
@@ -213,6 +220,9 @@ export interface BridgeGateInput {
   /** Whether the queue synthesised this turn from a local-terminal event
    *  (no fingerprint match for a Lark message). */
   isLocal: boolean | undefined;
+  /** Zero-injection sessions forward real terminal answers through the same
+   * delivery channel. Keep local attribution for failure/empty-turn filtering. */
+  forwardLocalFinal?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -312,8 +322,13 @@ function previewMatchesFinal(previewText: string, finalNormalized: string): bool
  *
  * Markers with no `contentLength` (`botmux send --images` with no body, and the
  * `--voice` path, whose marker is hand-assembled) cannot establish equality at
- * all, so they never suppress — a duplicate message is a far cheaper failure
- * than a silently swallowed answer.
+ * all, so they never suppress HERE — a duplicate message is a far cheaper
+ * failure than a silently swallowed answer. This leniency applies only to
+ * progress/kind-less markers: an explicit responseKind='final' marker, body or
+ * no body, is already an unconditional return-true in shouldSuppressBridgeEmit
+ * before this function is reached, under every replyDelivery (an image-only or
+ * voice `--response-kind final` IS the declared final delivery; letting the
+ * transcript final through would double-post).
  */
 function markerSetDuplicatesFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
   const finalNormalized = normaliseForFingerprint(finalText ?? '');
@@ -344,13 +359,26 @@ export function shouldSuppressBridgeEmit(
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
-  if (turn.isLocal) return true;
+  if (turn.isLocal && !turn.forwardLocalFinal) return true;
+  if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
+    && turn.terminalStatus !== 'completed') return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
-    && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'));
-  if (markersInWindow.some(m => m.replyCardResponseKind === 'final')) return true;
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  // An explicit `botmux send --response-kind final` already delivered this
+  // turn's final answer to Lark. The unified-reply path also writes
+  // replyCardResponseKind='final'; the plain (non-unified) path writes only
+  // responseKind='final' (replyCardResponseKind is absent). Suppress the
+  // terminal-transcription fallback in both cases, otherwise the same answer
+  // is double-posted (e.g. Chinese answer sent, then an English summary).
+  // Managed-card progress/auxiliary markers are not final deliveries.
+  if (inWindow.some(m => m.responseKind === 'final'
+      && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'))) {
+    return true;
+  }
+  const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
+    || m.replyCardResponseKind === 'final');
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

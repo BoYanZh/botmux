@@ -1,4 +1,8 @@
 // src/core/dashboard-ipc-server.ts
+import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
+import { updateHandoffLiveCard } from './worker-pool.js';
+import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -11,6 +15,7 @@ import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
@@ -840,6 +845,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -1043,6 +1049,16 @@ async function handleManagedOriginAttestation(
   if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
     return jsonRes(res, 429, { ok: false, error: 'too_many_attestations' });
   }
+  // Credentials and the allowlist stay on the host. A proof carries only the
+  // authorization for this exact caller/turn, never a client-selected identity.
+  let scheduleBot;
+  try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
+  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+    callerOpenId: origin.callerOpenId,
+    allowedUsers: scheduleBot?.config.allowedUsers,
+    resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
+    resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
+  });
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -1054,6 +1070,9 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        scheduleCreator,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -1093,7 +1112,7 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
-  let body: { sessionId?: unknown };
+  let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
     body = await readBoundedJsonBody(req, 1_024, 1_000);
   } catch (err) {
@@ -1109,6 +1128,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const expectedScheduledTurnId = typeof body.expectedScheduledTurnId === 'string'
+    && body.expectedScheduledTurnId.length <= 256
+    ? body.expectedScheduledTurnId
+    : undefined;
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
@@ -1125,6 +1148,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -1630,18 +1654,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
-  if (readonlyOrigin
-    && readonlyOrigin.workerGeneration === ds.workerGeneration
-    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
-    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
-    return nativeSubagentRuntimeJsonRes({
-      req, res, sessionId: params.sessionId, status: 200,
-      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
-      ...responseAuth,
-    });
-  }
-
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
   catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
@@ -2484,13 +2496,13 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
   }
 });
 
-/** Explicit control plane for one read-only long-running task lease. The
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
  * rotating current-turn capability binds every action to the calling session
  * and turn; the daemon owns all persisted state and timers. */
 ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
   type ContinuationRequestBody = {
     action?: unknown;
-    readonly?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
     ttlMs?: unknown;
     maxContinuations?: unknown;
   } & Record<string, unknown>;
@@ -2505,14 +2517,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
     return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
   }
   if (!ensureReadonlyTaskContinuationAttached(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
   }
   try {
     let state;
     if (body.action === 'start') {
-      if (body.readonly !== true) {
-        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
-      }
       if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
         return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
       }
@@ -2527,17 +2536,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
       }
       const generation = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
         || ds.session.workerGeneration !== generation
         || proof?.workerGeneration !== generation) {
-        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
         ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
         ...(typeof body.maxContinuations === 'number'
           ? { maxContinuations: body.maxContinuations }
@@ -2780,10 +2801,12 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
     if (terminal && owner) {
       const r = terminal.result;
-      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      const at = (r.status === 'completed' ? r.completedAt : r.status === 'interrupted' ? r.interruptedAt : r.failedAt) ?? Date.now();
       try {
         if (r.status === 'completed') {
           asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+        } else if (r.status === 'interrupted') {
+          asyncTriggerStore.recordInterruptedStrict(sessionId, persisted.triggerId, at, owner);
         } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
           asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
         } else {
@@ -2887,7 +2910,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
   if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
-    resolved.readOnlyUrl = buildTerminalUrl(ds);
+    resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
   return resolved;
@@ -3639,6 +3662,24 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
   jsonRes(res, 200, { ok: true, name: p?.name ?? me.ownerName ?? null, avatarUrl: p?.avatarUrl ?? null });
 });
 
+// Dashboard-authenticated connector event, not a user-message or model-output hook.
+ipcRoute('POST', '/api/sessions/:sessionId/live-stage', async (req, res, params) => {
+  let event;
+  try { event = parseHandoffCardEvent(await readJsonBody(req)); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_live_stage' }); }
+  const active = findActiveBySessionId(params.sessionId);
+  if (!active) return jsonRes(res, 409, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(active) || active.scope !== 'chat' || active.chatType !== 'group') {
+    return jsonRes(res, 409, { ok: false, error: 'live_stage_unavailable' });
+  }
+  try {
+    await updateHandoffLiveCard(active, event);
+    return jsonRes(res, 200, { ok: true });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : 'live_stage_failed' });
+  }
+});
+
 // 会话重命名：dashboard 看板卡片就地编辑 Botmux 的 canonical title；运行中的
 // Codex/Claude Code 再收到一条 best-effort 原生 /rename，同步其 resume picker。
 // 飞书话题标题不受影响。全视图（看板/状态板/表格/抽屉）读同一字段。
@@ -3720,8 +3761,8 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 /**
  * Read-only twin of write-link: the base capability URL the Feishu card's
  * 「打开 Web 终端」button also hands out (viewToken, never the write token).
- * The viewToken here is the worker's PER-BOOT card token — it dies with the
- * worker generation and is deliberately not bound to any dashboard auth
+ * The viewToken here is the worker's PER-BOOT token — it dies with the worker
+ * generation and is deliberately not bound to any dashboard auth
  * session. The central dashboard therefore REPLACES it with a short-lived
  * signed read grant bound to the requesting identity before answering its own
  * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
@@ -3739,7 +3780,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
-  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { viewScope: 'worker' }) });
 });
 
 /**
@@ -4231,7 +4272,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -4705,6 +4746,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
     const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
@@ -4724,7 +4778,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
       followActive: followActive || undefined,
@@ -6075,11 +6130,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined, cliLaunchMode ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let idleSuspendMinutes: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    const ttl = botConfig.idleSuspendMinutes;
+    if (typeof ttl === 'number' && Number.isInteger(ttl) && ttl > 0) idleSuspendMinutes = ttl;
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
@@ -6194,12 +6252,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
+    autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
     groupJoinCommand: cardPrefs.groupJoinCommand,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
@@ -6217,6 +6277,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
+    grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -6225,12 +6286,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     replyDelivery,
     replyDeliveryDefault,
     replyDeliverySupported,
+    promptInjection: (() => { try { return getBot(cachedLarkAppId).config.promptInjection ?? 'default'; } catch { return 'default'; } })(),
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    idleSuspendMinutes,
     sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
@@ -6319,11 +6382,12 @@ ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
+    thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
@@ -6333,11 +6397,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const patch: {
+    thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
@@ -6372,13 +6437,17 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     }
     patch.codexBrowser = body.codexBrowser;
   }
+  if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
+  // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
+  else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.autoInviteOwnerOnGroupAdd === 'boolean') patch.autoInviteOwnerOnGroupAdd = body.autoInviteOwnerOnGroupAdd;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {
@@ -6403,6 +6472,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
+  if (body.autoStartExcludedChats !== undefined) {
+    if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auto_start_excluded_chats' });
+    }
+    patch.autoStartExcludedChats = [...new Set(body.autoStartExcludedChats.map(id => id.trim()))];
+  }
   if (typeof body.groupJoinCommandEnabled === 'boolean') patch.groupJoinCommandEnabled = body.groupJoinCommandEnabled;
   if (typeof body.groupJoinCommand === 'string') {
     // 解析不了的命令（未闭合引号）当场拒绝——否则保存成功、入群时才静默跑不起来。
@@ -6516,6 +6591,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
 //   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
+//   • grantRequestToOwnerDm: boolean       — 无管理员可点卡时申请卡转投 owner 私聊
 //   • messageQuotaDefaultLimit: number|null — 授权卡访客额度覆盖（null = 卡片内置 3 条）；Oncall 恒不限额、不读它
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
@@ -6531,6 +6607,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
     restrictGrantCommands?: unknown;
     autoGrantRequestCards?: unknown;
     p2pOpen?: unknown;
+    grantRequestToOwnerDm?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
   };
@@ -6539,12 +6616,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
     restrictGrantCommands?: boolean;
     autoGrantRequestCards?: boolean;
     p2pOpen?: boolean;
+    grantRequestToOwnerDm?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
+  if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
@@ -7337,6 +7416,21 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 //   • ''/其它 → 删 key，回到缺省 send
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
+ipcRoute('PUT', '/api/bot-prompt-injection', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { promptInjection?: unknown };
+  try { body = await readJsonBody<{ promptInjection?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.promptInjection !== 'none' && body.promptInjection !== 'default') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_prompt_injection' });
+  }
+  const spec = findConfigField('promptInjection');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const r = await applyConfigField(cachedLarkAppId, spec, body.promptInjection);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, promptInjection: body.promptInjection });
+});
+
 ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { replyDelivery?: unknown };
@@ -7749,6 +7843,35 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+// Per-bot 空闲会话自动休眠超时 idleSuspendMinutes。Body `{ idleSuspendMinutes: number | null }`:
+//   • 正整数（分钟）→ 会话持续空闲超过该时长即休眠回收内存，与数量上限互不影响
+//   • null          → 清除（关闭空闲 TTL，默认行为，仅受数量上限约束）
+// 同样走 applyConfigField；sweeper 每分钟实时读 bot.config.idleSuspendMinutes，免重启生效。
+ipcRoute('PUT', '/api/bot-idle-suspend-minutes', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { idleSuspendMinutes?: unknown };
+  const spec = findConfigField('idleSuspendMinutes');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  let value: number | null;
+  if (body.idleSuspendMinutes === null || body.idleSuspendMinutes === undefined) {
+    value = null;
+  } else {
+    const c = coerceConfigValue(spec, body.idleSuspendMinutes);
+    if (!c.ok || typeof c.value !== 'number') return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    value = c.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, idleSuspendMinutes: value });
 });
 
 ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {
